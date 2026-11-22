@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/eddiexyang/graphnet/internal/model"
-	quic "github.com/quic-go/quic-go"
+	quic "github.com/eddiexyang/quic-go"
 )
 
 // silent fails when anything arrives on conn within a short wait.

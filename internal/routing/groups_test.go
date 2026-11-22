@@ -231,7 +231,7 @@ func TestGroupToGroupRejectsConflicts(t *testing.T) {
 			n.GroupLinks[0].Overrides = []model.EdgeOverride{o, {A: o.B, B: o.A}}
 		},
 		"invalid override value": func(n *model.Network) {
-			n.GroupLinks[0].Overrides = []model.EdgeOverride{{A: n.Nodes[0].ID, B: n.Nodes[3].ID, Transports: []model.Transport{model.Transport("ws")}}}
+			n.GroupLinks[0].Overrides = []model.EdgeOverride{{A: n.Nodes[0].ID, B: n.Nodes[3].ID, Transports: []model.Transport{model.Transport("invalid")}}}
 		},
 	}
 	for name, change := range cases {

@@ -39,7 +39,7 @@ func (m *Mesh) streamsEnabled() bool {
 
 // Streams need ordered, reliable delivery from the Link's transport.
 func streamTransport(t model.Transport) bool {
-	return t == model.TCP || t == model.QUIC
+	return t == model.TCP || t == model.QUIC || t == model.WS || t == model.WSS
 }
 
 // StreamsAvailable reports whether the Edge to remote can carry a new stream.

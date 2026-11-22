@@ -52,6 +52,7 @@ type kernelTUN struct {
 	// device, which its stack does not take.
 	udp  chan []byte
 	icmp chan []byte
+	embedded *embeddedClientFixture
 }
 
 type kernelPacket struct {
@@ -309,6 +310,7 @@ func graphAgents(t *testing.T, carrier model.Transport, options streamOptions, c
 	for _, configure := range configure {
 		configure(&state)
 	}
+	applyClientFixture(t, &state)
 	agents := make([]*DataPlane, count)
 	devices := make([]*kernelTUN, count)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -318,6 +320,9 @@ func graphAgents(t *testing.T, carrier model.Transport, options streamOptions, c
 		seed[0] = byte(i + 1)
 		configured := DataPlaneOptions{}
 		configured.BindHost = "127.0.0.1"
+		if i == 0 && clientFixtureEnabled() {
+			configured.Embedded = true
+		}
 		configured.legacyStreams = options.legacy[i]
 		configured.snatDial = options.snatDial
 		configured.TunnelFactory = func(cfg tunnel.Config) (tunnel.Device, error) {
@@ -342,6 +347,9 @@ func graphAgents(t *testing.T, carrier model.Transport, options streamOptions, c
 		}
 		if err := agent.Apply(ctx, snapshot); err != nil {
 			t.Fatal(err)
+		}
+		if i == 0 && clientFixtureEnabled() && devices[i] != nil {
+			devices[i].attachEmbeddedClient(ctx, agent)
 		}
 	}
 	// Each Edge chooses streams or packets when a connection starts. Start
@@ -430,7 +438,7 @@ func TestTCPStreamsAcrossGraph(t *testing.T) {
 				}
 				serverErr <- err
 			}()
-			conn, err := gonet.DialContextTCP(ctx, devices[0].stack, tcpip.FullAddress{NIC: 1, Addr: tcpip.AddrFrom4(target.As4()), Port: 8080}, ipv4.ProtocolNumber)
+			conn, err := devices[0].dialTCP(ctx, tcpip.AddrFrom4(target.As4()), 8080, ipv4.ProtocolNumber)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -481,7 +489,7 @@ func assertNoTCPOverTCP(t *testing.T, agents []*DataPlane) {
 // streamCarrier reports transports whose Links carry streams, TCP and QUIC;
 // UDP is unreliable.
 func streamCarrier(carrier model.Transport) bool {
-	return carrier == model.TCP || carrier == model.QUIC
+	return carrier == model.TCP || carrier == model.QUIC || carrier == model.WS || carrier == model.WSS
 }
 
 // Edges without stream support forward TCP as packets, end to end.
@@ -507,7 +515,7 @@ func TestTCPPacketsOnEdgesWithoutStreams(t *testing.T) {
 		raw, _ := io.ReadAll(conn)
 		received <- raw
 	}()
-	conn, err := gonet.DialContextTCP(ctx, devices[0].stack, tcpip.FullAddress{NIC: 1, Addr: tcpip.AddrFrom4(target.As4()), Port: 8080}, ipv4.ProtocolNumber)
+	conn, err := devices[0].dialTCP(ctx, tcpip.AddrFrom4(target.As4()), 8080, ipv4.ProtocolNumber)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -566,7 +574,7 @@ func transferApplication(t *testing.T, source, destination *kernelTUN, target ne
 		}
 		serverErr <- err
 	}()
-	conn, err := gonet.DialContextTCP(ctx, source.stack, tcpip.FullAddress{NIC: 1, Addr: address, Port: 8081}, protocol)
+	conn, err := source.dialTCP(ctx, address, 8081, protocol)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -646,7 +654,7 @@ func TestTCPRevokedEdgeStallsAndResumes(t *testing.T) {
 	go func() { conn, _ := listener.Accept(); accepted <- conn }()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	conn, err := gonet.DialContextTCP(ctx, devices[0].stack, tcpip.FullAddress{NIC: 1, Addr: tcpip.AddrFrom4(target.As4()), Port: 8082}, ipv4.ProtocolNumber)
+	conn, err := devices[0].dialTCP(ctx, tcpip.AddrFrom4(target.As4()), 8082, ipv4.ProtocolNumber)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -707,7 +715,7 @@ func TestTCPSlowReaderReceivesLastBytes(t *testing.T) {
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	conn, err := gonet.DialContextTCP(ctx, devices[0].stack, tcpip.FullAddress{NIC: 1, Addr: tcpip.AddrFrom4(target.As4()), Port: 8083}, ipv4.ProtocolNumber)
+	conn, err := devices[0].dialTCP(ctx, tcpip.AddrFrom4(target.As4()), 8083, ipv4.ProtocolNumber)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -780,7 +788,7 @@ func TestTCPSNATEgressUsesHostSocket(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	external := netip.MustParseAddr("198.51.100.7")
-	conn, err := gonet.DialContextTCP(ctx, devices[0].stack, tcpip.FullAddress{NIC: 1, Addr: tcpip.AddrFrom4(external.As4()), Port: 443}, ipv4.ProtocolNumber)
+	conn, err := devices[0].dialTCP(ctx, tcpip.AddrFrom4(external.As4()), 443, ipv4.ProtocolNumber)
 	if err != nil {
 		t.Fatal(err)
 	}

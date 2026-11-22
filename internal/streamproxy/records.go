@@ -175,6 +175,10 @@ func (r *Records) readPending(p []byte) int {
 // reads until one record opened; with a budget, it reads no more than that,
 // which read has without waiting. It returns whether a record opened.
 func (r *Records) fill(read func([]byte) (int, error), budget int) (bool, error) {
+	return r.fillLimit(read, budget, window)
+}
+
+func (r *Records) fillLimit(read func([]byte) (int, error), budget, limit int) (bool, error) {
 	opened := false
 	take := func(p []byte) (int, error) {
 		if budget >= 0 {
@@ -190,7 +194,7 @@ func (r *Records) fill(read func([]byte) (int, error), budget int) (bool, error)
 		return n, err
 	}
 	for {
-		if budget < 0 && opened || budget == 0 || r.end-r.start >= window {
+		if budget < 0 && opened || budget == 0 || r.available() >= limit || r.end-r.start >= window {
 			return opened, nil
 		}
 		for r.heads < RecordHeader {

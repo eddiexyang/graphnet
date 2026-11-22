@@ -61,7 +61,7 @@ func TestTCPConnectionResetsOnExitChange(t *testing.T) {
 		t.Helper()
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		conn, err := gonet.DialContextTCP(ctx, devices[0].stack, tcpip.FullAddress{NIC: 1, Addr: server, Port: 9000}, ipv4.ProtocolNumber)
+		conn, err := devices[0].dialTCP(ctx, server, 9000, ipv4.ProtocolNumber)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -304,7 +304,7 @@ func TestSealedECMPSpreadsConnections(t *testing.T) {
 	used := map[int]int{}
 	for i := range 64 {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		conn, err := gonet.DialContextTCP(ctx, devices[0].stack, tcpip.FullAddress{NIC: 1, Addr: server, Port: 9000}, ipv4.ProtocolNumber)
+		conn, err := devices[0].dialTCP(ctx, server, 9000, ipv4.ProtocolNumber)
 		cancel()
 		if err != nil {
 			t.Fatal(err)

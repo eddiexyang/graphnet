@@ -107,7 +107,7 @@ func sessionExchange(t *testing.T, devices []*kernelTUN, state model.State, targ
 		}
 		serverErr <- errors.Join(err, <-written)
 	}()
-	conn, err := gonet.DialContextTCP(ctx, devices[0].stack, tcpip.FullAddress{NIC: 1, Addr: tcpip.AddrFrom4(address.As4()), Port: 8090}, ipv4.ProtocolNumber)
+	conn, err := devices[0].dialTCP(ctx, tcpip.AddrFrom4(address.As4()), 8090, ipv4.ProtocolNumber)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -295,7 +295,7 @@ func TestTCPSessionEndsDuringReroute(t *testing.T) {
 	for i := range 40 {
 		abort := i%2 == 1
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		conn, err := gonet.DialContextTCP(ctx, devices[0].stack, tcpip.FullAddress{NIC: 1, Addr: tcpip.AddrFrom4(address.As4()), Port: 8091}, ipv4.ProtocolNumber)
+		conn, err := devices[0].dialTCP(ctx, tcpip.AddrFrom4(address.As4()), 8091, ipv4.ProtocolNumber)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -366,7 +366,7 @@ func TestTCPSessionResetsOnPacketPath(t *testing.T) {
 	go func() { conn, _ := listener.Accept(); accepted <- conn }()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	conn, err := gonet.DialContextTCP(ctx, devices[0].stack, tcpip.FullAddress{NIC: 1, Addr: tcpip.AddrFrom4(address.As4()), Port: 8092}, ipv4.ProtocolNumber)
+	conn, err := devices[0].dialTCP(ctx, tcpip.AddrFrom4(address.As4()), 8092, ipv4.ProtocolNumber)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -413,7 +413,7 @@ func TestTCPPacketFlowResetsOnTCPPath(t *testing.T) {
 	go func() { conn, _ := listener.Accept(); accepted <- conn }()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	conn, err := gonet.DialContextTCP(ctx, devices[0].stack, tcpip.FullAddress{NIC: 1, Addr: tcpip.AddrFrom4(address.As4()), Port: 8093}, ipv4.ProtocolNumber)
+	conn, err := devices[0].dialTCP(ctx, tcpip.AddrFrom4(address.As4()), 8093, ipv4.ProtocolNumber)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -460,7 +460,7 @@ func TestTCPSessionStalledConnectionsDoNotBlockOthers(t *testing.T) {
 	dial := func(port uint16) net.Conn {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		conn, err := gonet.DialContextTCP(ctx, devices[0].stack, tcpip.FullAddress{NIC: 1, Addr: tcpip.AddrFrom4(address.As4()), Port: port}, ipv4.ProtocolNumber)
+		conn, err := devices[0].dialTCP(ctx, tcpip.AddrFrom4(address.As4()), port, ipv4.ProtocolNumber)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -524,7 +524,7 @@ func TestTCPSessionStalledConnectionsDoNotBlockOthers(t *testing.T) {
 	if _, err := conn.Write(request); err != nil {
 		t.Fatal("the active connection could not send:", err)
 	}
-	if err := conn.(*gonet.TCPConn).CloseWrite(); err != nil {
+	if err := conn.(interface{ CloseWrite() error }).CloseWrite(); err != nil {
 		t.Fatal(err)
 	}
 	reply, err := io.ReadAll(conn)

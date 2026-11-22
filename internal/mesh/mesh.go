@@ -6,9 +6,12 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"net"
+	"net/http"
 	"net/netip"
+	"net/url"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -58,7 +61,11 @@ type Mesh struct {
 	punches        map[punchKey]*transport.PunchMux
 	punchDials     map[punchKey]*punchDial
 	punchNotify    chan struct{}
+	webListener    *connIngress
+	webServer      *http.Server
 	tls            *tls.Config
+	wssTLS         *tls.Config
+	wsRoots        *x509.CertPool
 	sniffSlots     chan struct{}
 	pending        map[net.Conn]bool
 	udp            *transport.UDP
@@ -73,9 +80,31 @@ type Mesh struct {
 	wg             sync.WaitGroup
 	closed         bool
 	linkOptions    link.Options
+	streamWindow     uint64
+	consumingStreams atomic.Int64
+	stalledBytes     atomic.Int64
+}
+
+// Options configures transport and mux receive windows for a Mesh.
+type Options struct {
+	QUIC            transport.QUICOptions
+	StreamWindow    uint64
+	// OriginClientCAs requires incoming WSS connections to authenticate with
+	// a client certificate signed by one of these CAs (CDN mTLS origin pull).
+	OriginClientCAs *x509.CertPool
+	// OriginTLS optionally overrides the server TLS config for incoming WSS
+	// connections (for example, a CA-signed origin certificate verified by a CDN).
+	OriginTLS       *tls.Config
+	// WebSocketRoots overrides the CA roots trusted when dialing WSS endpoints
+	// behind a CDN or reverse proxy (nil uses system roots plus peer identity pin).
+	WebSocketRoots  *x509.CertPool
 }
 
 func New(parent context.Context, identity ed25519.PrivateKey, host string, port uint16, receive Receive, batches ...func(context.Context, model.ID, []*packetbuf.Buffer) error) (*Mesh, error) {
+	return NewWithOptions(parent, identity, host, port, receive, Options{}, batches...)
+}
+
+func NewWithOptions(parent context.Context, identity ed25519.PrivateKey, host string, port uint16, receive Receive, opts Options, batches ...func(context.Context, model.ID, []*packetbuf.Buffer) error) (*Mesh, error) {
 	if len(identity) != ed25519.PrivateKeySize || receive == nil {
 		return nil, errors.New("mesh requires identity and packet receiver")
 	}
@@ -83,12 +112,12 @@ func New(parent context.Context, identity ed25519.PrivateKey, host string, port 
 	if err != nil {
 		return nil, err
 	}
-	listener, udp, quic, err := listenTransports(parent, identity, host, port, transport.ListenTCP)
+	listener, udp, quic, err := listenTransports(parent, identity, host, port, transport.ListenTCP, opts.QUIC)
 	if err != nil {
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(parent)
-	m := &Mesh{sniffSlots: make(chan struct{}, 64), pending: map[net.Conn]bool{}, identity: bytes.Clone(identity), ctx: ctx, cancel: cancel, listener: listener, udp: udp, receive: receive, groups: map[key]*group{}, slots: make(chan struct{}, 8), punchSlots: make(chan struct{}, 16), acceptSlots: make(chan struct{}, 64), punchNotify: make(chan struct{})}
+	m := &Mesh{sniffSlots: make(chan struct{}, 64), pending: map[net.Conn]bool{}, identity: bytes.Clone(identity), ctx: ctx, cancel: cancel, listener: listener, udp: udp, receive: receive, groups: map[key]*group{}, slots: make(chan struct{}, 8), punchSlots: make(chan struct{}, 16), acceptSlots: make(chan struct{}, 64), punchNotify: make(chan struct{}), streamWindow: opts.StreamWindow}
 	if len(batches) > 0 {
 		m.receiveBatch = batches[0]
 	}
@@ -99,6 +128,22 @@ func New(parent context.Context, identity ed25519.PrivateKey, host string, port 
 	m.punches = map[punchKey]*transport.PunchMux{}
 	m.punchDials = map[punchKey]*punchDial{}
 	m.tls = tlsConfig
+	m.wsRoots = opts.WebSocketRoots
+	if opts.OriginTLS != nil {
+		m.wssTLS = opts.OriginTLS.Clone()
+	} else {
+		m.wssTLS = tlsConfig.Clone()
+	}
+	m.wssTLS.MinVersion = tls.VersionTLS13
+	if len(m.wssTLS.CurvePreferences) == 0 {
+		m.wssTLS.CurvePreferences = []tls.CurveID{tls.X25519}
+	}
+	m.wssTLS.NextProtos = []string{"http/1.1"}
+	if opts.OriginClientCAs != nil {
+		m.wssTLS.ClientAuth = tls.RequireAndVerifyClientCert
+		m.wssTLS.ClientCAs = opts.OriginClientCAs
+	}
+	m.startHTTP()
 	m.wg.Add(3)
 	go m.acceptTCP()
 	go m.acceptUDP()
@@ -134,6 +179,8 @@ func (m *Mesh) Close() error {
 	}
 	m.mu.Unlock()
 	m.listener.Close()
+	m.webListener.Close()
+	m.webServer.Close()
 	for _, conn := range pending {
 		conn.Close()
 	}
@@ -632,6 +679,13 @@ func candidateIngress(candidate link.Candidate, conn transport.Conn) bool {
 		if (candidate.Method == link.Punch) != punched {
 			return false
 		}
+	}
+	if path, ok := conn.(interface{ EndpointPath() string }); ok {
+		parsed, err := url.Parse(candidate.Endpoint.URL)
+		if err != nil || candidate.Endpoint.Source != model.Manual {
+			return false
+		}
+		return transport.WebSocketPath(parsed) == path.EndpointPath()
 	}
 	return candidate.Family == addressFamily(conn.RemoteAddr())
 }

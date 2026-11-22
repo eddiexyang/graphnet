@@ -188,13 +188,11 @@ func runManagedService(role string, args []string) error {
 		}
 		return s.Run()
 	case "install":
-		db := "agent.db"
 		if role == "server" {
-			db = "controller.db"
-		}
-		info, err := os.Stat(filepath.Join(absoluteData, db))
-		if err != nil || !info.Mode().IsRegular() {
-			return fmt.Errorf("initialize/register %s first, using the same --data-dir (missing %s)", role, db)
+			info, err := os.Stat(filepath.Join(absoluteData, "controller.db"))
+			if err != nil || !info.Mode().IsRegular() {
+				return fmt.Errorf("initialize/register %s first, using the same --data-dir (missing controller.db)", role)
+			}
 		}
 		if role == "agent" {
 			if err := prepareAgentPlatform(context.Background()); err != nil {

@@ -117,6 +117,9 @@ func Candidates(local model.ID, peer model.Peer, now time.Time) []Candidate {
 				if endpoint.Transport != model.UDP && endpoint.Transport != model.TCP {
 					priority += 50
 				}
+				if endpoint.Transport == model.WS || endpoint.Transport == model.WSS {
+					priority += 50
+				}
 				result = append(result, Candidate{ID: CandidateID(peer.Edge.ID, local, endpoint.ID, family, method), Endpoint: endpoint, Family: family, Method: method, Priority: priority})
 			}
 		}

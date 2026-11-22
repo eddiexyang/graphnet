@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/eddiexyang/graphnet/internal/model"
-	bolt "go.etcd.io/bbolt"
 )
 
 func validateDirectory(reg Registration, directory *model.ServerDirectory) error {
@@ -42,41 +41,35 @@ func (c *Cache) SaveDirectory(directory *model.ServerDirectory, roots *x509.Cert
 	if directory == nil {
 		return nil
 	}
-	return c.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(agentBucket)
-		var reg Registration
-		if err := json.Unmarshal(b.Get([]byte("registration")), &reg); err != nil {
-			return err
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.reg == nil {
+		return errors.New("missing registration")
+	}
+	reg := c.reg.clone()
+	if err := validateDirectory(reg, directory); err != nil {
+		return err
+	}
+	if len(reg.CA) == 0 {
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(directory.CA) {
+			return errors.New("invalid directory CA")
 		}
-		if err := validateDirectory(reg, directory); err != nil {
-			return err
-		}
-		// Legacy migration still pins the CA to an authenticated controller and the
-		// existing Agent certificate. A directory cannot replace the trust anchor.
-		if len(reg.CA) == 0 {
-			pool := x509.NewCertPool()
-			if !pool.AppendCertsFromPEM(directory.CA) {
-				return errors.New("invalid directory CA")
-			}
-			cert, err := c.TLSCertificate(reg)
-			if err != nil {
-				return err
-			}
-			if _, err = cert.Leaf.Verify(x509.VerifyOptions{Roots: pool, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}}); err != nil {
-				return err
-			}
-			if _, err = cert.Leaf.Verify(x509.VerifyOptions{Roots: roots, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}}); err != nil {
-				return err
-			}
-		}
-		reg.CA = bytes.Clone(directory.CA)
-		reg.Directory = directory.Clone()
-		raw, err := json.Marshal(reg)
+		cert, err := c.TLSCertificate(reg)
 		if err != nil {
 			return err
 		}
-		return b.Put([]byte("registration"), raw)
-	})
+		if _, err = cert.Leaf.Verify(x509.VerifyOptions{Roots: pool, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}}); err != nil {
+			return err
+		}
+		if _, err = cert.Leaf.Verify(x509.VerifyOptions{Roots: roots, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}}); err != nil {
+			return err
+		}
+	}
+	reg.CA = bytes.Clone(directory.CA)
+	reg.Directory = directory.Clone()
+	c.reg = &reg
+	return nil
 }
 
 type controlTarget struct{ key, origin, transport, tlsName string }
@@ -153,10 +146,13 @@ func (c *Client) targets(reg Registration) []controlTarget {
 }
 
 func (c *Cache) lastServer() (string, error) {
-	var last string
-	err := c.db.View(func(tx *bolt.Tx) error { last = string(tx.Bucket(agentBucket).Get([]byte("last-server"))); return nil })
-	return last, err
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastSrv, nil
 }
 func (c *Cache) saveLastServer(key string) error {
-	return c.db.Update(func(tx *bolt.Tx) error { return tx.Bucket(agentBucket).Put([]byte("last-server"), []byte(key)) })
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lastSrv = key
+	return nil
 }

@@ -80,7 +80,7 @@ type Hello struct {
 	Transport                           model.Transport
 }
 
-var transports = []model.Transport{model.UDP, model.TCP, model.QUIC}
+var transports = []model.Transport{model.UDP, model.TCP, model.QUIC, model.WS, model.WSS}
 
 func (h Hello) marshal(noise []byte) ([]byte, error) {
 	out := make([]byte, helloHeader, helloHeader+len(noise))

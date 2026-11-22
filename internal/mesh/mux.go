@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -59,7 +60,7 @@ const (
 	// over 80 ms.
 	muxWindow = 32 << 20
 	// A windowed stream's credit before its first acknowledgement.
-	muxInitialWindow = 256 << 10
+	muxInitialWindow = 16 << 10
 	// A windowed stream that consumed nothing this long stopped: it keeps its
 	// credit but no longer shares the Link's buffer.
 	muxIdle         = time.Second
@@ -136,6 +137,9 @@ type mux struct {
 	// share is each windowed stream's part of the current Link's kernel
 	// receive buffer, split between the streams consuming; maintain sets it.
 	// receiveWindow replaces the Link's buffer in tests.
+	defaultWindow uint64
+	lastConsuming int64
+	lastStalled   int64
 	share         uint64
 	receiveWindow func() (int, bool)
 }
@@ -145,7 +149,11 @@ type mux struct {
 const muxQueue = 2 << 20
 
 func newMux(g *group, even bool, handler func(*muxStream)) *mux {
-	m := &mux{g: g, even: even, handler: handler, ready: map[*link.Link]bool{}, streams: map[uint64]*muxStream{}, queuedStreams: map[*muxStream]bool{}, ended: map[uint64]time.Time{}, drained: make(chan struct{})}
+	defWin := uint64(muxWindow)
+	if g != nil && g.mesh != nil && g.mesh.streamWindow > 0 {
+		defWin = max(muxMaxData, g.mesh.streamWindow)
+	}
+	m := &mux{g: g, even: even, handler: handler, ready: map[*link.Link]bool{}, streams: map[uint64]*muxStream{}, queuedStreams: map[*muxStream]bool{}, ended: map[uint64]time.Time{}, drained: make(chan struct{}), defaultWindow: defWin, share: defWin}
 	// The peer's mux can outlive this Agent, retaining live stream IDs and
 	// tombstones across Link reconnections. A fresh random counter origin
 	// avoids deterministic reuse after an Agent restart or group recreation.
@@ -206,6 +214,11 @@ func (m *mux) Open(ctx context.Context) (*muxStream, error) {
 		return nil, errors.New("edge stream IDs exhausted")
 	}
 	s := m.newStreamLocked(m.next, m.current.Windows())
+	if s.windowed {
+		s.ackDue = true
+		m.enqueueLocked(s)
+		m.current.WakeStreams()
+	}
 	if m.next > ^uint64(0)-2 {
 		m.next = 0
 	} else {
@@ -379,6 +392,7 @@ func (m *mux) shareLocked() {
 		budget, known = m.current.ReceiveWindow()
 	}
 	var consuming []*muxStream
+	var localStalled uint64
 	now := time.Now()
 	for _, s := range m.streams {
 		if !s.windowed || s.err != nil {
@@ -389,11 +403,53 @@ func (m *mux) shareLocked() {
 		}
 		if now.Sub(s.consuming) < muxIdle {
 			consuming = append(consuming, s)
+		} else {
+			committed := uint64(s.recvBytes)
+			if s.advertised > s.consumed {
+				committed = max(committed, s.advertised-s.consumed)
+			}
+			localStalled += committed
 		}
 	}
-	share := uint64(muxWindow)
+	defWin := m.defaultWindow
+	if defWin == 0 {
+		defWin = uint64(muxWindow)
+	}
+	eff := defWin
 	if known {
-		share = max(muxMaxData, uint64(budget)/uint64(max(1, len(consuming))))
+		eff = uint64(budget)
+		if defWin < uint64(muxWindow) && eff > defWin {
+			eff = defWin
+		}
+	}
+	divisor := int64(max(1, len(consuming)))
+	totalStalled := localStalled
+	if m.g != nil && m.g.mesh != nil {
+		delta := int64(len(consuming)) - m.lastConsuming
+		m.lastConsuming = int64(len(consuming))
+		total := m.g.mesh.consumingStreams.Add(delta)
+		if defWin < uint64(muxWindow) && total > divisor {
+			divisor = total
+		}
+		sdelta := int64(localStalled) - m.lastStalled
+		m.lastStalled = int64(localStalled)
+		if st := m.g.mesh.stalledBytes.Add(sdelta); st > 0 {
+			totalStalled = uint64(st)
+		} else {
+			totalStalled = 0
+		}
+	}
+	avail := eff
+	if defWin < uint64(muxWindow) {
+		if totalStalled >= eff {
+			avail = 0
+		} else {
+			avail = eff - totalStalled
+		}
+	}
+	share := max(muxMaxData, avail/uint64(divisor))
+	if defWin < uint64(muxWindow) {
+		share = max(uint64(muxInitialWindow), avail/uint64(divisor))
 	}
 	m.share = share
 	for _, s := range m.streams {
@@ -402,13 +458,30 @@ func (m *mux) shareLocked() {
 		}
 	}
 	for _, s := range consuming {
-		s.window = share
+		if defWin < uint64(muxWindow) {
+			// In memory-bounded mode, ramp credit only as the app actually consumes bytes
+			// so newly opened/unread streams stay at muxInitialWindow until read.
+			ramp := max(uint64(muxInitialWindow), s.consumed*2)
+			s.window = min(share, ramp)
+		} else {
+			s.window = share
+		}
 	}
 }
 
 func (m *mux) close() {
 	m.mu.Lock()
 	m.closed = true
+	if m.g != nil && m.g.mesh != nil {
+		if m.lastConsuming != 0 {
+			m.g.mesh.consumingStreams.Add(-m.lastConsuming)
+			m.lastConsuming = 0
+		}
+		if m.lastStalled != 0 {
+			m.g.mesh.stalledBytes.Add(-m.lastStalled)
+			m.lastStalled = 0
+		}
+	}
 	for _, s := range m.streams {
 		s.failLocked(net.ErrClosed)
 	}
@@ -755,6 +828,14 @@ type muxStream struct {
 	sendWake chan struct{}
 	readWake chan struct{}
 
+	dlMu      sync.Mutex
+	readTimer *time.Timer
+	readExp   chan struct{}
+	readChg   chan struct{}
+	writeTmr  *time.Timer
+	writeExp  chan struct{}
+	writeChg  chan struct{}
+
 	// A TCP session hop; see streamproxy.Hop. Its session offsets count from
 	// sendStart at this stream's offset sendMark.
 	session       bool
@@ -968,6 +1049,72 @@ func (b *frameBuilder) release() {
 
 // reserve waits for send credit and returns the next offset and how many
 // bytes may follow it. Callers hold writeMu.
+func (s *muxStream) SetReadDeadline(t time.Time) error {
+	s.dlMu.Lock()
+	defer s.dlMu.Unlock()
+	if s.readTimer != nil {
+		s.readTimer.Stop()
+		s.readTimer = nil
+	}
+	s.readExp = nil
+	if !t.IsZero() {
+		exp := make(chan struct{})
+		s.readExp = exp
+		if d := time.Until(t); d <= 0 {
+			close(exp)
+		} else {
+			s.readTimer = time.AfterFunc(d, func() { close(exp) })
+		}
+	}
+	if s.readChg != nil {
+		close(s.readChg)
+		s.readChg = nil
+	}
+	return nil
+}
+
+func (s *muxStream) SetWriteDeadline(t time.Time) error {
+	s.dlMu.Lock()
+	defer s.dlMu.Unlock()
+	if s.writeTmr != nil {
+		s.writeTmr.Stop()
+		s.writeTmr = nil
+	}
+	s.writeExp = nil
+	if !t.IsZero() {
+		exp := make(chan struct{})
+		s.writeExp = exp
+		if d := time.Until(t); d <= 0 {
+			close(exp)
+		} else {
+			s.writeTmr = time.AfterFunc(d, func() { close(exp) })
+		}
+	}
+	if s.writeChg != nil {
+		close(s.writeChg)
+		s.writeChg = nil
+	}
+	return nil
+}
+
+func (s *muxStream) readDeadlineChans() (exp, chg chan struct{}) {
+	s.dlMu.Lock()
+	defer s.dlMu.Unlock()
+	if s.readChg == nil {
+		s.readChg = make(chan struct{})
+	}
+	return s.readExp, s.readChg
+}
+
+func (s *muxStream) writeDeadlineChans() (exp, chg chan struct{}) {
+	s.dlMu.Lock()
+	defer s.dlMu.Unlock()
+	if s.writeChg == nil {
+		s.writeChg = make(chan struct{})
+	}
+	return s.writeExp, s.writeChg
+}
+
 func (s *muxStream) reserve() (uint64, int, error) {
 	m := s.m
 	for {
@@ -989,20 +1136,32 @@ func (s *muxStream) reserve() (uint64, int, error) {
 		}
 		m.mu.Unlock()
 		if full {
-			// The Link writer has enough waiting: the bytes stay in their
-			// source until it catches up.
+			wExp, wChg := s.writeDeadlineChans()
 			select {
 			case <-drained:
+			case <-wExp:
+				return 0, 0, os.ErrDeadlineExceeded
+			case <-wChg:
 			case <-s.ctx.Done():
 				return 0, 0, s.errOr(net.ErrClosed)
 			}
 			continue
 		}
 		if available > 0 {
+			wExp, _ := s.writeDeadlineChans()
+			select {
+			case <-wExp:
+				return 0, 0, os.ErrDeadlineExceeded
+			default:
+			}
 			return start, int(min(available, muxBurst*muxMaxData)), nil
 		}
+		wExp, wChg := s.writeDeadlineChans()
 		select {
 		case <-s.sendWake:
+		case <-wExp:
+			return 0, 0, os.ErrDeadlineExceeded
+		case <-wChg:
 		case <-s.ctx.Done():
 			return 0, 0, s.errOr(net.ErrClosed)
 		}
@@ -1273,8 +1432,12 @@ func (s *muxStream) ReadWindow() (int, error) {
 			return 0, err
 		}
 		m.mu.Unlock()
+		rExp, rChg := s.readDeadlineChans()
 		select {
 		case <-s.readWake:
+		case <-rExp:
+			return 0, os.ErrDeadlineExceeded
+		case <-rChg:
 		case <-s.ctx.Done():
 			return 0, s.errOr(net.ErrClosed)
 		}
@@ -1313,6 +1476,9 @@ func (s *muxStream) consume(n int) {
 	m := s.m
 	m.mu.Lock()
 	s.consumed += uint64(n)
+	if s.windowed && m.defaultWindow > 0 && m.defaultWindow < uint64(muxWindow) && s.window < m.share {
+		s.window = min(m.share, max(uint64(muxInitialWindow), s.consumed*2))
+	}
 	var l *link.Link
 	// A session hop that read up to its FIN acknowledges at once: the far end
 	// finishes the session only when it learns that everything was delivered.
@@ -1450,7 +1616,46 @@ func (s *muxStream) waitKeep(need int) (int, error) {
 	if keep == nil {
 		return math.MaxInt, nil
 	}
-	return keep.Wait(s.ctx, need)
+	for {
+		exp, chg := s.writeDeadlineChans()
+		if exp == nil {
+			return keep.Wait(s.ctx, need)
+		}
+		select {
+		case <-exp:
+			return 0, os.ErrDeadlineExceeded
+		default:
+		}
+		waitCtx, cancel := context.WithCancel(s.ctx)
+		var expired atomic.Bool
+		var changed atomic.Bool
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			select {
+			case <-exp:
+				expired.Store(true)
+				cancel()
+			case <-chg:
+				changed.Store(true)
+				cancel()
+			case <-waitCtx.Done():
+			}
+		}()
+		n, err := keep.Wait(waitCtx, need)
+		cancel()
+		<-done
+		if err == nil {
+			return n, nil
+		}
+		if expired.Load() {
+			return 0, os.ErrDeadlineExceeded
+		}
+		if changed.Load() && s.ctx.Err() == nil {
+			continue
+		}
+		return 0, err
+	}
 }
 
 // bufferOffset reports where data starts in owner.Data, if data is a view of
@@ -1533,6 +1738,10 @@ func (s *muxStream) failLocked(err error) {
 	delete(s.m.streams, s.id)
 	s.m.endedLocked(s.id)
 	s.cancel()
+	s.dlMu.Lock()
+	if s.readTimer != nil { s.readTimer.Stop(); s.readTimer = nil }
+	if s.writeTmr != nil { s.writeTmr.Stop(); s.writeTmr = nil }
+	s.dlMu.Unlock()
 }
 
 func (s *muxStream) errOr(fallback error) error {

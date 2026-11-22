@@ -1,12 +1,12 @@
 package agent
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 
 	"github.com/eddiexyang/graphnet/internal/linkstate"
 	"github.com/eddiexyang/graphnet/internal/model"
-	bolt "go.etcd.io/bbolt"
 )
 
 // Keep the installed live paths across discovery/configuration revisions. A new
@@ -73,32 +73,31 @@ func (c *Cache) saveRoutes(update model.RouteUpdate) error {
 	if len(raw) > maxSnapshotBytes {
 		return errors.New("route update too large")
 	}
-	return c.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(agentBucket)
-		snapshot, err := snapshotFrom(b, "applied")
-		if err != nil {
-			return err
-		}
-		if snapshot == nil {
-			return errors.New("missing applied configuration")
-		}
-		if _, err := update.Apply(*snapshot); err != nil {
-			return err
-		}
-		return b.Put([]byte("routes"), raw)
-	})
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	snapshot, err := c.snapshotFromLocked(c.applied)
+	if err != nil {
+		return err
+	}
+	if snapshot == nil {
+		return errors.New("missing applied configuration")
+	}
+	if _, err := update.Apply(*snapshot); err != nil {
+		return err
+	}
+	c.routes = raw
+	return nil
 }
 
 func (r *Reconciler) restoreRoutes(revision uint64) error {
+	r.cache.mu.Lock()
+	raw := bytes.Clone(r.cache.routes)
+	r.cache.mu.Unlock()
+	if raw == nil {
+		return nil
+	}
 	var update model.RouteUpdate
-	err := r.cache.db.View(func(tx *bolt.Tx) error {
-		raw := tx.Bucket(agentBucket).Get([]byte("routes"))
-		if raw == nil {
-			return nil
-		}
-		return json.Unmarshal(raw, &update)
-	})
-	if err != nil {
+	if err := json.Unmarshal(raw, &update); err != nil {
 		return err
 	}
 	if update.Revision == 0 || update.Revision != revision {

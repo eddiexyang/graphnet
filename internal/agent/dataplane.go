@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -22,6 +24,7 @@ import (
 	"github.com/eddiexyang/graphnet/internal/model"
 	"github.com/eddiexyang/graphnet/internal/packet"
 	"github.com/eddiexyang/graphnet/internal/packetbuf"
+	"github.com/eddiexyang/graphnet/internal/transport"
 	"github.com/eddiexyang/graphnet/internal/tunnel"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
@@ -35,6 +38,18 @@ type DataPlaneOptions struct {
 	// host gateway rules and listens on an ephemeral port instead of the
 	// configured one.
 	Embedded bool
+	// QUICStreamReceiveWindow caps a QUIC Link per-stream receive window (0 = 32 MiB).
+	QUICStreamReceiveWindow uint64
+	// QUICConnectionReceiveWindow caps a QUIC Link connection receive window (0 = 48 MiB).
+	QUICConnectionReceiveWindow uint64
+	// StreamReceiveWindow caps a mux stream fallback receive window (0 = 32 MiB).
+	StreamReceiveWindow uint64
+	// OriginClientCAs enforces mTLS client certificates on incoming WSS links.
+	OriginClientCAs *x509.CertPool
+	// OriginTLS optionally overrides the origin server TLS config for incoming WSS links.
+	OriginTLS *tls.Config
+	// WebSocketRoots overrides CA roots trusted when dialing WSS links.
+	WebSocketRoots *x509.CertPool
 	// legacyStreams makes this Agent carry streams without TCP sessions, as
 	// older versions do. Tests use it for mixed versions.
 	legacyStreams bool
@@ -198,7 +213,16 @@ func (r *DataPlane) Apply(ctx context.Context, snapshot model.Snapshot) error {
 		if r.options.Embedded {
 			port = 0
 		}
-		next.mesh, err = mesh.New(r.ctx, r.identity, r.options.BindHost, port, r.receive, r.receiveBatch)
+		next.mesh, err = mesh.NewWithOptions(r.ctx, r.identity, r.options.BindHost, port, r.receive, mesh.Options{
+			QUIC: transport.QUICOptions{
+				MaxStreamReceiveWindow:     r.options.QUICStreamReceiveWindow,
+				MaxConnectionReceiveWindow: r.options.QUICConnectionReceiveWindow,
+			},
+			StreamWindow:    r.options.StreamReceiveWindow,
+			OriginClientCAs: r.options.OriginClientCAs,
+			OriginTLS:       r.options.OriginTLS,
+			WebSocketRoots:  r.options.WebSocketRoots,
+		}, r.receiveBatch)
 		if err != nil {
 			return fmt.Errorf("listen for peers: %w", err)
 		}

@@ -33,6 +33,9 @@ func (e Endpoint) Validate() error {
 	if e.Source != Interface && e.Source != Observed && e.Source != Manual {
 		return fmt.Errorf("invalid endpoint source %q", e.Source)
 	}
+	if e.Source != Manual && (e.Transport == WS || e.Transport == WSS) {
+		return fmt.Errorf("automatic endpoints do not support %s", e.Transport)
+	}
 	if len(e.URL) > 2048 {
 		return fmt.Errorf("endpoint URL too long")
 	}
@@ -47,7 +50,7 @@ func (e Endpoint) Validate() error {
 	if err != nil || port == 0 {
 		return fmt.Errorf("endpoint requires an explicit port in 1–65535")
 	}
-	if u.Path != "" {
+	if e.Transport != WS && e.Transport != WSS && u.Path != "" {
 		return fmt.Errorf("%s endpoint cannot have a path", e.Transport)
 	}
 	addr, addrErr := netip.ParseAddr(u.Hostname())

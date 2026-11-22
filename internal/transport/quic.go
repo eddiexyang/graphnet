@@ -16,12 +16,16 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/eddiexyang/graphnet/internal/model"
 	"github.com/eddiexyang/graphnet/internal/packetbuf"
 	"github.com/eddiexyang/graphnet/internal/sockets"
-	quic "github.com/quic-go/quic-go"
+	quic "github.com/eddiexyang/quic-go"
+	"github.com/eddiexyang/quic-go/bbr"
+	"github.com/eddiexyang/quic-go/congestion"
+	"golang.org/x/net/ipv4"
 )
 
 const (
@@ -31,7 +35,7 @@ const (
 	quicIDSize   = 16
 	quicIDPrefix = 'Q'
 	// quicQueue bounds the datagrams waiting for QUIC's reader.
-	quicQueue = 1024
+	quicQueue = 4096
 	// A knock opens QUIC to its sender's address for quicKnockLife: kind,
 	// 8-byte Unix time, 8 random bytes, then quicKnockMAC bytes of
 	// HMAC-SHA256 keyed by the receiver's identity. Without one, a stranger's
@@ -71,6 +75,7 @@ type QUICHub struct {
 	accepted  chan *QUIC
 	wg        sync.WaitGroup
 	cancel    context.CancelFunc
+	opts      QUICOptions
 	ids       quicIDs
 	// knockKey is the key of knocks toward this Agent; knocks holds when each
 	// knocking address may start a connection until. The hub's lock guards it.
@@ -146,7 +151,12 @@ func knockFor(identity ed25519.PublicKey) []byte {
 
 // EnableQUIC starts QUIC on the hub's sockets: datagrams that admit takes
 // and no native peer claims go to it.
-func (h *UDP) EnableQUIC(identity ed25519.PrivateKey) (*QUICHub, error) {
+func (h *UDP) EnableQUIC(identity ed25519.PrivateKey, options ...QUICOptions) (*QUICHub, error) {
+	var opts QUICOptions
+	if len(options) > 0 {
+		opts = options[0]
+	}
+	opts = opts.normalize()
 	tlsConfig, err := PeerServerTLS(identity)
 	if err != nil {
 		return nil, err
@@ -159,10 +169,11 @@ func (h *UDP) EnableQUIC(identity ed25519.PrivateKey) (*QUICHub, error) {
 	var resetKey quic.StatelessResetKey
 	copy(resetKey[:], reset)
 	ctx, cancel := context.WithCancel(context.Background())
-	q := &QUICHub{udp: h, engines: map[*net.UDPConn]*quic.Transport{}, sockets: map[*net.UDPConn]*quicSocket{}, slots: make(chan struct{}, 512), accepted: make(chan *QUIC), cancel: cancel, knocks: map[netip.AddrPort]time.Time{}}
+	q := &QUICHub{udp: h, opts: opts, engines: map[*net.UDPConn]*quic.Transport{}, sockets: map[*net.UDPConn]*quicSocket{}, slots: make(chan struct{}, 512), accepted: make(chan *QUIC), cancel: cancel, knocks: map[netip.AddrPort]time.Time{}}
 	q.ids = quicIDs{key: quicKey(identity.Seed(), "GraphNet QUIC connection ID v1")}
 	q.knockKey = quicKey(identity.Public().(ed25519.PublicKey), "GraphNet QUIC knock v1")
 	for _, socket := range h.sockets {
+		_ = socket.SetWriteBuffer(4 << 20)
 		conn := &quicSocket{socket: socket, hub: h, incoming: make(chan udpPacketCopy, quicQueue), done: make(chan struct{})}
 		engine := &quic.Transport{
 			Conn:                             conn,
@@ -179,7 +190,7 @@ func (h *UDP) EnableQUIC(identity ed25519.PrivateKey) (*QUICHub, error) {
 				return context.WithValue(ctx, quicAdmissionKey{}, release), nil
 			},
 		}
-		listener, err := engine.Listen(tlsConfig, quicConfig())
+		listener, err := engine.Listen(tlsConfig, quicConfig(opts))
 		if err != nil {
 			cancel()
 			q.close()
@@ -214,6 +225,7 @@ func (h *UDP) EnableQUIC(identity ed25519.PrivateKey) (*QUICHub, error) {
 type quicAdmissionKey struct{}
 
 func (q *QUICHub) acceptStream(ctx context.Context, conn *quic.Conn) {
+	installBBRv1(conn)
 	accept, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	stream, err := conn.AcceptStream(accept)
@@ -230,12 +242,19 @@ func (q *QUICHub) acceptStream(ctx context.Context, conn *quic.Conn) {
 	}
 }
 
-func quicConfig() *quic.Config {
+func installBBRv1(conn *quic.Conn) {
+	conn.SetCongestionControl(bbr.NewBbrSender(bbr.DefaultClock{}, congestion.InitialPacketSize, bbr.ProfileStandard))
+}
+
+func quicConfig(opts QUICOptions) *quic.Config {
+	opts = opts.normalize()
 	return &quic.Config{Versions: []quic.Version{quic.Version1},
 		HandshakeIdleTimeout: 5 * time.Second, MaxIdleTimeout: 15 * time.Second, KeepAlivePeriod: 5 * time.Second,
 		MaxIncomingStreams: 1, MaxIncomingUniStreams: -1,
-		InitialStreamReceiveWindow: 512 << 10, MaxStreamReceiveWindow: 16 << 20,
-		InitialConnectionReceiveWindow: 512 << 10, MaxConnectionReceiveWindow: 24 << 20,
+		InitialStreamReceiveWindow:     opts.InitialStreamReceiveWindow,
+		MaxStreamReceiveWindow:         opts.MaxStreamReceiveWindow,
+		InitialConnectionReceiveWindow: opts.InitialConnectionReceiveWindow,
+		MaxConnectionReceiveWindow:     opts.MaxConnectionReceiveWindow,
 	}
 }
 
@@ -327,9 +346,10 @@ func (q *QUICHub) DialAt(ctx context.Context, endpoint model.Endpoint, family in
 		socket := q.udp.socketFor(address)
 		engine := q.engines[socket]
 		stopKnocking := q.knockUntil(attempt, socket, netip.AddrPortFrom(address, uint16(port)), knock)
-		conn, dialErr := engine.Dial(attempt, net.UDPAddrFromAddrPort(netip.AddrPortFrom(address, uint16(port))), tlsConfig, quicConfig())
+		conn, dialErr := engine.Dial(attempt, net.UDPAddrFromAddrPort(netip.AddrPortFrom(address, uint16(port))), tlsConfig, quicConfig(q.opts))
 		stopKnocking()
 		if dialErr == nil {
+			installBBRv1(conn)
 			var stream *quic.Stream
 			if stream, dialErr = conn.OpenStreamSync(attempt); dialErr != nil {
 				conn.CloseWithError(1, "no stream")
@@ -445,12 +465,74 @@ func (s *quicSocket) WriteTo(raw []byte, remote net.Addr) (int, error) {
 		return 0, errors.New("invalid QUIC address")
 	}
 	s.hub.writeMu.Lock()
-	defer s.hub.writeMu.Unlock()
-	if err := s.socket.SetWriteDeadline(time.Now().Add(2 * time.Second)); err != nil {
-		return 0, err
+	n, err := s.socket.WriteToUDPAddrPort(raw, address.AddrPort())
+	s.hub.writeMu.Unlock()
+	return n, err
+}
+
+
+func (s *quicSocket) SyscallConn() (syscall.RawConn, error) {
+	return s.socket.SyscallConn()
+}
+
+func (s *quicSocket) ReadMsgUDP(b, oob []byte) (int, int, int, *net.UDPAddr, error) {
+	n, addr, err := s.ReadFrom(b)
+	if err != nil {
+		return 0, 0, 0, nil, err
 	}
-	defer s.socket.SetWriteDeadline(time.Time{})
-	return s.socket.WriteToUDPAddrPort(raw, address.AddrPort())
+	return n, 0, 0, addr.(*net.UDPAddr), nil
+}
+
+func (s *quicSocket) ReadBatch(ms []ipv4.Message, _ int) (int, error) {
+	if len(ms) == 0 {
+		return 0, nil
+	}
+	for {
+		s.deadline.Lock()
+		if s.changed == nil {
+			s.changed = make(chan struct{})
+		}
+		expired, changed := s.expired, s.changed
+		s.deadline.Unlock()
+		select {
+		case p := <-s.incoming:
+			ms[0].N = copy(ms[0].Buffers[0], p.buffer.Data)
+			ms[0].NN = 0
+			ms[0].Flags = 0
+			ms[0].Addr = net.UDPAddrFromAddrPort(p.remote)
+			p.buffer.Release()
+			count := 1
+			for count < len(ms) {
+				select {
+				case p = <-s.incoming:
+					ms[count].N = copy(ms[count].Buffers[0], p.buffer.Data)
+					ms[count].NN = 0
+					ms[count].Flags = 0
+					ms[count].Addr = net.UDPAddrFromAddrPort(p.remote)
+					p.buffer.Release()
+					count++
+				default:
+					return count, nil
+				}
+			}
+			return count, nil
+		case <-s.done:
+			return 0, net.ErrClosed
+		case <-expired:
+			return 0, os.ErrDeadlineExceeded
+		case <-changed:
+		}
+	}
+}
+
+func (s *quicSocket) WriteMsgUDP(b, oob []byte, addr *net.UDPAddr) (int, int, error) {
+	if addr == nil {
+		return 0, 0, errors.New("invalid QUIC address")
+	}
+	s.hub.writeMu.Lock()
+	n, oobn, err := s.socket.WriteMsgUDPAddrPort(b, oob, addr.AddrPort())
+	s.hub.writeMu.Unlock()
+	return n, oobn, err
 }
 
 func (s *quicSocket) Close() error {

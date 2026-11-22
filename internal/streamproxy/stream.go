@@ -168,7 +168,7 @@ func relay(ctx context.Context, a, b Conn, onError func(error)) error {
 	defer closeBoth()
 	errs := make(chan error, 2)
 	copyTo := func(dst, src Conn) {
-		_, err := io.CopyBuffer(dst, src, make([]byte, 64*1024))
+		_, err := relayCopy(dst, src)
 		if err == nil {
 			err = dst.CloseWrite()
 		}
@@ -187,4 +187,55 @@ func relay(ctx context.Context, a, b Conn, onError func(error)) error {
 		return ctx.Err()
 	}
 	return err
+}
+
+var relayBufPool = sync.Pool{New: func() any { b := make([]byte, 64*1024); return &b }}
+
+func relayCopy(dst io.Writer, src io.Reader) (int64, error) {
+	if wt, ok := src.(io.WriterTo); ok {
+		return wt.WriteTo(dst)
+	}
+	if rf, ok := dst.(io.ReaderFrom); ok {
+		return rf.ReadFrom(src)
+	}
+	if rw, ok := src.(interface{ ReadWindow() (int, error) }); ok {
+		var total int64
+		for {
+			avail, err := rw.ReadWindow()
+			if err == io.EOF {
+				return total, nil
+			}
+			if err != nil {
+				return total, err
+			}
+			if avail <= 0 {
+				continue
+			}
+			bp := relayBufPool.Get().(*[]byte)
+			buf := (*bp)[:min(len(*bp), avail)]
+			n, rerr := src.Read(buf)
+			if n > 0 {
+				wn, werr := dst.Write(buf[:n])
+				total += int64(wn)
+				if werr != nil {
+					relayBufPool.Put(bp)
+					return total, werr
+				}
+				if wn != n {
+					relayBufPool.Put(bp)
+					return total, io.ErrShortWrite
+				}
+			}
+			relayBufPool.Put(bp)
+			if rerr == io.EOF {
+				return total, nil
+			}
+			if rerr != nil {
+				return total, rerr
+			}
+		}
+	}
+	bp := relayBufPool.Get().(*[]byte)
+	defer relayBufPool.Put(bp)
+	return io.CopyBuffer(dst, src, *bp)
 }

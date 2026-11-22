@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"testing"
 
-	bolt "go.etcd.io/bbolt"
 )
 
 // A snapshot cached by a version this one cannot read is skipped, not fatal:
@@ -18,9 +17,9 @@ func TestUnreadableCachedSnapshotIsSkipped(t *testing.T) {
 	old := *desired
 	old.Schema--
 	raw, _ := json.Marshal(old)
-	if err := cache.db.Update(func(tx *bolt.Tx) error { return tx.Bucket(agentBucket).Put([]byte("desired"), raw) }); err != nil {
-		t.Fatal(err)
-	}
+	cache.mu.Lock()
+	cache.desired = raw
+	cache.mu.Unlock()
 	if got, _, err := cache.Snapshots(); err != nil || got != nil {
 		t.Fatalf("unreadable snapshot restored: %v %v", got, err)
 	}

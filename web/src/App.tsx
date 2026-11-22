@@ -712,7 +712,7 @@ function CreateNetwork({
               name,
               cidr,
               mtu,
-              cipher: 'chacha20-poly1305',
+              cipher: 'aes-128-gcm',
               nodes: [],
               edges: [],
             })

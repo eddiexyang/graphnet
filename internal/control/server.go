@@ -272,7 +272,7 @@ func (s *Server) createNetwork(w http.ResponseWriter, r *http.Request) {
 		n.MTU = model.DefaultMTU
 	}
 	if n.Cipher == "" {
-		n.Cipher = model.ChaCha20Poly1305
+		n.Cipher = model.AES128GCM
 	}
 	if n.Nodes == nil {
 		n.Nodes = []model.Node{}

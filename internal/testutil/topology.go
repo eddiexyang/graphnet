@@ -16,7 +16,7 @@ func ID(n int) model.ID { return model.ID(fmt.Sprintf("%032x", n)) }
 func Topology() model.State {
 	s := model.EmptyState()
 	s.Revision = 7
-	n := model.Network{ID: ID(1), Name: "Test network", CIDR: netip.MustParsePrefix("10.42.0.0/24"), MTU: model.DefaultMTU, Cipher: model.ChaCha20Poly1305}
+	n := model.Network{ID: ID(1), Name: "Test network", CIDR: netip.MustParsePrefix("10.42.0.0/24"), MTU: model.DefaultMTU, Cipher: model.AES128GCM}
 	for i := 0; i < 5; i++ {
 		seed := make([]byte, ed25519.SeedSize)
 		seed[0] = byte(i + 1)

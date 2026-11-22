@@ -20,8 +20,6 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
-	"os"
-	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -47,9 +45,6 @@ type Config struct {
 	// PrivateKey is the node identity. The controller knows its public key,
 	// registered by an operator or by enrollment.
 	PrivateKey ed25519.PrivateKey
-	// StateDir keeps the last configuration and controller directory across
-	// restarts. Empty uses a temporary directory removed by Close.
-	StateDir string
 	// Control is applied to every socket the client opens, after its own
 	// options; Lookup resolves every name it dials. The embedding application
 	// passes the options of its own outbound connections here, so the
@@ -57,6 +52,16 @@ type Config struct {
 	Control func(network, address string, c syscall.RawConn) error
 	Lookup  func(ctx context.Context, network, host string) ([]netip.Addr, error)
 	Logger  *slog.Logger
+	// QUICStreamReceiveWindow caps a QUIC Link per-stream receive window. Zero defaults to 32 MiB.
+	QUICStreamReceiveWindow uint64
+	// QUICConnectionReceiveWindow caps a QUIC Link connection receive window. Zero defaults to 48 MiB.
+	QUICConnectionReceiveWindow uint64
+	// StreamReceiveWindow caps the mux stream receive window when a Link does not
+	// expose a kernel socket receive buffer (such as QUIC). Zero defaults to 32 MiB.
+	StreamReceiveWindow uint64
+	// WebSocketRoots overrides the CA roots trusted when dialing WSS peer endpoints
+	// (nil trusts system roots for public CDNs plus direct peer identity pins).
+	WebSocketRoots *x509.CertPool
 }
 
 // ErrUnreachable means the network has no route to a destination.
@@ -69,7 +74,6 @@ type Client struct {
 	runtime *agent.DataPlane
 	control *agent.Client
 	done    chan struct{}
-	temp    string
 	mu      sync.Mutex
 	stacks  map[netip.Addr]*netstack
 }
@@ -97,22 +101,18 @@ func Start(ctx context.Context, cfg Config) (*Client, error) {
 		}
 	}
 	c := &Client{stacks: map[netip.Addr]*netstack{}, done: make(chan struct{})}
-	dir := cfg.StateDir
-	if dir == "" {
-		if dir, err = os.MkdirTemp("", "graphnet-client-"); err != nil {
-			return nil, err
-		}
-		c.temp = dir
-	}
-	if c.cache, err = agent.OpenCacheWithKey(filepath.Join(dir, "agent.db"), cfg.PrivateKey); err != nil {
-		c.removeTemp()
+	if c.cache, err = agent.NewMemoryCache(cfg.PrivateKey); err != nil {
 		return nil, fmt.Errorf("graphnet: open state: %w", err)
 	}
 	c.ctx, c.cancel = context.WithCancel(sockets.With(context.WithoutCancel(ctx), sockets.Hooks{Control: cfg.Control, Lookup: cfg.Lookup}))
 	var control *agent.Client
 	c.runtime, err = agent.NewDataPlane(c.ctx, cfg.PrivateKey, agent.DataPlaneOptions{
 		TunnelFactory: c.newStack,
-		Embedded:      true,
+		Embedded:                    true,
+		QUICStreamReceiveWindow:     cfg.QUICStreamReceiveWindow,
+		QUICConnectionReceiveWindow: cfg.QUICConnectionReceiveWindow,
+		StreamReceiveWindow:         cfg.StreamReceiveWindow,
+		WebSocketRoots:              cfg.WebSocketRoots,
 		Logger:        cfg.Logger,
 		Endpoints: func(endpoints []model.Endpoint) error {
 			if control == nil {
@@ -124,7 +124,6 @@ func Start(ctx context.Context, cfg Config) (*Client, error) {
 	if err != nil {
 		c.cancel()
 		c.cache.Close()
-		c.removeTemp()
 		return nil, err
 	}
 	control, err = agent.NewClient(c.cache, c.runtime, agent.Options{Server: cfg.Server, ServerTransport: cfg.ServerTransport, Roots: roots, Version: "client", Logger: cfg.Logger})
@@ -132,7 +131,6 @@ func Start(ctx context.Context, cfg Config) (*Client, error) {
 		c.runtime.Close()
 		c.cancel()
 		c.cache.Close()
-		c.removeTemp()
 		return nil, err
 	}
 	c.control = control
@@ -229,23 +227,28 @@ func (c *Client) DialTCP(ctx context.Context, destination netip.AddrPort) (net.C
 	if n.address().Is4() != destination.Addr().Is4() {
 		return nil, fmt.Errorf("%w: %s is not in the network's address family", ErrUnreachable, destination)
 	}
-	endpoint, err := n.bindTCP()
+	port, releasePort, err := n.allocPort()
 	if err != nil {
 		return nil, err
 	}
-	source := netip.AddrPortFrom(n.address(), endpoint.port)
+	source := netip.AddrPortFrom(n.address(), port)
 	stream, err := c.runtime.OpenEmbeddedTCP(ctx, network, source, destination)
 	if err != nil {
-		endpoint.Close()
+		releasePort()
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return nil, err
 		}
 		return nil, &net.OpError{Op: "connect", Net: "tcp", Source: net.TCPAddrFromAddrPort(source), Addr: net.TCPAddrFromAddrPort(destination), Err: err}
 	}
 	if stream == nil {
+		releasePort()
+		endpoint, err := n.bindTCP()
+	if err != nil {
+			return nil, err
+		}
 		return endpoint.connect(ctx, destination)
 	}
-	return streamproxy.ClientConn(c.ctx, stream, source, destination, endpoint.Close), nil
+	return streamproxy.ClientConn(c.ctx, stream, source, destination, releasePort), nil
 }
 
 // ListenUDP returns an unconnected UDP socket in the Network that routes
@@ -273,12 +276,6 @@ func (c *Client) Close() error {
 	err := c.runtime.Close()
 	c.control.Close()
 	err = errors.Join(err, c.cache.Close())
-	c.removeTemp()
 	return err
 }
 
-func (c *Client) removeTemp() {
-	if c.temp != "" {
-		os.RemoveAll(c.temp)
-	}
-}

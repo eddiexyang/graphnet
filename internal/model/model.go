@@ -28,11 +28,13 @@ const (
 	UDP  Transport = "udp"
 	TCP  Transport = "tcp"
 	QUIC Transport = "quic"
+	WS   Transport = "ws"
+	WSS  Transport = "wss"
 )
 
 func (t Transport) Valid() bool {
 	switch t {
-	case UDP, TCP, QUIC:
+	case UDP, TCP, QUIC, WS, WSS:
 		return true
 	}
 	return false

@@ -11,7 +11,6 @@ import (
 	"io"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"runtime/debug"
 	"strings"
 	"syscall"
@@ -61,6 +60,7 @@ func runAgentContext(parent context.Context, args []string) error {
 	data := fs.String("data-dir", "./graphnet-agent-data", "private persistent agent directory")
 	name := fs.String("name", "", "agent display name for first enrollment")
 	ca := fs.String("ca", "", "PEM CA certificate to trust for controller HTTPS")
+	originMTLSCA := fs.String("origin-mtls-ca", "", "optional PEM CA certificate requiring mTLS client certs on incoming WSS links")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -116,7 +116,18 @@ func runAgentContext(parent context.Context, args []string) error {
 		return err
 	}
 	var client *agent.Client
-	runtime, err := agent.NewDataPlane(ctx, cache.PrivateKey(), agent.DataPlaneOptions{Endpoints: func(endpoints []model.Endpoint) error {
+	var originClientCAs *x509.CertPool
+	if *originMTLSCA != "" {
+		raw, err := os.ReadFile(*originMTLSCA)
+		if err != nil {
+			return err
+		}
+		originClientCAs = x509.NewCertPool()
+		if !originClientCAs.AppendCertsFromPEM(raw) {
+			return errors.New("origin-mtls-ca contains no certificates")
+		}
+	}
+	runtime, err := agent.NewDataPlane(ctx, cache.PrivateKey(), agent.DataPlaneOptions{OriginClientCAs: originClientCAs, Endpoints: func(endpoints []model.Endpoint) error {
 		if client == nil {
 			return nil
 		}
@@ -126,17 +137,12 @@ func runAgentContext(parent context.Context, args []string) error {
 		return err
 	}
 	defer runtime.Close()
-	go writeLinkState(ctx, *data, runtime.LinkState)
-	updater, err := managedUpdater(ctx, *data)
-	if err != nil {
-		return err
-	}
 	token := os.Getenv("GRAPHNET_ENROLLMENT_TOKEN")
 	if explicit {
 		// An Agent given its key registers by public key alone.
 		token = ""
 	}
-	client, err = agent.NewClient(cache, runtime, agent.Options{Updater: updater, Server: *server, ServerTransport: *serverTransport, Name: *name, EnrollmentToken: token, Roots: roots, Version: version})
+	client, err = agent.NewClient(cache, runtime, agent.Options{Server: *server, ServerTransport: *serverTransport, Name: *name, EnrollmentToken: token, Roots: roots, Version: version})
 	if err != nil {
 		return err
 	}
@@ -209,20 +215,18 @@ func runAgentEnroll(args []string) error {
 // the data directory then only caches state for it.
 const agentPrivateKeyEnv = "GRAPHNET_PRIVATE_KEY"
 
-// openAgentCache opens the data directory's cache for the key in
-// agentPrivateKeyEnv, or for the identity the cache keeps when it is unset.
-func openAgentCache(data string) (cache *agent.Cache, explicit bool, err error) {
-	path := filepath.Join(data, "agent.db")
+// openAgentCache opens an in-memory cache for the key in agentPrivateKeyEnv.
+// Agent nodes keep no disk state and fetch configuration from the controller on every start.
+func openAgentCache(_ string) (cache *agent.Cache, explicit bool, err error) {
 	text := strings.TrimSpace(os.Getenv(agentPrivateKeyEnv))
 	if text == "" {
-		cache, err = agent.OpenCache(path)
-		return cache, false, err
+		return nil, false, errors.New(agentPrivateKeyEnv + " is required for stateless agent startup")
 	}
 	key, ok := model.ParseAgentPrivateKey(text)
 	if !ok {
 		return nil, false, errors.New(agentPrivateKeyEnv + " is not a base64 Ed25519 private key")
 	}
-	cache, err = agent.OpenCacheWithKey(path, key)
+	cache, err = agent.NewMemoryCache(key)
 	return cache, true, err
 }
 

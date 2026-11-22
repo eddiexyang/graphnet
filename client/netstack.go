@@ -27,12 +27,15 @@ import (
 // connections live in this user-space stack at the node's overlay address;
 // its packets go to the data plane exactly as a TUN's would.
 type netstack struct {
-	config tunnel.Config
-	stack  *stack.Stack
-	link   *netstackLink
-	ctx    context.Context
-	cancel context.CancelFunc
-	once   sync.Once
+	config   tunnel.Config
+	stack    *stack.Stack
+	link     *netstackLink
+	ctx      context.Context
+	cancel   context.CancelFunc
+	once     sync.Once
+	portMu   sync.Mutex
+	ports    map[uint16]struct{}
+	nextPort uint16
 }
 
 const netstackQueue = 1024
@@ -101,6 +104,33 @@ type boundTCP struct {
 	tcpip.Endpoint
 	queue waiter.Queue
 	port  uint16
+}
+
+func (n *netstack) allocPort() (uint16, func(), error) {
+	n.portMu.Lock()
+	defer n.portMu.Unlock()
+	if n.ports == nil {
+		n.ports = make(map[uint16]struct{})
+		n.nextPort = 32768
+	}
+	const minPort, maxPort = 32768, 65535
+	for i := 0; i <= maxPort-minPort; i++ {
+		p := n.nextPort
+		if n.nextPort == maxPort {
+			n.nextPort = minPort
+		} else {
+			n.nextPort++
+		}
+		if _, used := n.ports[p]; !used {
+			n.ports[p] = struct{}{}
+			return p, func() {
+				n.portMu.Lock()
+				delete(n.ports, p)
+				n.portMu.Unlock()
+			}, nil
+		}
+	}
+	return 0, nil, errors.New("graphnet: no ephemeral source port available")
 }
 
 func (n *netstack) bindTCP() (*boundTCP, error) {

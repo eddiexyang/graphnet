@@ -1,7 +1,7 @@
 import ipaddr from 'ipaddr.js'
 import { effectiveEdges, pruneGroups, type FullMeshGroup, type GroupLink } from './groups'
-export type Transport = 'udp' | 'tcp' | 'quic'
-export const transports: Transport[] = ['udp', 'tcp', 'quic']
+export type Transport = 'udp' | 'tcp' | 'quic' | 'ws' | 'wss'
+export const transports: Transport[] = ['udp', 'tcp', 'quic', 'ws', 'wss']
 export type Endpoint = {
   id: string
   transport: Transport

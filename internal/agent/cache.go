@@ -1,4 +1,4 @@
-// Package agent implements the durable Agent identity and controller client.
+// Package agent implements the in-memory Agent state and controller client.
 package agent
 
 import (
@@ -10,15 +10,10 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
-	"os"
-	"path/filepath"
-	"time"
+	"sync"
 
 	"github.com/eddiexyang/graphnet/internal/model"
-	bolt "go.etcd.io/bbolt"
 )
-
-var agentBucket = []byte("agent-v1")
 
 const maxSnapshotBytes = 8 << 20
 
@@ -36,77 +31,48 @@ type Registration struct {
 // KeyOnly reports a registration by public key, without a certificate.
 func (r Registration) KeyOnly() bool { return len(r.Certificate) == 0 }
 
+func (r Registration) clone() Registration {
+	out := r
+	out.CA = bytes.Clone(r.CA)
+	out.Certificate = bytes.Clone(r.Certificate)
+	if r.Directory != nil {
+		out.Directory = r.Directory.Clone()
+	}
+	return out
+}
+
+// Cache holds an Agent runtime state strictly in memory. Nothing is written to
+// disk; on every start the node registers by its configured key and fetches
+// configuration from the controller.
 type Cache struct {
-	db  *bolt.DB
-	key ed25519.PrivateKey
+	mu      sync.Mutex
+	key     ed25519.PrivateKey
+	reg     *Registration
+	desired []byte
+	applied []byte
+	routes  []byte
+	lastSrv string
 }
 
-func OpenCache(path string) (*Cache, error) { return openCache(path, nil) }
-
-// OpenCacheWithKey opens a cache for an identity kept by the caller, for
-// example in configuration. The key is the Agent's identity and the cache only
-// its state: a cache created for a different identity is cleared, and the
-// Agent registers again with the key.
-func OpenCacheWithKey(path string, identity ed25519.PrivateKey) (*Cache, error) {
-	if len(identity) != ed25519.PrivateKeySize || !bytes.Equal(ed25519.NewKeyFromSeed(identity.Seed()), identity) {
-		return nil, errors.New("invalid private identity")
+// NewMemoryCache creates an in-memory cache for identity. If identity is nil,
+// a fresh ephemeral key is generated (used by tests and enrollment).
+func NewMemoryCache(identity ed25519.PrivateKey) (*Cache, error) {
+	var key ed25519.PrivateKey
+	if identity != nil {
+		if len(identity) != ed25519.PrivateKeySize || !bytes.Equal(ed25519.NewKeyFromSeed(identity.Seed()), identity) {
+			return nil, errors.New("invalid private identity")
+		}
+		key = bytes.Clone(identity)
+	} else {
+		var err error
+		if _, key, err = ed25519.GenerateKey(rand.Reader); err != nil {
+			return nil, err
+		}
 	}
-	return openCache(path, identity)
+	return &Cache{key: key}, nil
 }
 
-func openCache(path string, identity ed25519.PrivateKey) (*Cache, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
-		return nil, err
-	}
-	db, err := bolt.Open(path, 0600, &bolt.Options{Timeout: time.Second})
-	if err != nil {
-		return nil, err
-	}
-	cache := &Cache{db: db}
-	err = db.Update(func(tx *bolt.Tx) error {
-		b, err := tx.CreateBucketIfNotExists(agentBucket)
-		if err != nil {
-			return err
-		}
-		key := b.Get([]byte("identity"))
-		if identity != nil && key != nil && !bytes.Equal(key, identity) {
-			if err := tx.DeleteBucket(agentBucket); err != nil {
-				return err
-			}
-			if b, err = tx.CreateBucket(agentBucket); err != nil {
-				return err
-			}
-			key = nil
-		}
-		if key != nil {
-			if len(key) != ed25519.PrivateKeySize {
-				return errors.New("invalid stored private identity")
-			}
-			derived := ed25519.NewKeyFromSeed(key[:ed25519.SeedSize])
-			if !bytes.Equal(derived, key) {
-				return errors.New("corrupted private identity")
-			}
-			cache.key = bytes.Clone(key)
-			return nil
-		}
-		if b.Get([]byte("registration")) != nil || b.Get([]byte("desired")) != nil {
-			return errors.New("agent identity is missing from existing cache")
-		}
-		if identity != nil {
-			key = bytes.Clone(identity)
-		} else if _, key, err = ed25519.GenerateKey(rand.Reader); err != nil {
-			return err
-		}
-		cache.key = bytes.Clone(key)
-		return b.Put([]byte("identity"), key)
-	})
-	if err != nil {
-		db.Close()
-		return nil, err
-	}
-	return cache, nil
-}
-func (c *Cache) Close() error                   { return c.db.Close() }
+func (c *Cache) Close() error                   { return nil }
 func (c *Cache) PrivateKey() ed25519.PrivateKey { return bytes.Clone(c.key) }
 func (c *Cache) PublicKey() ed25519.PublicKey   { return c.key.Public().(ed25519.PublicKey) }
 func (c *Cache) CSR() ([]byte, error) {
@@ -114,16 +80,15 @@ func (c *Cache) CSR() ([]byte, error) {
 }
 
 func (c *Cache) Registration() (*Registration, error) {
-	var registration *Registration
-	err := c.db.View(func(tx *bolt.Tx) error {
-		raw := tx.Bucket(agentBucket).Get([]byte("registration"))
-		if raw == nil {
-			return nil
-		}
-		return json.Unmarshal(raw, &registration)
-	})
-	return registration, err
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.reg == nil {
+		return nil, nil
+	}
+	cp := c.reg.clone()
+	return &cp, nil
 }
+
 func (c *Cache) SaveRegistration(reg Registration) error {
 	if err := reg.AgentID.Validate(); err != nil {
 		return err
@@ -141,24 +106,18 @@ func (c *Cache) SaveRegistration(reg Registration) error {
 	if err := validateDirectory(reg, reg.Directory); err != nil {
 		return err
 	}
-	raw, err := json.Marshal(reg)
-	if err != nil {
-		return err
-	}
-	return c.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(agentBucket)
-		if prior := b.Get([]byte("registration")); prior != nil {
-			var old Registration
-			if err := json.Unmarshal(prior, &old); err != nil {
-				return err
-			}
-			if old.AgentID != reg.AgentID || old.Server != reg.Server || (len(old.CA) > 0 && !bytes.Equal(old.CA, reg.CA)) {
-				return errors.New("registration cannot change agent or controller identity")
-			}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.reg != nil {
+		if c.reg.AgentID != reg.AgentID || c.reg.Server != reg.Server || (len(c.reg.CA) > 0 && !bytes.Equal(c.reg.CA, reg.CA)) {
+			return errors.New("registration cannot change agent or controller identity")
 		}
-		return b.Put([]byte("registration"), raw)
-	})
+	}
+	cp := reg.clone()
+	c.reg = &cp
+	return nil
 }
+
 func (c *Cache) TLSCertificate(reg Registration) (tls.Certificate, error) {
 	block, rest := pem.Decode(reg.Certificate)
 	if block == nil || block.Type != "CERTIFICATE" || len(bytes.TrimSpace(rest)) != 0 {
@@ -175,50 +134,44 @@ func (c *Cache) TLSCertificate(reg Registration) (tls.Certificate, error) {
 	return tls.Certificate{Certificate: [][]byte{cert.Raw}, PrivateKey: c.PrivateKey(), Leaf: cert}, nil
 }
 
-func snapshotFrom(b *bolt.Bucket, key string) (*model.Snapshot, error) {
-	raw := b.Get([]byte(key))
+func (c *Cache) snapshotFromLocked(raw []byte) (*model.Snapshot, error) {
 	if raw == nil {
 		return nil, nil
 	}
 	if len(raw) > maxSnapshotBytes {
 		return nil, errors.New("cached snapshot too large")
 	}
-	var reg Registration
-	if err := json.Unmarshal(b.Get([]byte("registration")), &reg); err != nil {
-		return nil, err
+	if c.reg == nil {
+		return nil, errors.New("missing registration")
 	}
-	// A snapshot another version cached that this one cannot read is not
-	// restored: the Agent starts without it and the controller sends a
-	// current one.
 	var snapshot model.Snapshot
-	if json.Unmarshal(raw, &snapshot) != nil || snapshot.Validate(reg.AgentID) != nil {
+	if json.Unmarshal(raw, &snapshot) != nil || snapshot.Validate(c.reg.AgentID) != nil {
 		return nil, nil
 	}
 	return &snapshot, nil
 }
+
 func (c *Cache) Snapshots() (desired, applied *model.Snapshot, err error) {
-	err = c.db.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket(agentBucket)
-		var err error
-		desired, err = snapshotFrom(b, "desired")
-		if err != nil {
-			return err
-		}
-		applied, err = snapshotFrom(b, "applied")
-		return err
-	})
-	return
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if desired, err = c.snapshotFromLocked(c.desired); err != nil {
+		return nil, nil, err
+	}
+	applied, err = c.snapshotFromLocked(c.applied)
+	return desired, applied, err
 }
 
 // SaveDesired must finish before runtime application. A revision identifies one
 // immutable snapshot; replaying it with different content is an error.
 func (c *Cache) SaveDesired(snapshot model.Snapshot) error {
-	return c.saveSnapshot("desired", snapshot)
+	return c.saveSnapshot(false, snapshot)
 }
+
 func (c *Cache) MarkApplied(snapshot model.Snapshot) error {
-	return c.saveSnapshot("applied", snapshot)
+	return c.saveSnapshot(true, snapshot)
 }
-func (c *Cache) saveSnapshot(key string, snapshot model.Snapshot) error {
+
+func (c *Cache) saveSnapshot(applied bool, snapshot model.Snapshot) error {
 	raw, err := json.Marshal(snapshot)
 	if err != nil {
 		return err
@@ -226,44 +179,49 @@ func (c *Cache) saveSnapshot(key string, snapshot model.Snapshot) error {
 	if len(raw) > maxSnapshotBytes {
 		return errors.New("snapshot too large")
 	}
-	return c.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(agentBucket)
-		var reg Registration
-		if err := json.Unmarshal(b.Get([]byte("registration")), &reg); err != nil {
-			return err
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.reg == nil {
+		return errors.New("missing registration")
+	}
+	if err := snapshot.Validate(c.reg.AgentID); err != nil {
+		return err
+	}
+	slot := c.desired
+	if applied {
+		slot = c.applied
+	}
+	prior, err := c.snapshotFromLocked(slot)
+	if err != nil {
+		return err
+	}
+	if prior != nil {
+		if snapshot.Revision < prior.Revision {
+			return errors.New("snapshot revision rollback rejected")
 		}
-		if err := snapshot.Validate(reg.AgentID); err != nil {
-			return err
+		if snapshot.Revision == prior.Revision {
+			previous, _ := json.Marshal(prior)
+			if !bytes.Equal(raw, previous) {
+				return errors.New("snapshot revision changed content")
+			}
+			return nil
 		}
-		prior, err := snapshotFrom(b, key)
+	}
+	if applied {
+		desired, err := c.snapshotFromLocked(c.desired)
 		if err != nil {
 			return err
 		}
-		if prior != nil {
-			if snapshot.Revision < prior.Revision {
-				return errors.New("snapshot revision rollback rejected")
-			}
-			if snapshot.Revision == prior.Revision {
-				previous, _ := json.Marshal(prior)
-				if !bytes.Equal(raw, previous) {
-					return errors.New("snapshot revision changed content")
-				}
-				return nil
-			}
+		if desired == nil {
+			return errors.New("cannot apply before persisting desired snapshot")
 		}
-		if key == "applied" {
-			desired, err := snapshotFrom(b, "desired")
-			if err != nil {
-				return err
-			}
-			if desired == nil {
-				return errors.New("cannot apply before persisting desired snapshot")
-			}
-			expected, _ := json.Marshal(desired)
-			if !bytes.Equal(raw, expected) {
-				return errors.New("applied snapshot differs from desired state")
-			}
+		expected, _ := json.Marshal(desired)
+		if !bytes.Equal(raw, expected) {
+			return errors.New("applied snapshot differs from desired state")
 		}
-		return b.Put([]byte(key), raw)
-	})
+		c.applied = raw
+		return nil
+	}
+	c.desired = raw
+	return nil
 }

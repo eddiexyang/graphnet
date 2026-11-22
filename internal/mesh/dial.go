@@ -248,6 +248,12 @@ func (g *group) connect(ctx context.Context, candidate link.Candidate) (*peer.Ch
 			return nil, linkCaps{}, err
 		}
 		raw = transport.NewStream(conn)
+	} else if candidate.Endpoint.Transport == model.WS || candidate.Endpoint.Transport == model.WSS {
+		conn, err := transport.DialWebSocketAt(ctx, candidate.Endpoint, candidate.Family, g.policy.Load().peer.PublicKey, g.mesh.wsRoots, target)
+		if err != nil {
+			return nil, linkCaps{}, err
+		}
+		raw = conn
 	} else if candidate.Endpoint.Transport == model.QUIC {
 		conn, err := g.mesh.quic.DialAt(ctx, candidate.Endpoint, candidate.Family, g.policy.Load().peer.PublicKey, target)
 		if err != nil {

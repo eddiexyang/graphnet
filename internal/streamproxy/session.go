@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -460,7 +461,13 @@ type End struct {
 	// attempt to start at once.
 	attempt  context.CancelFunc
 	rerouted bool
-	orphan   time.Time
+	orphan      time.Time
+	orphanTimer *time.Timer
+	readDL      time.Time
+	writeDL     time.Time
+	readDLTmr   *time.Timer
+	writeDLTmr  *time.Timer
+	onDone      []func()
 	done     bool
 	closed   bool
 	err      error
@@ -474,7 +481,6 @@ func newEnd(parent context.Context, counters *Counters, records *Records) *End {
 		e.keep.budget.join()
 	}
 	e.cond = sync.NewCond(&e.mu)
-	go e.watchOrphan()
 	return e
 }
 
@@ -527,6 +533,20 @@ func (e *End) useLocked(hop Hop, out, in uint64) {
 	e.keep.Release(hop.PeerDelivered())
 	e.hop, e.in, e.inRead = hop, in, 0
 	e.orphan = time.Time{}
+	if e.orphanTimer != nil {
+		e.orphanTimer.Stop()
+		e.orphanTimer = nil
+	}
+	if !e.readDL.IsZero() {
+		if dl, ok := hop.(interface{ SetReadDeadline(time.Time) error }); ok {
+			_ = dl.SetReadDeadline(e.readDL)
+		}
+	}
+	if !e.writeDL.IsZero() {
+		if dl, ok := hop.(interface{ SetWriteDeadline(time.Time) error }); ok {
+			_ = dl.SetWriteDeadline(e.writeDL)
+		}
+	}
 	e.cond.Broadcast()
 }
 
@@ -601,6 +621,13 @@ func (e *End) Accept(hop Hop, gen uint32, down, up uint64, at bool, answer func(
 	e.replacement = hop
 	if e.orphan.IsZero() {
 		e.orphan = time.Now()
+		e.orphanTimer = time.AfterFunc(orphanLifetime, func() {
+			e.mu.Lock()
+			if !e.done && !e.orphan.IsZero() && time.Since(e.orphan) >= orphanLifetime {
+				e.finishLocked(errNoPath)
+			}
+			e.mu.Unlock()
+		})
 	}
 	if at {
 		down = max(down, e.read)
@@ -847,21 +874,79 @@ func (e *End) waitReplay(gen uint32) {
 	}
 }
 
-func (e *End) watchOrphan() {
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-e.ctx.Done():
-			return
-		case <-ticker.C:
-		}
-		e.mu.Lock()
-		if !e.done && !e.orphan.IsZero() && time.Since(e.orphan) > orphanLifetime {
-			e.finishLocked(errNoPath)
-		}
+func (e *End) OnDone(fn func()) {
+	e.mu.Lock()
+	if e.done {
 		e.mu.Unlock()
+		fn()
+		return
 	}
+	e.onDone = append(e.onDone, fn)
+	e.mu.Unlock()
+}
+
+func (e *End) HasUnread() bool {
+	if e.records != nil && e.records.available() > 0 {
+		return true
+	}
+	e.mu.Lock()
+	hop := e.hop
+	e.mu.Unlock()
+	if hop == nil {
+		return false
+	}
+	if b, ok := hop.(interface{ Buffered() int }); ok {
+		return b.Buffered() > 0
+	}
+	return false
+}
+
+func (e *End) SetReadDeadline(t time.Time) error {
+	e.mu.Lock()
+	e.readDL = t
+	if e.readDLTmr != nil {
+		e.readDLTmr.Stop()
+		e.readDLTmr = nil
+	}
+	if !t.IsZero() {
+		if d := time.Until(t); d <= 0 {
+			e.cond.Broadcast()
+		} else {
+			e.readDLTmr = time.AfterFunc(d, func() { e.cond.Broadcast() })
+		}
+	}
+	hop := e.hop
+	e.mu.Unlock()
+	if hop != nil {
+		if dl, ok := hop.(interface{ SetReadDeadline(time.Time) error }); ok {
+			return dl.SetReadDeadline(t)
+		}
+	}
+	return nil
+}
+
+func (e *End) SetWriteDeadline(t time.Time) error {
+	e.mu.Lock()
+	e.writeDL = t
+	if e.writeDLTmr != nil {
+		e.writeDLTmr.Stop()
+		e.writeDLTmr = nil
+	}
+	if !t.IsZero() {
+		if d := time.Until(t); d <= 0 {
+			e.cond.Broadcast()
+		} else {
+			e.writeDLTmr = time.AfterFunc(d, func() { e.cond.Broadcast() })
+		}
+	}
+	hop := e.hop
+	e.mu.Unlock()
+	if hop != nil {
+		if dl, ok := hop.(interface{ SetWriteDeadline(time.Time) error }); ok {
+			return dl.SetWriteDeadline(t)
+		}
+	}
+	return nil
 }
 
 // current waits for a chain; it returns nil once the session ended.
@@ -896,8 +981,25 @@ func (e *End) finishLocked(err error) {
 		e.replacement.AbortSession()
 	}
 	e.keep.close()
+	if e.orphanTimer != nil {
+		e.orphanTimer.Stop()
+		e.orphanTimer = nil
+	}
+	if e.readDLTmr != nil {
+		e.readDLTmr.Stop()
+		e.readDLTmr = nil
+	}
+	if e.writeDLTmr != nil {
+		e.writeDLTmr.Stop()
+		e.writeDLTmr = nil
+	}
+	callbacks := e.onDone
+	e.onDone = nil
 	e.cond.Broadcast()
 	e.cancel()
+	for _, cb := range callbacks {
+		cb()
+	}
 }
 
 // ReadFrom sends the local connection's bytes on the current chain. A chain
@@ -937,6 +1039,9 @@ func (e *End) ReadFrom(src io.Reader) (int64, error) {
 			e.leftover = append(e.leftover, left...)
 			e.mu.Unlock()
 		}
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			return total, os.ErrDeadlineExceeded
+		}
 		if err == nil {
 			return total, nil
 		}
@@ -955,6 +1060,12 @@ func (e *End) ReadFrom(src io.Reader) (int64, error) {
 }
 
 func (e *End) Write(p []byte) (int, error) {
+	e.mu.Lock()
+	dl := e.writeDL
+	e.mu.Unlock()
+	if !dl.IsZero() && !time.Now().Before(dl) {
+		return 0, os.ErrDeadlineExceeded
+	}
 	n, err := e.ReadFrom(&onceReader{p: p})
 	return int(n), err
 }
@@ -977,6 +1088,9 @@ func (e *End) input() (Hop, uint64, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	for !e.done && !e.ended && e.hop == nil {
+		if !e.readDL.IsZero() && !time.Now().Before(e.readDL) {
+			return nil, 0, os.ErrDeadlineExceeded
+		}
 		e.cond.Wait()
 	}
 	if e.ended {
@@ -995,7 +1109,7 @@ func (e *End) input() (Hop, uint64, error) {
 // ReadWindow reports bytes Read can return without waiting.
 func (e *End) ReadWindow() (int, error) {
 	if e.records != nil {
-		if err := e.openRecord(); err != nil {
+		if err := e.openRecord(window); err != nil {
 			return 0, err
 		}
 		return e.records.available(), nil
@@ -1027,7 +1141,7 @@ func (e *End) Read(p []byte) (int, error) {
 		return 0, nil
 	}
 	if r := e.records; r != nil {
-		if err := e.openRecord(); err != nil {
+		if err := e.openRecord(min(len(p), window)); err != nil {
 			return 0, err
 		}
 		return r.read(p), nil
@@ -1041,6 +1155,12 @@ func (e *End) Read(p []byte) (int, error) {
 			continue
 		}
 		n, err := hop.Read(p)
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			if n > 0 {
+				_ = e.received(hop, n, nil)
+			}
+			return n, os.ErrDeadlineExceeded
+		}
 		if err := e.received(hop, n, err); err != nil || n > 0 {
 			return n, err
 		}
@@ -1051,7 +1171,7 @@ func (e *End) Read(p []byte) (int, error) {
 // then opens what the current chain has of the records after it without
 // waiting. A record that fails to open, or that the direction ends within,
 // resets the connection.
-func (e *End) openRecord() error {
+func (e *End) openRecord(limit int) error {
 	r := e.records
 	for r.available() == 0 {
 		hop, skip, err := e.input()
@@ -1059,11 +1179,14 @@ func (e *End) openRecord() error {
 			continue
 		}
 		if err == nil {
-			err = e.openFrom(hop, true)
+			err = e.openFrom(hop, true, limit)
 		}
 		if err = e.recordError(err); err != nil {
 			return err
 		}
+	}
+	if r.available() >= limit {
+		return nil
 	}
 	e.mu.Lock()
 	hop := e.hop
@@ -1072,7 +1195,7 @@ func (e *End) openRecord() error {
 	if !current {
 		return nil
 	}
-	if err := e.openFrom(hop, false); errors.Is(err, errRecord) {
+	if err := e.openFrom(hop, false, limit); errors.Is(err, errRecord) {
 		// What opened before the record is not read: the connection is
 		// reset as it would be at that record.
 		return e.recordError(err)
@@ -1081,10 +1204,10 @@ func (e *End) openRecord() error {
 }
 
 // openFrom opens records hop received: until one opened when wait, and what
-// hop has without waiting otherwise. A record that arrived whole in one of
-// hop's buffers opens there; other bytes are read into the window. A failed
-// chain returns nil, so the caller reads the next one.
-func (e *End) openFrom(hop Hop, wait bool) error {
+// hop has without waiting otherwise up to limit opened bytes. A record that
+// arrived whole in one of hop's buffers opens there; other bytes are read
+// into the window. A failed chain returns nil, so the caller reads the next one.
+func (e *End) openFrom(hop Hop, wait bool, limit int) error {
 	r := e.records
 	taker, takes := hop.(interface {
 		TakeChunk() ([]byte, *packetbuf.Buffer, error)
@@ -1100,9 +1223,9 @@ func (e *End) openFrom(hop Hop, wait bool) error {
 	for {
 		budget := -1
 		if !wait {
-			// What is opened is bounded as the window bounds it: the rest
+			// What is opened is bounded by limit (at most window): the rest
 			// stays with the hop, whose window holds the sender back.
-			if !hasBuffered || r.available() >= window {
+			if !hasBuffered || r.available() >= limit {
 				return nil
 			}
 			if budget = buffered.Buffered(); budget == 0 && r.pending == nil {
@@ -1127,7 +1250,7 @@ func (e *End) openFrom(hop Hop, wait bool) error {
 		if budget >= 0 {
 			budget += len(r.pending)
 		}
-		opened, err := r.fill(read, budget)
+		opened, err := r.fillLimit(read, budget, limit)
 		if err != nil || !wait {
 			return err
 		}
@@ -1330,7 +1453,7 @@ func RelayHops(ctx context.Context, up, down Hop) error {
 		if relay, ok := src.(interface{ RelayTo(Hop) (int64, error) }); ok {
 			_, err = relay.RelayTo(dst)
 		} else {
-			_, err = io.CopyBuffer(dst, src, make([]byte, 64*1024))
+			_, err = relayCopy(dst, src)
 		}
 		if err == nil {
 			err = dst.CloseWrite()

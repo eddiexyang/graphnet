@@ -36,7 +36,7 @@ func registeredController(t *testing.T, legacy ...bool) (*Cache, *pki.Authority,
 	if err != nil {
 		t.Fatal(err)
 	}
-	cache, err := OpenCache(filepath.Join(t.TempDir(), "agent.db"))
+	cache, err := NewMemoryCache(nil)
 	if err != nil {
 		t.Fatal(err)
 	}

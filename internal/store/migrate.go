@@ -19,7 +19,7 @@ func migrate(state *model.State) {
 }
 
 // dropRemoved removes what GraphNet no longer carries from a stored state:
-// WebSocket and gRPC endpoints and transports, and WireGuard nodes,
+// gRPC endpoints and transports, and WireGuard nodes,
 // which decode without an Agent, with their edges. A transport list left
 // empty falls back to UDP, and an override left empty inherits.
 func dropRemoved(state *model.State) {

@@ -51,7 +51,7 @@ func TestTCPConnectsOnceItsPathExists(t *testing.T) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 		defer cancel()
-		conn, err := gonet.DialContextTCP(ctx, devices[0].stack, tcpip.FullAddress{NIC: 1, Addr: tcpip.AddrFrom4(address.As4()), Port: 8083}, ipv4.ProtocolNumber)
+		conn, err := devices[0].dialTCP(ctx, tcpip.AddrFrom4(address.As4()), 8083, ipv4.ProtocolNumber)
 		if err == nil {
 			buf := make([]byte, 2)
 			conn.SetReadDeadline(time.Now().Add(5 * time.Second))

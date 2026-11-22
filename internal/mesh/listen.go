@@ -12,7 +12,7 @@ import (
 // TCP and UDP have separate ephemeral-port allocators. A randomly selected TCP
 // port may already belong to a UDP listener. Retry the pair, releasing each
 // failed TCP reservation; never change an explicitly requested port.
-func listenTransports(ctx context.Context, identity ed25519.PrivateKey, host string, port uint16, listenTCP func(context.Context, string) (*transport.TCP, error)) (*transport.TCP, *transport.UDP, *transport.QUICHub, error) {
+func listenTransports(ctx context.Context, identity ed25519.PrivateKey, host string, port uint16, listenTCP func(context.Context, string) (*transport.TCP, error), quicOpts ...transport.QUICOptions) (*transport.TCP, *transport.UDP, *transport.QUICHub, error) {
 	for attempt := 0; ; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return nil, nil, nil, err
@@ -23,7 +23,7 @@ func listenTransports(ctx context.Context, identity ed25519.PrivateKey, host str
 		}
 		udp, err := transport.ListenUDP(ctx, tcp.Addr().String())
 		if err == nil {
-			quic, err := udp.EnableQUIC(identity)
+			quic, err := udp.EnableQUIC(identity, quicOpts...)
 			if err != nil {
 				udp.Close()
 				tcp.Close()

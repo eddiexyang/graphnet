@@ -28,7 +28,7 @@ func TestAgentRegistersByKeyThroughAControllerTunnel(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	cache, err := OpenCache(filepath.Join(t.TempDir(), "agent.db"))
+	cache, err := NewMemoryCache(nil)
 	if err != nil {
 		t.Fatal(err)
 	}

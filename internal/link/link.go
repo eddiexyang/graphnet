@@ -574,7 +574,7 @@ func (l *Link) maskedFrame(frame []byte, owners []*packetbuf.Buffer, i int) *pac
 func (l *Link) TCPBacked() bool { return l.tcpBacked() }
 
 func (l *Link) tcpBacked() bool {
-	return l.info.Transport == model.TCP || l.info.Transport == model.QUIC
+	return l.info.Transport == model.TCP || l.info.Transport == model.QUIC || l.info.Transport == model.WS || l.info.Transport == model.WSS
 }
 
 func (l *Link) notifyData() {
