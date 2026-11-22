@@ -59,12 +59,13 @@ type Options struct {
 	Version         string
 	UpdateDirectory string
 	Password        string
+	APIToken        string
 	Logger          *slog.Logger
 	GeoIPDirectory  string
 }
 
 func New(db *store.Store, options Options) (*Server, error) {
-	auth, err := newAuth(db, options.Password)
+	auth, err := newAuth(db, options.Password, options.APIToken)
 	if err != nil {
 		return nil, err
 	}

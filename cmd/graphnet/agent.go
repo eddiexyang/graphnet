@@ -137,6 +137,7 @@ func runAgentContext(parent context.Context, args []string) error {
 		return err
 	}
 	defer runtime.Close()
+	go writeLinkState(ctx, *data, runtime.LinkState)
 	token := os.Getenv("GRAPHNET_ENROLLMENT_TOKEN")
 	if explicit {
 		// An Agent given its key registers by public key alone.

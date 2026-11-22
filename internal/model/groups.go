@@ -140,13 +140,27 @@ func (n Network) sources(link GroupLink) []ID {
 	return g.Members
 }
 
+func (n Network) clientNodes() map[ID]bool {
+	clients := make(map[ID]bool)
+	for _, node := range n.Nodes {
+		if node.Client {
+			clients[node.ID] = true
+		}
+	}
+	return clients
+}
+
 func (n Network) groupEdges(g FullMeshGroup) []Edge {
+	clients := n.clientNodes()
 	members := slices.Clone(g.Members)
 	slices.Sort(members)
 	overrides := newOverrideSet(g.Overrides)
 	edges := []Edge{}
 	for i, a := range members {
 		for _, b := range members[i+1:] {
+			if clients[a] && clients[b] {
+				continue
+			}
 			edges = append(edges, overrides.apply(Edge{ID: GroupEdgeID(g.ID, a, b), A: a, B: b, Weight: g.RoutingWeight(), Enabled: true, Transports: slices.Clone(g.Transports), Methods: g.Methods}))
 		}
 	}
@@ -158,10 +172,14 @@ func (n Network) linkEdges(link GroupLink) []Edge {
 	if !ok {
 		return nil
 	}
+	clients := n.clientNodes()
 	overrides := newOverrideSet(link.Overrides)
 	edges := []Edge{}
 	for _, a := range n.sources(link) {
 		for _, b := range g.Members {
+			if clients[a] && clients[b] {
+				continue
+			}
 			edges = append(edges, overrides.apply(Edge{ID: GroupEdgeID(link.ID, a, b), A: a, B: b, Weight: link.Weight, Enabled: link.Enabled, Transports: slices.Clone(link.Transports), Methods: link.Methods}))
 		}
 	}
@@ -205,22 +223,27 @@ func (n Network) validateGroups(addID func(ID) error) error {
 		if err := validateName(g.Name); err != nil {
 			return err
 		}
-		if len(g.Members) < 2 || len(g.Members) > MaxNodes {
-			return fmt.Errorf("full mesh group requires 2–%d members", MaxNodes)
+		if len(g.Members) > MaxNodes {
+			return fmt.Errorf("full mesh group allows at most %d members", MaxNodes)
 		}
-		size := int64(len(g.Members))
-		count += size * (size - 1) / 2
-		if count > MaxEdges {
-			return fmt.Errorf("full mesh topology exceeds %d edges", MaxEdges)
-		}
+		var clientMembers int64
 		for _, id := range g.Members {
-			if _, ok := nodes[id]; !ok {
-				return fmt.Errorf("full mesh members must be regular nodes in this network")
+			node, ok := nodes[id]
+			if !ok {
+				return fmt.Errorf("group members must be nodes in this network")
 			}
 			if used[id] {
 				return fmt.Errorf("node belongs to a full mesh group more than once")
 			}
 			used[id] = true
+			if node.Client {
+				clientMembers++
+			}
+		}
+		size := int64(len(g.Members))
+		count += size*(size-1)/2 - clientMembers*(clientMembers-1)/2
+		if count > MaxEdges {
+			return fmt.Errorf("full mesh topology exceeds %d edges", MaxEdges)
 		}
 	}
 	groups := map[ID]FullMeshGroup{}
@@ -229,7 +252,7 @@ func (n Network) validateGroups(addID func(ID) error) error {
 	}
 	for _, g := range n.Groups {
 		if err := validateOverrides(g.Overrides, func(a, b ID) bool {
-			return a != b && slices.Contains(g.Members, a) && slices.Contains(g.Members, b)
+			return a != b && !(nodes[a].Client && nodes[b].Client) && slices.Contains(g.Members, a) && slices.Contains(g.Members, b)
 		}); err != nil {
 			return err
 		}
@@ -244,17 +267,14 @@ func (n Network) validateGroups(addID func(ID) error) error {
 			return fmt.Errorf("group link requires an existing target group")
 		}
 		var key [2]ID
-		size := int64(len(g.Members))
 		if link.SourceGroup != "" {
-			source, ok := groups[link.SourceGroup]
-			if link.Node != "" || !ok || link.SourceGroup == link.Group {
+			if _, ok := groups[link.SourceGroup]; link.Node != "" || !ok || link.SourceGroup == link.Group {
 				return fmt.Errorf("group-to-group link requires two distinct groups and no node")
 			}
 			key = pairKey(link.SourceGroup, link.Group)
-			size *= int64(len(source.Members))
 		} else {
 			if _, ok := nodes[link.Node]; !ok || slices.Contains(g.Members, link.Node) {
-				return fmt.Errorf("group link requires a regular node outside its target group")
+				return fmt.Errorf("group link requires a node outside its target group")
 			}
 			key = [2]ID{link.Node, link.Group}
 		}
@@ -262,12 +282,26 @@ func (n Network) validateGroups(addID func(ID) error) error {
 			return fmt.Errorf("duplicate group link")
 		}
 		pairs[key] = true
-		count += size
+		near := n.sources(link)
+		var nearClients, targetClients int64
+		for _, id := range near {
+			if nodes[id].Client {
+				nearClients++
+			}
+		}
+		for _, id := range g.Members {
+			if nodes[id].Client {
+				targetClients++
+			}
+		}
+		count += int64(len(near))*int64(len(g.Members)) - nearClients*targetClients
 		if count > MaxEdges {
 			return fmt.Errorf("expanded topology exceeds %d edges", MaxEdges)
 		}
-		near := n.sources(link)
 		if err := validateOverrides(link.Overrides, func(a, b ID) bool {
+			if nodes[a].Client && nodes[b].Client {
+				return false
+			}
 			return slices.Contains(near, a) && slices.Contains(g.Members, b) || slices.Contains(near, b) && slices.Contains(g.Members, a)
 		}); err != nil {
 			return err

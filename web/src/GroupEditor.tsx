@@ -3,6 +3,7 @@ import { Modal, Field, ErrorBox, NumberInput, useConfirm } from './components'
 import { newID, transports, type Edge, type Network } from './model'
 import {
   coveredEdges,
+  internalEdges,
   pruneGroups,
   topologyError,
   type FullMeshGroup,
@@ -197,6 +198,9 @@ export default function GroupEditor({
         {error && <ErrorBox>{error}</ErrorBox>}
         {target.kind === 'group' ? (
           <>
+            <Field label="Group ID">
+              <input value={group.id} readOnly onFocus={(e) => e.currentTarget.select()} />
+            </Field>
             <Field label="Group name">
               <input
                 value={group.name}
@@ -237,13 +241,14 @@ export default function GroupEditor({
                       }
                     />
                     {n.name}
+                    {n.client ? ' (client)' : ''}
                     {occupied ? ' (grouped)' : ''}
                   </label>
                 )
               })}
             </div>
             <div className="mesh-note">
-              {(group.members.length * (group.members.length - 1)) / 2} internal edges · Weight{' '}
+              {internalEdges(group, true, network).length} internal edges · Weight{' '}
               {group.weight ?? 1}
             </div>
           </>

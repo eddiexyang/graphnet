@@ -31,6 +31,7 @@ export type Node = {
   id: string
   agent_id: string
   name: string
+  client?: boolean
   address: string
   position: { x: number; y: number }
 }

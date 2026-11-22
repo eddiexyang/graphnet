@@ -115,6 +115,7 @@ func serveController(ctx context.Context, listen, data, hosts string, insecure b
 	app, err := control.New(db, control.Options{
 		Version: version, Updater: updater,
 		Password:        os.Getenv("GRAPHNET_ADMIN_PASSWORD"),
+		APIToken:        os.Getenv("GRAPHNET_API_TOKEN"),
 		GeoIPDirectory:  filepath.Join(data, "geoip"),
 		UpdateDirectory: filepath.Join(data, "updates"),
 	})

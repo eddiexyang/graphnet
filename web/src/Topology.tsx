@@ -1,12 +1,15 @@
-import GroupEditor, { type GroupEditorTarget } from './GroupEditor'
+import GroupEditor, { ConnectionPolicy, type GroupEditorTarget } from './GroupEditor'
 import {
   effectiveEdges,
   internalEdges,
+  pruneGroups,
   childEdges,
+  coveredEdges,
   linkSource,
   linkSources,
   setOverride,
   type EdgeOwner,
+  type GroupLink,
   aggregate,
   connectionConflicts,
   individualConnection,
@@ -56,6 +59,7 @@ import {
   latencyLabel,
   edgeView,
   createEdge,
+  newID,
   removeNode,
   bytes,
   rate,
@@ -239,7 +243,7 @@ export default function Topology({
   const scopeLink =
     scope?.kind === 'link' ? network.group_links?.find((l) => l.id === scope.id) : undefined
   const scopedEdges = scopeGroup
-    ? internalEdges(scopeGroup)
+    ? internalEdges(scopeGroup, false, network)
     : scopeLink
       ? childEdges(network, scopeLink)
       : undefined
@@ -332,15 +336,66 @@ export default function Topology({
   const connect = async (source: string, target: string) => {
     if (!editing) return
     const groups = network.groups?.filter((g) => g.id === source || g.id === target) ?? []
-    if (groups.length === 2) {
-      setGroupEditor({ kind: 'link', sourceGroup: source, group: target })
-      return
-    }
-    const group = groups[0]
-    if (group) {
-      const node = source === group.id ? target : source
-      if (!group.members.includes(node) && network.nodes.some((n) => n.id === node))
-        setGroupEditor({ kind: 'link', node, group: group.id })
+    if (groups.length === 2 || groups.length === 1) {
+      const existing = (network.group_links ?? []).find((l) =>
+        groups.length === 2
+          ? (l.source_group === source && l.group === target) ||
+            (l.source_group === target && l.group === source)
+          : !l.source_group &&
+            l.group === groups[0].id &&
+            l.node === (source === groups[0].id ? target : source),
+      )
+      if (existing) {
+        enter('link', existing.id)
+        return
+      }
+      const newLink: GroupLink =
+        groups.length === 2
+          ? {
+              id: newID(),
+              source_group: source,
+              group: target,
+              weight: 10,
+              enabled: true,
+              transports: ['udp', 'tcp'],
+              methods: { ipv4_direct: true, ipv6_direct: true, hole_punch: false },
+            }
+          : {
+              id: newID(),
+              node: source === groups[0].id ? target : source,
+              group: groups[0].id,
+              weight: 10,
+              enabled: true,
+              transports: ['udp', 'tcp'],
+              methods: { ipv4_direct: true, ipv6_direct: true, hole_punch: false },
+            }
+      if (
+        groups.length === 1 &&
+        (groups[0].members.includes(newLink.node!) ||
+          !network.nodes.some((n) => n.id === newLink.node))
+      ) {
+        return
+      }
+      let updated = pruneGroups({
+        ...network,
+        group_links: [...(network.group_links ?? []), newLink],
+      })
+      const covered = coveredEdges(updated)
+      if (covered.length) {
+        if (
+          !(await confirm({
+            title: 'Replace existing edges?',
+            message: `Replace ${covered.length} existing explicit edge(s) covered by this group link?`,
+            confirmLabel: 'Replace',
+            danger: true,
+          }))
+        )
+          return
+        const drop = new Set(covered.map((e) => e.id))
+        updated = { ...updated, edges: updated.edges.filter((e) => !drop.has(e.id)) }
+      }
+      change(updated)
+      enter('link', newLink.id)
       return
     }
     const conflicts = connectionConflicts(network, source, target)
@@ -460,12 +515,12 @@ export default function Topology({
             selectable: false,
             data: {
               name: g.name,
-              summary: aggregate(network, internalEdges(g), statuses, rates, live, showSpeeds)
+              summary: aggregate(network, internalEdges(g, false, network), statuses, rates, live, showSpeeds)
                 .label,
               address: '',
               state: '',
               connecting,
-              path: internalEdges(g).some((e) => path?.edges.includes(e.id)),
+              path: internalEdges(g, false, network).some((e) => path?.edges.includes(e.id)),
             },
           },
         ]
@@ -586,13 +641,13 @@ export default function Topology({
     selection?.type === 'node' ? network.nodes.find((n) => n.id === selection.id) : undefined
   const edge = selection?.type === 'edge' ? allEdges.find((e) => e.id === selection.id) : undefined
   const derivedOwner: EdgeOwner | undefined = edge
-    ? (network.groups?.find((g) => internalEdges(g).some((e) => e.id === edge.id)) ??
+    ? (network.groups?.find((g) => internalEdges(g, false, network).some((e) => e.id === edge.id)) ??
       network.group_links?.find((l) => childEdges(network, l).some((e) => e.id === edge.id)))
     : undefined
   const sharedEdge =
     derivedOwner &&
     ('members' in derivedOwner
-      ? internalEdges(derivedOwner, true)
+      ? internalEdges(derivedOwner, true, network)
       : childEdges(network, derivedOwner, true)
     ).find((e) => e.id === edge!.id)
   const overridden = !!derivedOwner?.overrides?.some(
@@ -638,6 +693,11 @@ export default function Topology({
           ...network,
           edges: network.edges.map((e) => (e.id === edge.id ? { ...e, ...patch } : e)),
         }))
+  const updateGroupLink = (id: string, patch: Partial<GroupLink>) =>
+    change({
+      ...network,
+      group_links: (network.group_links ?? []).map((l) => (l.id === id ? { ...l, ...patch } : l)),
+    })
   return (
     <div className="workspace">
       {groupEditor && (
@@ -927,13 +987,28 @@ export default function Topology({
             <div className="inspector-intro">
               <h3>
                 {scopeGroup?.name ??
-                  `${network.nodes.find((n) => n.id === scopeLink?.node)?.name} → ${network.groups?.find((g) => g.id === scopeLink?.group)?.name}`}
+                  `${
+                    scopeLink?.source_group
+                      ? network.groups?.find((g) => g.id === scopeLink.source_group)?.name
+                      : network.nodes.find((n) => n.id === scopeLink?.node)?.name
+                  } → ${network.groups?.find((g) => g.id === scopeLink?.group)?.name}`}
               </h3>
               <Badge>{scopeSummary.state}</Badge>
             </div>
+            {scopeGroup && (
+              <Field label="Group ID">
+                <input value={scopeGroup.id} readOnly onFocus={(e) => e.currentTarget.select()} />
+              </Field>
+            )}
             <dl className="inspector-summary">
-              <dt>Routing weight</dt>
-              <dd>{scopeGroup ? (scopeGroup.weight ?? 1) : scopeLink?.weight}</dd>
+              {scopeGroup && (
+                <>
+                  <dt>Members</dt>
+                  <dd>{scopeGroup.members.length}</dd>
+                  <dt>Routing weight</dt>
+                  <dd>{scopeGroup.weight ?? 1}</dd>
+                </>
+              )}
               <dt>Total traffic</dt>
               <dd>{rate(scopeSummary.speed)}</dd>
               <dt>Maximum RTT</dt>
@@ -947,11 +1022,40 @@ export default function Topology({
                 {live ? scopeSummary.connected : '—'} / {scopeSummary.total}
               </dd>
             </dl>
+            {scopeLink && (
+              <fieldset disabled={!editing}>
+                <label className="check">
+                  <input
+                    type="checkbox"
+                    checked={scopeLink.enabled}
+                    onChange={(e) => updateGroupLink(scopeLink.id, { enabled: e.target.checked })}
+                  />
+                  Enable link
+                </label>
+                <Field label="Routing weight">
+                  <NumberInput
+                    key={`glink:${scopeLink.id}:${editing}`}
+                    required
+                    min={1}
+                    max={4294967295}
+                    value={scopeLink.weight}
+                    onChange={(weight) => {
+                      if (weight !== undefined) updateGroupLink(scopeLink.id, { weight })
+                    }}
+                    onInvalid={(bad) => markInvalid(`glink:${scopeLink.id}:weight`, bad)}
+                  />
+                </Field>
+                <ConnectionPolicy
+                  value={scopeLink}
+                  change={(patch) => updateGroupLink(scopeLink.id, patch)}
+                />
+              </fieldset>
+            )}
             {editing && (
               <div className="actions">
-                <button onClick={() => setGroupEditor(scope)}>
-                  Edit {scope.kind === 'group' ? 'group' : 'link'}
-                </button>
+                {scopeGroup && (
+                  <button onClick={() => setGroupEditor(scope)}>Edit group</button>
+                )}
                 <button
                   className="danger"
                   onClick={async () => {
@@ -1371,7 +1475,7 @@ export default function Topology({
                 onClick={() => {
                   const kind = 'members' in derivedOwner ? 'group' : 'link'
                   enter(kind, derivedOwner.id)
-                  if (editing) setGroupEditor({ kind, id: derivedOwner.id })
+                  if (editing && kind === 'group') setGroupEditor({ kind, id: derivedOwner.id })
                 }}
               >
                 Shared {'members' in derivedOwner ? 'group' : 'link'} settings
@@ -1545,6 +1649,9 @@ export default function Topology({
             <div className="inspector-intro">
               <h3>{network.name}</h3>
             </div>
+            <Field label="Network ID">
+              <input value={network.id} readOnly onFocus={(e) => e.currentTarget.select()} />
+            </Field>
             <fieldset disabled={!editing}>
               <Field label="Network name">
                 <input
@@ -1616,9 +1723,10 @@ export default function Topology({
                   {network.groups.map((g) => (
                     <button key={g.id} onClick={() => enter('group', g.id)}>
                       <span>
-                        {g.name}
+                        {g.name} ({g.members.length})
                         <small>
-                          {aggregate(network, internalEdges(g), statuses, rates, live).label}
+                          {g.id} ·{' '}
+                          {aggregate(network, internalEdges(g, false, network), statuses, rates, live).label}
                         </small>
                       </span>
                     </button>

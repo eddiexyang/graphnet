@@ -113,7 +113,6 @@ func TestGroupedTopologyRejectsConflicts(t *testing.T) {
 		"individual with aggregate": func(n *model.Network) { n.Edges = []model.Edge{n.EffectiveEdges()[3]} },
 		"duplicate member":          func(n *model.Network) { n.Groups[0].Members[1] = n.Groups[0].Members[0] },
 		"unknown member":            func(n *model.Network) { n.Groups[0].Members[0] = testutil.ID(999) },
-		"singleton":                 func(n *model.Network) { n.Groups[0].Members = n.Groups[0].Members[:1] },
 		"self group":                func(n *model.Network) { n.GroupLinks[0].Node = n.Groups[0].Members[0] },
 		"missing group":             func(n *model.Network) { n.GroupLinks[0].Group = testutil.ID(999) },
 		"duplicate aggregate": func(n *model.Network) {

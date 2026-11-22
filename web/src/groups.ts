@@ -68,21 +68,28 @@ export const groupEdgeID = (group: string, a: string, b: string) =>
     32,
   )
 // Shared settings without overrides; `inherit` lets the inspector reset a pair.
-export function internalEdges(group: FullMeshGroup, inherit = false): Edge[] {
+export function clientNodeSet(network?: Network): Set<string> {
+  return new Set((network?.nodes ?? []).filter((n) => n.client).map((n) => n.id))
+}
+export function internalEdges(group: FullMeshGroup, inherit = false, network?: Network): Edge[] {
+  const clients = clientNodeSet(network)
   const members = [...group.members].sort()
   return members.flatMap((a, i) =>
-    members.slice(i + 1).map((b) => {
-      const edge = {
-        id: groupEdgeID(group.id, a, b),
-        a,
-        b,
-        weight: group.weight ?? 1,
-        enabled: true,
-        transports: group.transports,
-        methods: group.methods,
-      }
-      return inherit ? edge : overridden(group, edge)
-    }),
+    members
+      .slice(i + 1)
+      .filter((b) => !(clients.has(a) && clients.has(b)))
+      .map((b) => {
+        const edge = {
+          id: groupEdgeID(group.id, a, b),
+          a,
+          b,
+          weight: group.weight ?? 1,
+          enabled: true,
+          transports: group.transports,
+          methods: group.methods,
+        }
+        return inherit ? edge : overridden(group, edge)
+      }),
   )
 }
 export function linkSources(network: Network, link: GroupLink) {
@@ -91,26 +98,29 @@ export function linkSources(network: Network, link: GroupLink) {
     : [link.node!]
 }
 export function childEdges(network: Network, link: GroupLink, inherit = false): Edge[] {
+  const clients = clientNodeSet(network)
   const targets = network.groups?.find((g) => g.id === link.group)?.members ?? []
   return linkSources(network, link).flatMap((a) =>
-    targets.map((b) => {
-      const edge = {
-        id: groupEdgeID(link.id, a, b),
-        a,
-        b,
-        weight: link.weight,
-        enabled: link.enabled,
-        transports: link.transports,
-        methods: link.methods,
-      }
-      return inherit ? edge : overridden(link, edge)
-    }),
+    targets
+      .filter((b) => !(clients.has(a) && clients.has(b)))
+      .map((b) => {
+        const edge = {
+          id: groupEdgeID(link.id, a, b),
+          a,
+          b,
+          weight: link.weight,
+          enabled: link.enabled,
+          transports: link.transports,
+          methods: link.methods,
+        }
+        return inherit ? edge : overridden(link, edge)
+      }),
   )
 }
 export function effectiveEdges(network: Network): Edge[] {
   return [
     ...network.edges,
-    ...(network.groups ?? []).flatMap((g) => internalEdges(g)),
+    ...(network.groups ?? []).flatMap((g) => internalEdges(g, false, network)),
     ...(network.group_links ?? []).flatMap((l) => childEdges(network, l)),
   ]
 }
@@ -131,34 +141,42 @@ export function aggregate(
   const speed =
     live && samples.length ? samples.reduce((sum, v) => sum + v.rx! + v.tx!, 0) : undefined
   const maximum = live && rtts.length ? Math.max(...rtts) : undefined
-  const state = !live
-    ? 'Unknown'
-    : edges.every((e) => !e.enabled)
-      ? 'Disabled'
-      : connected.length === edges.filter((e) => e.enabled).length
-        ? 'Connected'
-        : connected.length
-          ? 'Partial'
-          : 'Down'
+  const state = !edges.length
+    ? 'Idle'
+    : !live
+      ? 'Unknown'
+      : edges.every((e) => !e.enabled)
+        ? 'Disabled'
+        : connected.length === edges.filter((e) => e.enabled).length
+          ? 'Connected'
+          : connected.length
+            ? 'Partial'
+            : 'Down'
   return {
     state,
     connected: connected.length,
     total: edges.length,
     speed,
     maximum,
-    label: `${showSpeeds ? `${rate(speed)} · ` : ''}${maximum === undefined ? 'RTT unknown' : `max ${maximum.toFixed(1)} ms`} · ${live ? connected.length : '?'}/${edges.length}`,
+    label: !edges.length
+      ? '0 edges'
+      : `${showSpeeds ? `${rate(speed)} · ` : ''}${maximum === undefined ? 'RTT unknown' : `max ${maximum.toFixed(1)} ms`} · ${live ? connected.length : '?'}/${edges.length}`,
   }
 }
 // Also drops overrides for pairs that membership changes no longer expand.
 export function pruneGroups(network: Network): Network {
   const ids = new Set(network.nodes.map((n) => n.id))
+  const clients = clientNodeSet(network)
   const groups = (network.groups ?? [])
     .map((g) => ({ ...g, members: g.members.filter((id) => ids.has(id)) }))
-    .filter((g) => g.members.length >= 2)
     .map((g) => ({
       ...g,
       overrides: g.overrides?.filter(
-        (o) => o.a !== o.b && g.members.includes(o.a) && g.members.includes(o.b),
+        (o) =>
+          o.a !== o.b &&
+          !(clients.has(o.a) && clients.has(o.b)) &&
+          g.members.includes(o.a) &&
+          g.members.includes(o.b),
       ),
     }))
   const pruned = { ...network, groups }
@@ -187,7 +205,7 @@ export function coveredEdges(
 ) {
   const pairs = new Set(
     [
-      ...groups.flatMap((g) => internalEdges(g, true)),
+      ...groups.flatMap((g) => internalEdges(g, true, network)),
       ...links.flatMap((l) => childEdges({ ...network, groups }, l, true)),
     ].map((e) => [e.a, e.b].sort().join('/')),
   )
@@ -195,9 +213,9 @@ export function coveredEdges(
 }
 export function topologyError(network: Network): string | undefined {
   const seen = new Set<string>()
+  const clients = clientNodeSet(network)
   for (const group of network.groups ?? []) {
-    if (!group.name.trim() || group.members.length < 2)
-      return 'Each group needs a name and at least two members.'
+    if (!group.name.trim()) return 'Each group needs a name.'
     for (const id of group.members) {
       if (seen.has(id)) return 'A node can belong to only one group.'
       seen.add(id)
@@ -205,17 +223,17 @@ export function topologyError(network: Network): string | undefined {
   }
   const count =
     network.edges.length +
-    (network.groups ?? []).reduce(
-      (n, g) => n + (g.members.length * (g.members.length - 1)) / 2,
-      0,
-    ) +
-    (network.group_links ?? []).reduce(
-      (n, l) =>
-        n +
-        linkSources(network, l).length *
-          (network.groups?.find((g) => g.id === l.group)?.members.length ?? 0),
-      0,
-    )
+    (network.groups ?? []).reduce((n, g) => {
+      const c = g.members.filter((id) => clients.has(id)).length
+      return n + (g.members.length * (g.members.length - 1)) / 2 - (c * (c - 1)) / 2
+    }, 0) +
+    (network.group_links ?? []).reduce((n, l) => {
+      const src = linkSources(network, l)
+      const dst = network.groups?.find((g) => g.id === l.group)?.members ?? []
+      const sc = src.filter((id) => clients.has(id)).length
+      const dc = dst.filter((id) => clients.has(id)).length
+      return n + src.length * dst.length - sc * dc
+    }, 0)
   if (count > 100000) return 'Expanded topology exceeds 100,000 edges.'
   const pairs = new Set<string>()
   for (const link of network.group_links ?? []) {

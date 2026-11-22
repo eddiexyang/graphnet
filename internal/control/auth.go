@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -32,11 +33,13 @@ type attempt struct {
 	Until time.Time
 }
 type auth struct {
-	password passwordRecord
-	mu       sync.Mutex
-	sessions map[[32]byte]session
-	attempts map[string]attempt
-	slots    chan struct{}
+	password    passwordRecord
+	apiTokenSet bool
+	apiToken    [32]byte
+	mu          sync.Mutex
+	sessions    map[[32]byte]session
+	attempts    map[string]attempt
+	slots       chan struct{}
 }
 
 func randomToken() string {
@@ -46,8 +49,12 @@ func randomToken() string {
 }
 func tokenHash(token string) [32]byte { return sha256.Sum256([]byte(token)) }
 
-func newAuth(db *store.Store, password string) (*auth, error) {
+func newAuth(db *store.Store, password, apiToken string) (*auth, error) {
 	a := &auth{sessions: map[[32]byte]session{}, attempts: map[string]attempt{}, slots: make(chan struct{}, 4)}
+	if tok := strings.TrimSpace(apiToken); tok != "" {
+		a.apiTokenSet = true
+		a.apiToken = tokenHash(tok)
+	}
 	err := db.WriteRecords(func(r *store.Records) error {
 		if raw := r.Get("admin-password"); raw != nil {
 			if err := json.Unmarshal(raw, &a.password); err != nil {
@@ -185,8 +192,28 @@ func (a *auth) find(r *http.Request) (session, bool) {
 	}
 	return s, ok
 }
+func (a *auth) validBearer(r *http.Request) bool {
+	if !a.apiTokenSet {
+		return false
+	}
+	hdr := r.Header.Get("Authorization")
+	const prefix = "Bearer "
+	if !strings.HasPrefix(hdr, prefix) {
+		return false
+	}
+	tok := strings.TrimSpace(hdr[len(prefix):])
+	if tok == "" || len(tok) > 1024 {
+		return false
+	}
+	sum := tokenHash(tok)
+	return subtle.ConstantTimeCompare(sum[:], a.apiToken[:]) == 1
+}
 func (a *auth) require(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if a.validBearer(r) {
+			next(w, r)
+			return
+		}
 		s, ok := a.find(r)
 		if !ok {
 			fail(w, 401, "authentication required")
