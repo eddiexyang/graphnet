@@ -33,11 +33,12 @@ const (
 	// defaultSendBuffer is an end's send buffer where the kernel's largest is
 	// unknown.
 	defaultSendBuffer = 64 << 20
-	// An end without a working chain this long resets the connection.
-	orphanLifetime = 2 * time.Minute
-	rebuildMin     = 200 * time.Millisecond
-	rebuildMax     = 2 * time.Second
+	rebuildMin        = 200 * time.Millisecond
+	rebuildMax        = 2 * time.Second
 )
+
+// An end without a working chain this long resets the connection.
+var orphanLifetime = 2 * time.Minute
 
 // Response statuses for a chain's request.
 const (
@@ -619,16 +620,7 @@ func (e *End) Accept(hop Hop, gen uint32, down, up uint64, at bool, answer func(
 	}
 	e.hop, e.gen = nil, gen
 	e.replacement = hop
-	if e.orphan.IsZero() {
-		e.orphan = time.Now()
-		e.orphanTimer = time.AfterFunc(orphanLifetime, func() {
-			e.mu.Lock()
-			if !e.done && !e.orphan.IsZero() && time.Since(e.orphan) >= orphanLifetime {
-				e.finishLocked(errNoPath)
-			}
-			e.mu.Unlock()
-		})
-	}
+	e.markOrphanLocked()
 	if at {
 		down = max(down, e.read)
 	}
@@ -679,6 +671,27 @@ func (e *End) Reroute() {
 	go e.rebuild()
 }
 
+func (e *End) markOrphanLocked() {
+	if !e.orphan.IsZero() {
+		return
+	}
+	e.orphan = time.Now()
+	var fire func()
+	fire = func() {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		if e.done || e.orphan.IsZero() {
+			return
+		}
+		if rem := orphanLifetime - time.Since(e.orphan); rem > 0 {
+			e.orphanTimer = time.AfterFunc(rem, fire)
+			return
+		}
+		e.finishLocked(errNoPath)
+	}
+	e.orphanTimer = time.AfterFunc(orphanLifetime, fire)
+}
+
 // RequestReplay handles the egress's report that generation gen failed.
 func (e *End) RequestReplay(gen uint32) {
 	e.mu.Lock()
@@ -721,9 +734,7 @@ func (e *End) failLocked(hop Hop) {
 	e.counters.HopFailures.Add(1)
 	hop.Abort()
 	e.hop = nil
-	if e.orphan.IsZero() {
-		e.orphan = time.Now()
-	}
+	e.markOrphanLocked()
 	e.cond.Broadcast()
 	if e.busy {
 		return

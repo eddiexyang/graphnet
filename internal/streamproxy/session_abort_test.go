@@ -6,6 +6,7 @@ import (
 	"io"
 	"sync"
 	"testing"
+	"time"
 )
 
 type abortTestHop struct {
@@ -96,6 +97,32 @@ func TestCloseBeforeBothDirectionsEndedAbortsSession(t *testing.T) {
 		}
 	default:
 		t.Fatal("Close before both directions ended did not abort hop")
+	}
+	counters.retained.mu.Lock()
+	ends := counters.retained.ends
+	counters.retained.mu.Unlock()
+	if ends != 0 {
+		t.Fatalf("retained ends = %d, want 0", ends)
+	}
+}
+
+func TestEgressOrphanExpiresAfterFailLocked(t *testing.T) {
+	prev := orphanLifetime
+	orphanLifetime = 50 * time.Millisecond
+	t.Cleanup(func() { orphanLifetime = prev })
+
+	counters := &Counters{}
+	hop := newAbortTestHop(false)
+	e := NewEgress(t.Context(), hop, func(uint32) {}, counters, nil)
+	defer e.Abort()
+
+	// Trigger failLocked (hop failure without peer session reset).
+	e.RequestReplay(0)
+
+	select {
+	case <-e.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("egress session leaked past orphanLifetime after failLocked")
 	}
 	counters.retained.mu.Lock()
 	ends := counters.retained.ends
