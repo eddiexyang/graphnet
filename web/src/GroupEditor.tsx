@@ -199,7 +199,9 @@ export default function GroupEditor({
         {target.kind === 'group' ? (
           <>
             <Field label="Group ID">
-              <input value={group.id} readOnly onFocus={(e) => e.currentTarget.select()} />
+              <code className="mono" style={{ wordBreak: 'break-all', userSelect: 'all' }}>
+                {group.id}
+              </code>
             </Field>
             <Field label="Group name">
               <input

@@ -346,7 +346,7 @@ export default function Topology({
             l.node === (source === groups[0].id ? target : source),
       )
       if (existing) {
-        enter('link', existing.id)
+        select({ type: 'edge', id: existing.id })
         return
       }
       const newLink: GroupLink =
@@ -395,7 +395,7 @@ export default function Topology({
         updated = { ...updated, edges: updated.edges.filter((e) => !drop.has(e.id)) }
       }
       change(updated)
-      enter('link', newLink.id)
+      select({ type: 'edge', id: newLink.id })
       return
     }
     const conflicts = connectionConflicts(network, source, target)
@@ -607,7 +607,7 @@ export default function Topology({
       sourceHandle: 'surface',
       targetHandle: 'target',
       data: {
-        open: () => (link ? enter('link', link.id) : select({ type: 'edge', id: e.id })),
+        open: () => select({ type: 'edge', id: e.id }),
         anchors: geometry.anchors.get(e.id)!,
         route: geometry.routes.get(e.id)!,
         labelPoint: labels.get(e.id)!,
@@ -639,7 +639,20 @@ export default function Topology({
   })
   const node =
     selection?.type === 'node' ? network.nodes.find((n) => n.id === selection.id) : undefined
-  const edge = selection?.type === 'edge' ? allEdges.find((e) => e.id === selection.id) : undefined
+  const selectedGroupLink =
+    selection?.type === 'edge'
+      ? network.group_links?.find((l) => l.id === selection.id)
+      : undefined
+  const selectedGroupLinkEdges = selectedGroupLink
+    ? childEdges(network, selectedGroupLink)
+    : undefined
+  const selectedGroupLinkSummary = selectedGroupLinkEdges
+    ? aggregate(network, selectedGroupLinkEdges, statuses, rates, live)
+    : undefined
+  const edge =
+    selection?.type === 'edge' && !selectedGroupLink
+      ? allEdges.find((e) => e.id === selection.id)
+      : undefined
   const derivedOwner: EdgeOwner | undefined = edge
     ? (network.groups?.find((g) => internalEdges(g, false, network).some((e) => e.id === edge.id)) ??
       network.group_links?.find((l) => childEdges(network, l).some((e) => e.id === edge.id)))
@@ -862,11 +875,7 @@ export default function Topology({
                   selectNode(n.id, true)
                 }
               }}
-              onEdgeClick={(_, e) =>
-                !scope && network.group_links?.some((l) => l.id === e.id)
-                  ? enter('link', e.id)
-                  : select({ type: 'edge', id: e.id })
-              }
+              onEdgeClick={(_, e) => select({ type: 'edge', id: e.id })}
               onPaneClick={() => select(null)}
               onNodesChange={(changes) => {
                 applyNodeChanges(
@@ -973,8 +982,10 @@ export default function Topology({
               ? 'Active path'
               : node
                 ? 'Node details'
-                : edge
-                  ? 'Edge details'
+                : selectedGroupLink
+                  ? 'Aggregate link'
+                  : edge
+                    ? 'Edge details'
                   : scope
                     ? scope.kind === 'group'
                       ? 'Full mesh group'
@@ -995,14 +1006,13 @@ export default function Topology({
               </h3>
               <Badge>{scopeSummary.state}</Badge>
             </div>
-            {scopeGroup && (
-              <Field label="Group ID">
-                <input value={scopeGroup.id} readOnly onFocus={(e) => e.currentTarget.select()} />
-              </Field>
-            )}
             <dl className="inspector-summary">
               {scopeGroup && (
                 <>
+                  <dt>Group ID</dt>
+                  <dd>
+                    <code style={{ wordBreak: 'break-all', userSelect: 'all' }}>{scopeGroup.id}</code>
+                  </dd>
                   <dt>Members</dt>
                   <dd>{scopeGroup.members.length}</dd>
                   <dt>Routing weight</dt>
@@ -1460,6 +1470,107 @@ export default function Topology({
               </button>
             )}
           </>
+        ) : selectedGroupLink && selectedGroupLinkSummary ? (
+          <>
+            <div className="inspector-intro">
+              <h3>
+                {selectedGroupLink.source_group
+                  ? network.groups?.find((g) => g.id === selectedGroupLink.source_group)?.name
+                  : network.nodes.find((n) => n.id === selectedGroupLink.node)?.name}
+                <span className="muted"> → </span>
+                {network.groups?.find((g) => g.id === selectedGroupLink.group)?.name}
+              </h3>
+              <Badge>{selectedGroupLinkSummary.state}</Badge>
+            </div>
+            <dl className="inspector-summary">
+              <dt>Total traffic</dt>
+              <dd>{rate(selectedGroupLinkSummary.speed)}</dd>
+              <dt>Maximum RTT</dt>
+              <dd>
+                {selectedGroupLinkSummary.maximum === undefined
+                  ? 'Unknown'
+                  : `${selectedGroupLinkSummary.maximum.toFixed(1)} ms`}
+              </dd>
+              <dt>Connected edges</dt>
+              <dd>
+                {live ? selectedGroupLinkSummary.connected : '—'} / {selectedGroupLinkSummary.total}
+              </dd>
+            </dl>
+            <fieldset disabled={!editing}>
+              <label className="check">
+                <input
+                  type="checkbox"
+                  checked={selectedGroupLink.enabled}
+                  onChange={(e) =>
+                    updateGroupLink(selectedGroupLink.id, { enabled: e.target.checked })
+                  }
+                />
+                Enable link
+              </label>
+              <Field label="Routing weight">
+                <NumberInput
+                  key={`glink:${selectedGroupLink.id}:${editing}`}
+                  required
+                  min={1}
+                  max={4294967295}
+                  value={selectedGroupLink.weight}
+                  onChange={(weight) => {
+                    if (weight !== undefined) updateGroupLink(selectedGroupLink.id, { weight })
+                  }}
+                  onInvalid={(bad) => markInvalid(`glink:${selectedGroupLink.id}:weight`, bad)}
+                />
+              </Field>
+              <ConnectionPolicy
+                value={selectedGroupLink}
+                change={(patch) => updateGroupLink(selectedGroupLink.id, patch)}
+              />
+            </fieldset>
+            {editing && (
+              <button
+                className="danger wide"
+                onClick={async () => {
+                  if (
+                    !(await confirm({
+                      title: 'Remove aggregate link?',
+                      message: 'Remove this aggregate link and all its child edges?',
+                      confirmLabel: 'Remove link',
+                      danger: true,
+                    }))
+                  )
+                    return
+                  change({
+                    ...network,
+                    group_links: network.group_links?.filter((l) => l.id !== selectedGroupLink.id),
+                  })
+                  select(null)
+                }}
+              >
+                Remove link
+              </button>
+            )}
+            {!!selectedGroupLinkEdges?.length && (
+              <>
+                <h4>
+                  Child edges <span className="count">{selectedGroupLinkEdges.length}</span>
+                </h4>
+                <div className="object-list">
+                  {selectedGroupLinkEdges.map((e) => (
+                    <button key={e.id} onClick={() => select({ type: 'edge', id: e.id })}>
+                      <Cable size={15} />
+                      <span>
+                        {network.nodes.find((n) => n.id === e.a)?.name} ↔{' '}
+                        {network.nodes.find((n) => n.id === e.b)?.name}
+                        <small>
+                          {edgeView(network, e, statuses, rates, live).state} ·{' '}
+                          {aggregate(network, [e], statuses, rates, live).label}
+                        </small>
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              </>
+            )}
+          </>
         ) : edge ? (
           <>
             <div className="inspector-intro">
@@ -1473,9 +1584,13 @@ export default function Topology({
             {derivedOwner && (
               <button
                 onClick={() => {
-                  const kind = 'members' in derivedOwner ? 'group' : 'link'
-                  enter(kind, derivedOwner.id)
-                  if (editing && kind === 'group') setGroupEditor({ kind, id: derivedOwner.id })
+                  if ('members' in derivedOwner) {
+                    enter('group', derivedOwner.id)
+                    if (editing) setGroupEditor({ kind: 'group', id: derivedOwner.id })
+                  } else {
+                    setScope(null)
+                    select({ type: 'edge', id: derivedOwner.id })
+                  }
                 }}
               >
                 Shared {'members' in derivedOwner ? 'group' : 'link'} settings
@@ -1649,9 +1764,12 @@ export default function Topology({
             <div className="inspector-intro">
               <h3>{network.name}</h3>
             </div>
-            <Field label="Network ID">
-              <input value={network.id} readOnly onFocus={(e) => e.currentTarget.select()} />
-            </Field>
+            <dl className="inspector-summary">
+              <dt>Network ID</dt>
+              <dd>
+                <code style={{ wordBreak: 'break-all', userSelect: 'all' }}>{network.id}</code>
+              </dd>
+            </dl>
             <fieldset disabled={!editing}>
               <Field label="Network name">
                 <input
@@ -1739,7 +1857,7 @@ export default function Topology({
                 <h4>Group links</h4>
                 <div className="object-list">
                   {network.group_links.map((l) => (
-                    <button key={l.id} onClick={() => enter('link', l.id)}>
+                    <button key={l.id} onClick={() => select({ type: 'edge', id: l.id })}>
                       <span>
                         {l.source_group
                           ? network.groups?.find((g) => g.id === l.source_group)?.name

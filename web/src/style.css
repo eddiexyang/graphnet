@@ -2098,3 +2098,18 @@ td small,
 .canvas-fullscreen > .canvas-footer {
   display: none;
 }
+
+.inspector button.subtle {
+  border-color: #d7e0da;
+  background: #f8faf7;
+}
+.inspector .object-list button {
+  border-color: #d7e0da;
+}
+.inspector .actions button,
+.inspector button.danger {
+  border: 1px solid #d7e0da;
+}
+.inspector button.danger {
+  border-color: #e4b8b1;
+}
