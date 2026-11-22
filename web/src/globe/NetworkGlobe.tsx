@@ -96,7 +96,6 @@ export default function NetworkGlobe({
       ),
       focusedNodes: source ? [source] : selection?.type === 'node' ? [selection.id] : pathNodes,
       focusedEdges,
-      dimmed: selection !== null,
     }
   }, [network, state.agents, statuses, live, locations, source, selection, pathNodes, focusedEdges])
   const choose = (picked: GlobeSelection, multiple = false) => {

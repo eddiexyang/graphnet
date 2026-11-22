@@ -21,7 +21,6 @@ export type FloatingFlowEdge = Edge<
     onLabelSize?: (id: string, size: { width: number; height: number }) => void
     open?: () => void
     focused: boolean
-    dimmed: boolean
   },
   'floating'
 >
@@ -36,14 +35,14 @@ export function FloatingEdge(props: EdgeProps<FloatingFlowEdge>) {
     const element = labelRef.current
     if (!element || !onLabelSize || isFocused) return
     onLabelSize(props.id, { width: element.offsetWidth, height: element.offsetHeight })
-  }, [props.id, textLength, isFocused, props.data?.dimmed, onLabelSize])
+  }, [props.id, textLength, isFocused, onLabelSize])
   if (!props.data?.anchors) return null
-  const { route, labelPoint, labelScale = 1, focused, dimmed } = props.data
+  const { route, labelPoint, labelScale = 1, focused } = props.data
   if (!route) return null
   return (
     <>
       <BaseEdge id={props.id} path={route.path} style={props.style} interactionWidth={26} />
-      {!dimmed && props.label && (
+      {props.label && (
         <EdgeLabelRenderer>
           <div
             ref={labelRef}

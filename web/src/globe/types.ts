@@ -13,5 +13,4 @@ export type Appearance = {
   edges: Record<string, { color: string; dashed: boolean }>
   focusedNodes: string[]
   focusedEdges: string[]
-  dimmed: boolean
 }

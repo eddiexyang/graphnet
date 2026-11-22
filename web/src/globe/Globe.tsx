@@ -470,7 +470,7 @@ export default function Globe({
         mesh.material.color.set(on ? amber : style?.color || teal)
         mesh.material.dashSize = style?.dashed ? 0.018 : 100
         mesh.material.gapSize = style?.dashed ? 0.012 : 0
-        mesh.material.opacity = appearance?.dimmed || selected ? (on ? 0.95 : 0.17) : 0.7
+        mesh.material.opacity = on ? 0.95 : 0.7
       }
       invalidate()
     }

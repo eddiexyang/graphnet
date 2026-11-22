@@ -543,7 +543,6 @@ export default function Topology({
     const view = edgeView(network, e, statuses, rates, live)
     if (summary) view.state = summary.state
     const focused = focus.has(e.id)
-    const dimmed = selection !== null && !focused
     return {
       id: e.id,
       source: e.a,
@@ -560,9 +559,8 @@ export default function Topology({
         labelScale,
         onLabelSize,
         focused,
-        dimmed,
       },
-      zIndex: focused ? 100 : dimmed ? -1 : 0,
+      zIndex: focused ? 100 : 0,
       label: summary
         ? `${summary.label}${showWeights ? ` · Weight ${e.weight}` : ''}`
         : editing
@@ -575,7 +573,6 @@ export default function Topology({
       style: {
         stroke: focused ? '#087b66' : view.state === 'Connected' ? '#278f79' : '#91a3a0',
         strokeWidth: focused ? 3.5 : 1.8,
-        opacity: dimmed ? 0.12 : 1,
         strokeDasharray: view.state === 'Connected' ? undefined : '5 5',
       },
       labelStyle: { fill: '#35514b', fontSize: 11 },
