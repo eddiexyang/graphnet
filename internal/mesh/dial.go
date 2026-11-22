@@ -72,6 +72,53 @@ func (g *group) schedule() {
 		g.mux.maintain()
 		cfg := g.policy.Load()
 		candidates := g.candidates(cfg, true)
+		if pref := g.mesh.preferredTransport; pref != "" && slices.Contains(cfg.peer.Edge.Transports, pref) {
+			var prefCands []link.Candidate
+			for _, c := range candidates {
+				if c.Endpoint.Transport == pref {
+					prefCands = append(prefCands, c)
+				}
+			}
+			if len(prefCands) > 0 {
+				g.mu.Lock()
+				hasHealthyPref := false
+				for _, l := range g.links {
+					if l.Info().Transport == pref && l.Stats().Healthy {
+						hasHealthyPref = true
+						break
+					}
+				}
+				prefPending := false
+				if !hasHealthyPref {
+					for _, c := range prefCands {
+						st := g.attempts[c.ID]
+						if st == nil || st.inflight || st.delay == 0 {
+							prefPending = true
+							break
+						}
+					}
+				}
+				var retireFallback []*link.Link
+				if hasHealthyPref {
+					for id, l := range g.links {
+						if l.Info().Transport != pref {
+							retireFallback = append(retireFallback, l)
+							delete(g.links, id)
+							delete(g.linkCandidates, id)
+							delete(g.draining, id)
+							g.edge.Remove(id)
+						}
+					}
+				}
+				g.mu.Unlock()
+				for _, l := range retireFallback {
+					_ = l.Close()
+				}
+				if hasHealthyPref || prefPending {
+					candidates = prefCands
+				}
+			}
+		}
 		valid := map[string]bool{}
 		for _, candidate := range candidates {
 			valid[candidate.ID] = true

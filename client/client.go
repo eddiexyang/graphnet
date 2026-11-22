@@ -20,6 +20,8 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"net/url"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -62,6 +64,39 @@ type Config struct {
 	// WebSocketRoots overrides the CA roots trusted when dialing WSS peer endpoints
 	// (nil trusts system roots for public CDNs plus direct peer identity pins).
 	WebSocketRoots *x509.CertPool
+	// PreferredTransport selects a preferred peer data-plane transport (for
+	// example "quic" or "tcp") when allowed by the Edge, falling back to other
+	// allowed transports automatically if unreachable.
+	PreferredTransport string
+}
+
+func parseServerURL(raw, explicitTransport string) (origin, transport string, err error) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Opaque != "" || u.Path != "" && u.Path != "/" {
+		return "", "", errors.New("graphnet: server must be a controller origin URL (https://, tcp://, ws://, wss://, or grpc://)")
+	}
+	var schemeTransport string
+	switch strings.ToLower(u.Scheme) {
+	case "https":
+		schemeTransport = "https"
+	case "tcp":
+		schemeTransport = "tcp"
+	case "ws", "websocket":
+		schemeTransport = "websocket"
+	case "wss":
+		schemeTransport = "wss"
+	case "grpc":
+		schemeTransport = "grpc"
+	default:
+		return "", "", fmt.Errorf("graphnet: unsupported server scheme %q (use https, tcp, ws, wss, or grpc)", u.Scheme)
+	}
+	transport = strings.TrimSpace(explicitTransport)
+	if transport == "" {
+		transport = schemeTransport
+	}
+	u.Scheme = "https"
+	u.Path = ""
+	return u.String(), transport, nil
 }
 
 // ErrUnreachable means the network has no route to a destination.
@@ -84,8 +119,16 @@ func Start(ctx context.Context, cfg Config) (*Client, error) {
 	if len(cfg.PrivateKey) != ed25519.PrivateKeySize {
 		return nil, errors.New("graphnet: invalid private key")
 	}
-	if cfg.ServerTransport == "" {
-		cfg.ServerTransport = "tcp"
+	serverOrigin, serverTransport, err := parseServerURL(cfg.Server, cfg.ServerTransport)
+	if err != nil {
+		return nil, err
+	}
+	var prefTransport model.Transport
+	if pref := strings.TrimSpace(cfg.PreferredTransport); pref != "" {
+		prefTransport = model.Transport(strings.ToLower(pref))
+		if !prefTransport.Valid() {
+			return nil, fmt.Errorf("graphnet: unsupported preferred transport %q", cfg.PreferredTransport)
+		}
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
@@ -113,6 +156,7 @@ func Start(ctx context.Context, cfg Config) (*Client, error) {
 		QUICConnectionReceiveWindow: cfg.QUICConnectionReceiveWindow,
 		StreamReceiveWindow:         cfg.StreamReceiveWindow,
 		WebSocketRoots:              cfg.WebSocketRoots,
+		PreferredTransport:          prefTransport,
 		Logger:        cfg.Logger,
 		Endpoints: func(endpoints []model.Endpoint) error {
 			if control == nil {
@@ -126,7 +170,7 @@ func Start(ctx context.Context, cfg Config) (*Client, error) {
 		c.cache.Close()
 		return nil, err
 	}
-	control, err = agent.NewClient(c.cache, c.runtime, agent.Options{Server: cfg.Server, ServerTransport: cfg.ServerTransport, Roots: roots, Version: "client", Logger: cfg.Logger})
+	control, err = agent.NewClient(c.cache, c.runtime, agent.Options{Server: serverOrigin, ServerTransport: serverTransport, Roots: roots, GatewayRoots: roots, Version: "client", Logger: cfg.Logger})
 	if err != nil {
 		c.runtime.Close()
 		c.cancel()

@@ -49,7 +49,8 @@ type DataPlaneOptions struct {
 	// OriginTLS optionally overrides the origin server TLS config for incoming WSS links.
 	OriginTLS *tls.Config
 	// WebSocketRoots overrides CA roots trusted when dialing WSS links.
-	WebSocketRoots *x509.CertPool
+	WebSocketRoots     *x509.CertPool
+	PreferredTransport model.Transport
 	// legacyStreams makes this Agent carry streams without TCP sessions, as
 	// older versions do. Tests use it for mixed versions.
 	legacyStreams bool
@@ -221,7 +222,8 @@ func (r *DataPlane) Apply(ctx context.Context, snapshot model.Snapshot) error {
 			StreamWindow:    r.options.StreamReceiveWindow,
 			OriginClientCAs: r.options.OriginClientCAs,
 			OriginTLS:       r.options.OriginTLS,
-			WebSocketRoots:  r.options.WebSocketRoots,
+			WebSocketRoots:     r.options.WebSocketRoots,
+			PreferredTransport: r.options.PreferredTransport,
 		}, r.receiveBatch)
 		if err != nil {
 			return fmt.Errorf("listen for peers: %w", err)

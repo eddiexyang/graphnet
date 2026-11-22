@@ -353,14 +353,38 @@ export function rebase(draft: Draft, state: State): Draft {
   return equal(remote, draft.base) ? { ...draft, revision: state.revision } : draft
 }
 
-// An origin re-advertises every 10 s and sequences are origination times in
-// nanoseconds, so a copy older than two refreshes plus report delay is stale.
-const staleLSA = 25e9
+// An origin re-advertises every 5 min (MaxAge 15 min) and sequences are
+// origination times in nanoseconds. Flag either propagation lag behind the
+// origin (>25 s) or an unrefreshed copy older than two refresh cycles (11 min).
+const lsaLagThreshold = 25e9
+const staleLSA = 11 * 60 * 1e9
 export type RoutingView = {
   mode: 'controller' | 'link-state'
   origins: number
   missing: string[] // node names whose advertisement this Agent lacks
   stale: string[] // node names whose advertisement this Agent holds too old
+}
+function hasEnabledEdge(network: Network, nodeID: string): boolean {
+  if (network.edges.some((e) => e.enabled && (e.a === nodeID || e.b === nodeID))) return true
+  const groups = network.groups ?? []
+  const group = groups.find((g) => g.members.includes(nodeID))
+  if (group) {
+    if (group.members.length >= 2) {
+      const node = network.nodes.find((n) => n.id === nodeID)
+      if (
+        !node?.client ||
+        group.members.some((id) => id !== nodeID && !network.nodes.find((n) => n.id === id)?.client)
+      )
+        return true
+    }
+    if (
+      (network.group_links ?? []).some(
+        (l) => l.enabled && (l.group === group.id || l.source_group === group.id),
+      )
+    )
+      return true
+  }
+  return (network.group_links ?? []).some((l) => l.enabled && l.node === nodeID)
 }
 // routingView compares one Agent's link-state database with the
 // advertisements other connected Agents originate.
@@ -377,15 +401,19 @@ export function routingView(
     const db = report.origins[network.id]
     if (!db) continue
     const self = network.nodes.find((n) => n.agent_id === status.agent_id)
+    if (self && !hasEnabledEdge(network, self.id)) continue
     for (const node of network.nodes) {
       if (node.id === self?.id) continue
       const origin = statuses.find((s) => s.agent_id === node.agent_id)
-      const originated = origin?.connected && origin.link_state?.origins[network.id]?.[node.id]
+      const originated = origin?.connected
+        ? origin.link_state?.origins[network.id]?.[node.id]
+        : undefined
       const held = db[node.id]
       if (held !== undefined) view.origins++
-      if (!originated) continue
+      if (!originated || !hasEnabledEdge(network, node.id)) continue
       if (held === undefined) view.missing.push(node.name)
-      else if (seen - held > staleLSA) view.stale.push(node.name)
+      else if (originated - held > lsaLagThreshold || seen - held > staleLSA)
+        view.stale.push(node.name)
     }
   }
   return view

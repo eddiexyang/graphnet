@@ -774,6 +774,7 @@ function AddNode({
   const [agent, setAgent] = useState(available[0]?.id ?? '')
   const [name, setName] = useState(available[0]?.name ?? '')
   const [address, setAddress] = useState(nextAddress(network))
+  const [client, setClient] = useState(false)
   const [error, setError] = useState('')
   return (
     <Modal title="Add node" close={close}>
@@ -787,10 +788,24 @@ function AddNode({
               agent_id: agent,
               name,
               address,
-              position: {
-                x: (network.nodes.length % 3) * 280,
-                y: Math.floor(network.nodes.length / 3) * 150,
-              },
+              ...(client ? { client: true } : {}),
+              position: (() => {
+                const pts = network.nodes.map((n) => n.position)
+                if (!pts.length) return { x: 80, y: 80 }
+                const isFree = (x: number, y: number) =>
+                  pts.every((p) => Math.abs(p.x - x) >= 210 || Math.abs(p.y - y) >= 85)
+                const bottom = pts.reduce((a, b) =>
+                  b.y > a.y || (b.y === a.y && b.x < a.x) ? b : a,
+                )
+                for (let col = 0; col < 8; col++) {
+                  const x = bottom.x + col * 230
+                  for (let row = col === 0 ? 1 : 0; row < 20; row++) {
+                    const y = bottom.y + row * 110
+                    if (isFree(x, y)) return { x, y }
+                  }
+                }
+                return { x: bottom.x, y: bottom.y + 110 }
+              })(),
             }
             save({ ...network, nodes: [...network.nodes, node] })
           } catch (e) {
@@ -820,6 +835,10 @@ function AddNode({
         <Field label="Virtual IP">
           <input required value={address} onChange={(e) => setAddress(e.target.value)} />
         </Field>
+        <label className="check">
+          <input type="checkbox" checked={client} onChange={(e) => setClient(e.target.checked)} />
+          Client node (outbound only)
+        </label>
         {error && <ErrorBox>{error}</ErrorBox>}
         <button className="primary wide" disabled={!agent}>
           Add to draft

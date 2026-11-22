@@ -515,8 +515,14 @@ export default function Topology({
             selectable: false,
             data: {
               name: g.name,
-              summary: aggregate(network, internalEdges(g, false, network), statuses, rates, live, showSpeeds)
-                .label,
+              summary: aggregate(
+                network,
+                internalEdges(g, false, network),
+                statuses,
+                rates,
+                live,
+                showSpeeds,
+              ).label,
               address: '',
               state: '',
               connecting,
@@ -640,9 +646,7 @@ export default function Topology({
   const node =
     selection?.type === 'node' ? network.nodes.find((n) => n.id === selection.id) : undefined
   const selectedGroupLink =
-    selection?.type === 'edge'
-      ? network.group_links?.find((l) => l.id === selection.id)
-      : undefined
+    selection?.type === 'edge' ? network.group_links?.find((l) => l.id === selection.id) : undefined
   const selectedGroupLinkEdges = selectedGroupLink
     ? childEdges(network, selectedGroupLink)
     : undefined
@@ -654,8 +658,9 @@ export default function Topology({
       ? allEdges.find((e) => e.id === selection.id)
       : undefined
   const derivedOwner: EdgeOwner | undefined = edge
-    ? (network.groups?.find((g) => internalEdges(g, false, network).some((e) => e.id === edge.id)) ??
-      network.group_links?.find((l) => childEdges(network, l).some((e) => e.id === edge.id)))
+    ? (network.groups?.find((g) =>
+        internalEdges(g, false, network).some((e) => e.id === edge.id),
+      ) ?? network.group_links?.find((l) => childEdges(network, l).some((e) => e.id === edge.id)))
     : undefined
   const sharedEdge =
     derivedOwner &&
@@ -986,11 +991,11 @@ export default function Topology({
                   ? 'Aggregate link'
                   : edge
                     ? 'Edge details'
-                  : scope
-                    ? scope.kind === 'group'
-                      ? 'Full mesh group'
-                      : 'Aggregate link'
-                    : 'Network details'}
+                    : scope
+                      ? scope.kind === 'group'
+                        ? 'Full mesh group'
+                        : 'Aggregate link'
+                      : 'Network details'}
           </h2>
         </div>
         {!selection && scope && scopeSummary ? (
@@ -1011,7 +1016,9 @@ export default function Topology({
                 <>
                   <dt>Group ID</dt>
                   <dd>
-                    <code style={{ wordBreak: 'break-all', userSelect: 'all' }}>{scopeGroup.id}</code>
+                    <code style={{ wordBreak: 'break-all', userSelect: 'all' }}>
+                      {scopeGroup.id}
+                    </code>
                   </dd>
                   <dt>Members</dt>
                   <dd>{scopeGroup.members.length}</dd>
@@ -1063,9 +1070,7 @@ export default function Topology({
             )}
             {editing && (
               <div className="actions">
-                {scopeGroup && (
-                  <button onClick={() => setGroupEditor(scope)}>Edit group</button>
-                )}
+                {scopeGroup && <button onClick={() => setGroupEditor(scope)}>Edit group</button>}
                 <button
                   className="danger"
                   onClick={async () => {
@@ -1243,6 +1248,21 @@ export default function Topology({
                   }
                 />
               </Field>
+              <label className="check">
+                <input
+                  type="checkbox"
+                  checked={!!node.client}
+                  onChange={(e) =>
+                    change({
+                      ...network,
+                      nodes: network.nodes.map((n) =>
+                        n.id === node.id ? { ...n, client: e.target.checked || undefined } : n,
+                      ),
+                    })
+                  }
+                />
+                Client node (outbound only)
+              </label>
               <div className="advertised-subnets">
                 <strong>Advertised subnets</strong>
                 {(node.advertised_subnets || []).map((subnet, index) => (
@@ -1844,7 +1864,15 @@ export default function Topology({
                         {g.name} ({g.members.length})
                         <small>
                           {g.id} ·{' '}
-                          {aggregate(network, internalEdges(g, false, network), statuses, rates, live).label}
+                          {
+                            aggregate(
+                              network,
+                              internalEdges(g, false, network),
+                              statuses,
+                              rates,
+                              live,
+                            ).label
+                          }
                         </small>
                       </span>
                     </button>

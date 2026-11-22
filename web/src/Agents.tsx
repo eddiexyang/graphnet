@@ -348,9 +348,94 @@ function RoutingSummary({
         {view.origins} advertisements
         {status.link_state?.route_hash && <> · routes {status.link_state.route_hash.slice(0, 8)}</>}
       </small>
-      {view.missing.length > 0 && <small className="red">Missing {view.missing.join(', ')}</small>}
-      {view.stale.length > 0 && <small>Stale {view.stale.join(', ')}</small>}
+      {(view.missing.length > 0 || view.stale.length > 0) && (
+        <small
+          className={view.missing.length > 0 ? 'red' : undefined}
+          title={[
+            view.missing.length ? `Missing: ${view.missing.join(', ')}` : '',
+            view.stale.length ? `Stale: ${view.stale.join(', ')}` : '',
+          ]
+            .filter(Boolean)
+            .join(' · ')}
+        >
+          {[
+            view.missing.length ? `${view.missing.length} missing` : '',
+            view.stale.length ? `${view.stale.length} stale` : '',
+          ]
+            .filter(Boolean)
+            .join(' · ')}
+        </small>
+      )}
     </>
+  )
+}
+function RegisterKey({
+  revision,
+  csrf,
+  saved,
+  close,
+}: {
+  revision: number
+  csrf: string
+  saved: (s: State) => void
+  close: () => void
+}) {
+  const [name, setName] = useState('')
+  const [publicKey, setPublicKey] = useState('')
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+  return (
+    <Modal title="Register agent by public key" close={close}>
+      <form
+        onSubmit={async (e) => {
+          e.preventDefault()
+          setBusy(true)
+          setError('')
+          try {
+            const next = await request<State>('/agents', {
+              method: 'POST',
+              body: { name: name.trim(), public_key: publicKey.trim() },
+              csrf,
+              revision,
+            })
+            saved(next)
+            close()
+          } catch (err) {
+            setError(errorText(err))
+          } finally {
+            setBusy(false)
+          }
+        }}
+      >
+        <Field label="Agent name">
+          <input
+            required
+            maxLength={128}
+            placeholder="my-client"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+          />
+        </Field>
+        <Field label="Ed25519 public key (base64)">
+          <input
+            required
+            className="mono"
+            placeholder="base64 32-byte public key"
+            value={publicKey}
+            onChange={(e) => setPublicKey(e.target.value)}
+          />
+        </Field>
+        {error && <ErrorBox>{error}</ErrorBox>}
+        <footer>
+          <button type="button" onClick={close}>
+            Cancel
+          </button>
+          <button className="primary" type="submit" disabled={busy}>
+            {busy ? 'Registering…' : 'Register agent'}
+          </button>
+        </footer>
+      </form>
+    </Modal>
   )
 }
 export default function Agents({
@@ -370,16 +455,23 @@ export default function Agents({
 }) {
   const [editing, setEditing] = useState<Agent>()
   const [updating, setUpdating] = useState<Agent>()
+  const [registering, setRegistering] = useState(false)
   return (
     <>
       <div className="page-heading">
         <div>
           <h1>Agents</h1>
         </div>
-        <button className="primary" onClick={enroll}>
-          <Plus size={17} />
-          Enroll agent
-        </button>
+        <div className="actions">
+          <button onClick={() => setRegistering(true)}>
+            <Plus size={17} />
+            Register key
+          </button>
+          <button className="primary" onClick={enroll}>
+            <Plus size={17} />
+            Enroll agent
+          </button>
+        </div>
       </div>
       <div className="table-card">
         <table>
@@ -463,6 +555,14 @@ export default function Agents({
           </div>
         )}
       </div>
+      {registering && (
+        <RegisterKey
+          revision={state.revision}
+          csrf={csrf}
+          saved={updated}
+          close={() => setRegistering(false)}
+        />
+      )}
       {updating && (
         <AgentUpdate
           agent={updating}

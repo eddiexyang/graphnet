@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"math"
 	"mime"
 	"net/http"
 	"strconv"
@@ -283,6 +284,86 @@ func (s *Server) createNetwork(w http.ResponseWriter, r *http.Request) {
 	}
 	s.change(w, r, 201, func(state *model.State) error { state.Networks = append(state.Networks, n); return nil })
 }
+func placeUnpositionedNodes(n *model.Network, prev *model.Network) {
+	prevNodes := map[model.ID]bool{}
+	if prev != nil {
+		for _, node := range prev.Nodes {
+			prevNodes[node.ID] = true
+		}
+	}
+	groupOf := map[model.ID]model.FullMeshGroup{}
+	for _, g := range n.Groups {
+		for _, mid := range g.Members {
+			groupOf[mid] = g
+		}
+	}
+	occupied := make([]model.Position, 0, len(n.Nodes))
+	positioned := map[model.ID]model.Position{}
+	for _, node := range n.Nodes {
+		if prevNodes[node.ID] || node.Position.X != 0 || node.Position.Y != 0 {
+			occupied = append(occupied, node.Position)
+			positioned[node.ID] = node.Position
+		}
+	}
+	isFree := func(x, y float64) bool {
+		for _, p := range occupied {
+			if math.Abs(p.X-x) < 210 && math.Abs(p.Y-y) < 85 {
+				return false
+			}
+		}
+		return true
+	}
+	for i := range n.Nodes {
+		node := &n.Nodes[i]
+		if prevNodes[node.ID] || node.Position.X != 0 || node.Position.Y != 0 {
+			continue
+		}
+		var anchorX, anchorY float64
+		hasAnchor := false
+		if g, ok := groupOf[node.ID]; ok {
+			for _, mid := range g.Members {
+				if p, ok := positioned[mid]; ok {
+					if !hasAnchor || p.Y > anchorY || (p.Y == anchorY && p.X < anchorX) {
+						anchorX, anchorY, hasAnchor = p.X, p.Y, true
+					}
+				}
+			}
+		}
+		if !hasAnchor && len(occupied) > 0 {
+			for _, p := range occupied {
+				if !hasAnchor || p.Y > anchorY || (p.Y == anchorY && p.X < anchorX) {
+					anchorX, anchorY, hasAnchor = p.X, p.Y, true
+				}
+			}
+		}
+		placed := model.Position{X: 80, Y: 80}
+		if hasAnchor {
+			found := false
+			for col := 0; col < 8 && !found; col++ {
+				x := anchorX + float64(col)*230
+				startRow := 1
+				if col > 0 {
+					startRow = 0
+				}
+				for row := startRow; row < 20; row++ {
+					y := anchorY + float64(row)*110
+					if isFree(x, y) {
+						placed = model.Position{X: x, Y: y}
+						found = true
+						break
+					}
+				}
+			}
+			if !found {
+				placed = model.Position{X: anchorX, Y: anchorY + 110}
+			}
+		}
+		node.Position = placed
+		occupied = append(occupied, placed)
+		positioned[node.ID] = placed
+	}
+}
+
 func (s *Server) putNetwork(w http.ResponseWriter, r *http.Request) {
 	var n model.Network
 	if !decode(w, r, &n) {
@@ -296,6 +377,7 @@ func (s *Server) putNetwork(w http.ResponseWriter, r *http.Request) {
 	s.change(w, r, 200, func(state *model.State) error {
 		for i := range state.Networks {
 			if state.Networks[i].ID == n.ID {
+				placeUnpositionedNodes(&n, &state.Networks[i])
 				state.Networks[i] = n
 				return nil
 			}

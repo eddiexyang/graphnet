@@ -80,7 +80,8 @@ type Mesh struct {
 	wg             sync.WaitGroup
 	closed         bool
 	linkOptions    link.Options
-	streamWindow     uint64
+	streamWindow       uint64
+	preferredTransport model.Transport
 	consumingStreams atomic.Int64
 	stalledBytes     atomic.Int64
 }
@@ -98,6 +99,10 @@ type Options struct {
 	// WebSocketRoots overrides the CA roots trusted when dialing WSS endpoints
 	// behind a CDN or reverse proxy (nil uses system roots plus peer identity pin).
 	WebSocketRoots  *x509.CertPool
+	// PreferredTransport, when set and allowed by an Edge, causes the dialer to
+	// use only this transport while healthy, falling back to other allowed
+	// transports when all preferred candidates fail and switching back on recovery.
+	PreferredTransport model.Transport
 }
 
 func New(parent context.Context, identity ed25519.PrivateKey, host string, port uint16, receive Receive, batches ...func(context.Context, model.ID, []*packetbuf.Buffer) error) (*Mesh, error) {
@@ -117,7 +122,7 @@ func NewWithOptions(parent context.Context, identity ed25519.PrivateKey, host st
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(parent)
-	m := &Mesh{sniffSlots: make(chan struct{}, 64), pending: map[net.Conn]bool{}, identity: bytes.Clone(identity), ctx: ctx, cancel: cancel, listener: listener, udp: udp, receive: receive, groups: map[key]*group{}, slots: make(chan struct{}, 8), punchSlots: make(chan struct{}, 16), acceptSlots: make(chan struct{}, 64), punchNotify: make(chan struct{}), streamWindow: opts.StreamWindow}
+	m := &Mesh{sniffSlots: make(chan struct{}, 64), pending: map[net.Conn]bool{}, identity: bytes.Clone(identity), ctx: ctx, cancel: cancel, listener: listener, udp: udp, receive: receive, groups: map[key]*group{}, slots: make(chan struct{}, 8), punchSlots: make(chan struct{}, 16), acceptSlots: make(chan struct{}, 64), punchNotify: make(chan struct{}), streamWindow: opts.StreamWindow, preferredTransport: opts.PreferredTransport}
 	if len(batches) > 0 {
 		m.receiveBatch = batches[0]
 	}
