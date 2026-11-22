@@ -356,6 +356,30 @@ func (r *DataPlane) NetworkFor(destination netip.Addr) (model.ID, netip.Addr, er
 	return "", netip.Addr{}, last
 }
 
+// SendIP forwards a single raw L3 IP packet originating from this node's
+// overlay address in network through the data plane router.
+func (r *DataPlane) SendIP(ctx context.Context, network model.ID, raw []byte) error {
+	delay := 10 * time.Millisecond
+	for {
+		state := r.state.Load()
+		if state == nil {
+			return ErrNotConfigured
+		}
+		err := state.router.FromTunnel(ctx, network, raw)
+		if !errors.Is(err, errE2ESession) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-r.ctx.Done():
+			return err
+		case <-time.After(delay):
+		}
+		delay = min(2*delay, 100*time.Millisecond)
+	}
+}
+
 func (r *DataPlane) Report() []model.LinkStatus {
 	state := r.state.Load()
 	if state == nil {

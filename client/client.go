@@ -111,6 +111,7 @@ type Client struct {
 	done    chan struct{}
 	mu      sync.Mutex
 	stacks  map[netip.Addr]*netstack
+	rawIP   *rawIPRelay
 }
 
 // Start connects the client node. It returns once the node is running; the
@@ -143,7 +144,7 @@ func Start(ctx context.Context, cfg Config) (*Client, error) {
 			return nil, errors.New("graphnet: CA contains no certificates")
 		}
 	}
-	c := &Client{stacks: map[netip.Addr]*netstack{}, done: make(chan struct{})}
+	c := &Client{stacks: map[netip.Addr]*netstack{}, rawIP: newRawIPRelay(), done: make(chan struct{})}
 	if c.cache, err = agent.NewMemoryCache(cfg.PrivateKey); err != nil {
 		return nil, fmt.Errorf("graphnet: open state: %w", err)
 	}
@@ -207,6 +208,7 @@ func (c *Client) newStack(config tunnel.Config) (tunnel.Device, error) {
 	if err != nil {
 		return nil, err
 	}
+	n.setRawIPHandler(func(raw []byte) bool { return c.rawIP.deliver(config.Address.Addr(), raw) })
 	c.mu.Lock()
 	c.stacks[config.Address.Addr()] = n
 	c.mu.Unlock()

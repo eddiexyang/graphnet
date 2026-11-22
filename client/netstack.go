@@ -36,6 +36,7 @@ type netstack struct {
 	portMu   sync.Mutex
 	ports    map[uint16]struct{}
 	nextPort uint16
+	rawIP    atomic.Pointer[func([]byte) bool]
 }
 
 const netstackQueue = 1024
@@ -235,6 +236,14 @@ func (n *netstack) ReadOwnedOffloadBatch(buffers [][]byte, sizes, segmentSizes [
 	return 1, nil
 }
 
+func (n *netstack) setRawIPHandler(fn func([]byte) bool) {
+	if fn == nil {
+		n.rawIP.Store(nil)
+		return
+	}
+	n.rawIP.Store(&fn)
+}
+
 // Write delivers a packet from the data plane to the stack.
 func (n *netstack) Write(p []byte) (int, error) {
 	if n.ctx.Err() != nil {
@@ -242,6 +251,11 @@ func (n *netstack) Write(p []byte) (int, error) {
 	}
 	if len(p) == 0 {
 		return 0, nil
+	}
+	if proto, ok := ipUpperProtocol(p); ok && proto != 6 && proto != 17 {
+		if fn := n.rawIP.Load(); fn != nil && (*fn)(p) {
+			return len(p), nil
+		}
 	}
 	protocol := ipv4.ProtocolNumber
 	if p[0]>>4 == 6 {
