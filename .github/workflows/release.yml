@@ -29,9 +29,7 @@ jobs:
         with:
           go-version-file: .go-version
       - name: Run Go tests
-        run: go test -count=1 ./...
-      - name: Run privileged Linux SNAT netns tests
-        run: sudo -E env "PATH=$PATH" go test -v -count=1 ./internal/agent -run 'TestDialSNAT|TestDeliver'
+        run: sudo -E env "PATH=$PATH" go test -count=1 ./...
       - name: Check non-Linux build
         run: GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build ./client ./cmd/graphnet
 
