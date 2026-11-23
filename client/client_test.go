@@ -49,12 +49,7 @@ func startClientNetwork(t *testing.T, ctx context.Context, clientKey ed25519.Pri
 	state.Agents[3].PublicKey = clientKey.Public().(ed25519.PublicKey)
 	state.Agents[3].Endpoints = []model.Endpoint{}
 	for i := range 3 {
-		socket, err := net.Listen("tcp4", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		port := uint16(socket.Addr().(*net.TCPAddr).Port)
-		socket.Close()
+		port := testutil.AgentPort(t)
 		state.Agents[i].ListenPort = port
 		state.Agents[i].Endpoints = []model.Endpoint{{ID: testutil.ID(30 + i), Transport: carrier, Source: model.Manual, URL: fmt.Sprintf("%s://127.0.0.1:%d", carrier, port)}}
 	}
@@ -312,8 +307,25 @@ func TestClientConnectionFollowsRouteChange(t *testing.T) {
 	}
 	defer c.Close()
 	cn.serveEcho(t, 2, 7)
+	// Dial once the client's route to C goes through A, so the connection
+	// starts on the path the weight change moves it off.
+	nodes := cn.state.Networks[0].Nodes
+	for deadline := time.Now().Add(15 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		viaA := false
+		for _, n := range c.runtime.LinkState().Networks {
+			for _, r := range n.Routes {
+				viaA = viaA || r.Destination == nodes[2].ID && r.NextHop == nodes[0].ID
+			}
+		}
+		if viaA {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the client's route to C did not go through A")
+		}
+	}
 	dialCtx, stop := context.WithTimeout(ctx, 20*time.Second)
-	conn, err := c.DialTCP(dialCtx, netip.AddrPortFrom(cn.state.Networks[0].Nodes[2].Address, 7))
+	conn, err := c.DialTCP(dialCtx, netip.AddrPortFrom(nodes[2].Address, 7))
 	stop()
 	if err != nil {
 		t.Fatal(err)
@@ -340,7 +352,13 @@ func TestClientConnectionFollowsRouteChange(t *testing.T) {
 		}
 		got <- err
 	}()
-	time.Sleep(time.Second)
+	// Change the route only once the connection flows through A and B, so
+	// the change moves it rather than finding it on the direct path already.
+	for deadline := time.Now().Add(10 * time.Second); cn.runtimes[0].Counters()["relay_forwarded_bytes"] == 0; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the connection did not flow through A")
+		}
+	}
 	// D reaches C through A and B (21) until A-D costs 100; then directly (30).
 	cn.update(t, ctx, func(s *model.State) { s.Networks[0].Edges[2].Weight = 100 })
 	for deadline := time.Now().Add(5 * time.Second); c.runtime.Counters()["session_rebuilds"] == 0; time.Sleep(10 * time.Millisecond) {

@@ -383,6 +383,9 @@ func TestTCPPacketFlowResetsOnTCPPath(t *testing.T) {
 		s.Networks[0].Edges[3].Transports = []model.Transport{model.UDP} // D-C
 		s.Networks[0].Edges[0].Weight = 100                              // A-D-C first
 	})
+	// A routes through B until link-state hears that A-D and D-C are up.
+	waitConverged(t, agents[0], state, 0)
+	waitFor(t, 10*time.Second, "the route through D", func() bool { return nextHopToC(agents[0], state) == state.Networks[0].Nodes[3].ID })
 	address := state.Networks[0].Nodes[2].Address
 	listener, err := gonet.ListenTCP(devices[2].stack, tcpip.FullAddress{NIC: 1, Addr: tcpip.AddrFrom4(address.As4()), Port: 8093}, ipv4.ProtocolNumber)
 	if err != nil {
