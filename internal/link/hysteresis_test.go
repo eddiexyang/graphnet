@@ -22,18 +22,19 @@ func (c selectionTestChannel) RemoteAddr() net.Addr { return &net.UDPAddr{} }
 func TestBusyPathSelection(t *testing.T) {
 	for _, tc := range []struct {
 		name                           string
-		rtt                            time.Duration
-		age                            time.Duration
+		rtt, currentRTT                time.Duration
+		age, sinceSwitch               time.Duration
 		rx, tx                         uint64
 		failed, preferred, replacement bool
 		want                           string
 	}{
+		// A healthy path is never left for a lower RTT, busy or idle.
 		{name: "busy small improvement", rtt: 91 * time.Millisecond, tx: 1, want: "current"},
 		{name: "receive only", rtt: 91 * time.Millisecond, rx: 1, want: "current"},
-		{name: "ten percent", rtt: 90 * time.Millisecond, tx: 1, want: "candidate"},
-		{name: "larger improvement", rtt: 80 * time.Millisecond, rx: 1, want: "candidate"},
-		{name: "recent data", rtt: 99 * time.Millisecond, age: 5*time.Second - time.Nanosecond, want: "current"},
-		{name: "idle boundary", rtt: 99 * time.Millisecond, age: 5 * time.Second, want: "candidate"},
+		{name: "idle", rtt: 99 * time.Millisecond, age: time.Minute, want: "current"},
+		{name: "200 ms against 80 ms", currentRTT: 200 * time.Millisecond, rtt: 80 * time.Millisecond, tx: 1, want: "current"},
+		{name: "fast path jitter", currentRTT: 5 * time.Millisecond, rtt: 4 * time.Millisecond, want: "current"},
+		{name: "just switched and failed", rtt: 110 * time.Millisecond, sinceSwitch: time.Second, failed: true, want: "candidate"},
 		{name: "failed active", rtt: 110 * time.Millisecond, tx: 1, failed: true, want: "candidate"},
 		{name: "explicit preference", rtt: 110 * time.Millisecond, tx: 1, preferred: true, want: "candidate"},
 		{name: "session replacement", rtt: 110 * time.Millisecond, tx: 1, replacement: true, want: "candidate"},
@@ -43,7 +44,13 @@ func TestBusyPathSelection(t *testing.T) {
 			makeLink := func(id string, rtt time.Duration) *Link {
 				return &Link{channel: selectionTestChannel{id: id, created: now}, ctx: context.Background(), options: (Options{}).defaults(), info: Info{CandidateID: id}, lastPong: now, rtt: rtt, control: make(chan []byte, 8)}
 			}
-			current, candidate := makeLink("current", 100*time.Millisecond), makeLink("candidate", tc.rtt)
+			if tc.currentRTT == 0 {
+				tc.currentRTT = 100 * time.Millisecond
+			}
+			if tc.sinceSwitch == 0 {
+				tc.sinceSwitch = time.Hour
+			}
+			current, candidate := makeLink("current", tc.currentRTT), makeLink("candidate", tc.rtt)
 			current.rx.Store(tc.rx)
 			current.tx.Store(tc.tx)
 			current.lastTraffic = now.Add(-tc.age)
@@ -53,7 +60,7 @@ func TestBusyPathSelection(t *testing.T) {
 			e := NewCoordinatedEdge(model.ID("a"), model.ID("b"), "")
 			e.Add(current)
 			e.Add(candidate)
-			e.activateLocked(current, now)
+			e.activateLocked(current, now.Add(-tc.sinceSwitch))
 			e.selection.target = "current"
 			e.selection.confirmed = true
 			if tc.preferred {

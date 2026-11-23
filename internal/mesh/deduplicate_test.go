@@ -185,8 +185,9 @@ func TestDuplicatePathLifecycle(t *testing.T) {
 					active = report.LinkID
 				}
 			}
-			if active != fmt.Sprintf("%064x", 3) {
-				t.Fatal("did not select the lowest-RTT path after a 1 ms improvement")
+			// A healthy path is kept whatever the RTT of the others.
+			if active != fmt.Sprintf("%064x", 1) {
+				t.Fatalf("left the healthy first path for %q after a 1 ms lower RTT", active)
 			}
 		}
 		// Even an authenticated retirement request cannot remove a different path.

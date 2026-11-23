@@ -255,15 +255,15 @@ func (e *Edge) bestLocked(now time.Time) *Link {
 		}
 	}
 	// Explicit preferences and mandatory session replacement take precedence.
-	// Otherwise keep a busy healthy path unless RTT improves by at least 10%.
+	// Otherwise a healthy current path is kept, whatever the RTT of the
+	// others: lower latency on an equal-cost path is not better quality, and
+	// a switch pauses the far end's sender until it commits. RTT only picks
+	// the first path, or the next one after the current path fails.
 	if preferred != nil {
 		return preferred
 	}
-	if current != nil && best != nil && best != current && current.recentlyActive(now) {
-		currentRTT := current.Stats().RTTMillis
-		if currentRTT <= 0 || bestRTT <= 0 || bestRTT > currentRTT*0.9 {
-			return current
-		}
+	if current != nil {
+		return current
 	}
 	return best
 }
