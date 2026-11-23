@@ -19,11 +19,10 @@ and IPs, and `--listen` to expose it on the intended interface. Keep the data
 directory private and back it up: it contains the CA key and configuration.
 `--http --listen 127.0.0.1:8080` enables a loopback-only development server.
 
-Open the controller URL in a browser and sign in to the management UI. See the
-[UI guide](docs/management-ui.md) and [management API](docs/control-api.md). Setting
+Open the controller URL in a browser and sign in to the management UI. Setting
 a different password environment variable on restart does not replace the stored password.
 
-The [administrative CLI](docs/admin-cli.md) supports `graphnet network create`,
+The administrative CLI supports `graphnet network create`,
 `graphnet network list`, `graphnet node list` and `graphnet edge add`, with JSON
 output, verified HTTPS and revision-checked updates.
 
@@ -54,34 +53,18 @@ TLS 1.3 authentication and WebSocket control protocol. `--server` and
 uses its persistent Server directory and cached CA, updates that directory from
 controller snapshots, and automatically switches entrances or Servers on failure.
 Restarting with different bootstrap flags does not override the cached directory.
-See [control transport configuration](docs/control-api.md#control-transport-carriers).
 
 TUN setup requires root or `CAP_NET_ADMIN`. Add the enrolled Agent to a Network
 with a fixed virtual address, then create the desired Edges. Linux automatically
 advertises TCP/UDP endpoints from underlay interfaces; manual endpoints are also
-supported. QUIC uses explicit manual URLs; see [QUIC setup](docs/quic-operation.md).
+supported. QUIC uses explicit manual URLs.
 New Agents automatically discover public mappings using configurable STUN services.
-For STUN discovery and TCP/UDP hole punching, see [NAT setup](docs/nat-operation.md).
-Manual hostname behavior, multiple DNS addresses and TLS identity are documented
-in [endpoint resolution](docs/endpoint-resolution.md).
 The default peer listen port is 24752. No controller packet relay is
 used. Agents keep forwarding and can restart from cached configuration while the
 controller is unavailable.
 
 Nodes can advertise external subnets within a Network, with optional automatic
-gateway forwarding and Linux SNAT. External OS routes remain administrator-managed;
-see [advertised subnets](docs/advertised-subnets.md).
-
-For built-in Linux, Windows and macOS service management, see
-[service management](docs/service-management.md).
-
-For release binaries, Linux services (systemd, OpenRC and OpenWrt procd), upgrades and backups, see
-[deployment](docs/deployment.md).
-
-Platform setup and limitations: [Linux](docs/linux-operation.md),
-[FreeBSD](docs/freebsd-operation.md), [macOS](docs/macos-operation.md),
-[Windows](docs/windows-operation.md), [OpenBSD](docs/openbsd-operation.md),
-[NetBSD](docs/netbsd-operation.md) and [DragonFly](docs/dragonfly-operation.md).
+gateway forwarding and Linux SNAT. External OS routes remain administrator-managed.
 
 ## Known issues
 
@@ -101,4 +84,4 @@ pnpm --dir web build
 ```
 
 Version tags such as `v1.2.3` trigger cross-platform builds and a GitHub Release
-with one standalone binary per target. See [release CI and local checks](docs/continuous-integration.md).
+with one standalone binary per target.
