@@ -154,9 +154,20 @@ func serveController(ctx context.Context, listen, data, hosts string, insecure b
 		}
 		carriers = controltransport.NewServer(listener, app, server.TLSConfig)
 		defer carriers.Close()
-		if err := runtime.PublishEndpoints(nil); err != nil {
-			slog.Warn("clear discovered server endpoints", "error", err)
-		}
+		go func() {
+			for {
+				if _, leader := runtime.Raft.LeaderWithID(); leader != "" {
+					if err := runtime.PublishEndpoints(nil); err == nil {
+						return
+					}
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(500 * time.Millisecond):
+				}
+			}
+		}()
 	}
 	done := make(chan error, 1)
 	go func() {

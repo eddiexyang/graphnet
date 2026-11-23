@@ -117,11 +117,6 @@ func (s *Server) patchServer(w http.ResponseWriter, r *http.Request) {
 					urls[e.URL] = true
 					endpoints = append(endpoints, e)
 				}
-				for _, e := range p.Endpoints {
-					if e.Source != model.Manual && !urls[e.URL] {
-						endpoints = append(endpoints, e)
-					}
-				}
 				p.Endpoints = endpoints
 			}
 			return nil
