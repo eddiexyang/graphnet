@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -127,8 +128,13 @@ func newCountingRelay(t *testing.T, target int) *countingRelay {
 					back := make([]byte, 65536)
 					for {
 						n, err := conn.Read(back)
-						if err != nil {
+						if errors.Is(err, net.ErrClosed) {
 							return
+						}
+						if err != nil {
+							// A datagram sent before the target listened draws an
+							// ICMP refusal; keep relaying its later answers.
+							continue
 						}
 						r.bytes.Add(uint64(n))
 						listener.WriteToUDP(back[:n], from)
@@ -151,17 +157,12 @@ func idleBytes(t *testing.T, detection uint32) float64 {
 	var relays []*countingRelay
 	agents, _, _ := graphAgents(t, model.UDP, streamOptions{}, 2, 1, func(s *model.State) {
 		s.Networks[0].FailureDetection = detection
-		// One Node dials the other through the relay. An embedded client
-		// accepts no Links on its configured port, so with the client fixture
-		// A dials B; otherwise B dials A.
-		acceptor, dialer := 0, 1
-		if clientFixtureEnabled() {
-			acceptor, dialer = 1, 0
-		}
-		relay := newCountingRelay(t, int(s.Agents[acceptor].ListenPort))
+		// A dials B through the relay. B, never an embedded client, accepts
+		// on its configured port.
+		relay := newCountingRelay(t, int(s.Agents[1].ListenPort))
 		relays = append(relays, relay)
-		s.Agents[acceptor].Endpoints[0].URL = fmt.Sprintf("udp://127.0.0.1:%d", relay.port())
-		s.Agents[dialer].Endpoints = []model.Endpoint{}
+		s.Agents[1].Endpoints[0].URL = fmt.Sprintf("udp://127.0.0.1:%d", relay.port())
+		s.Agents[0].Endpoints = []model.Endpoint{}
 	})
 	waitFor(t, 10*time.Second, "a healthy Link", func() bool {
 		for _, l := range agents[0].Report() {
@@ -236,6 +237,59 @@ func TestFailureDetectionMixedSettings(t *testing.T) {
 			if !edgeUp(agent) {
 				t.Fatalf("agent %d: the Edge went down", i)
 			}
+		}
+	}
+}
+
+// A new failover time applies to the live Links: they stay up, whichever
+// Agent hears of it first, so no session they carry is cut.
+func TestFailureDetectionChangeKeepsLinks(t *testing.T) {
+	agents, _, state := graphAgents(t, model.UDP, streamOptions{}, 2, 1, func(s *model.State) {
+		s.Networks[0].FailureDetection = 1000
+	})
+	active := func(agent *DataPlane) string {
+		for _, l := range agent.Report() {
+			if l.Healthy && l.Active {
+				return l.LinkID
+			}
+		}
+		return ""
+	}
+	waitFor(t, 10*time.Second, "active Links both ways", func() bool { return active(agents[0]) != "" && active(agents[1]) != "" })
+	// Duplicate Links are retired early on; let that settle first.
+	time.Sleep(3 * time.Second)
+	want := []string{active(agents[0]), active(agents[1])}
+	hold := func(step string, d time.Duration) {
+		t.Helper()
+		for deadline := time.Now().Add(d); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+			for i, agent := range agents {
+				if got := active(agent); got != want[i] {
+					t.Fatalf("%s: agent %d: active Link %q, want %q", step, i, got, want[i])
+				}
+			}
+		}
+	}
+	revision := state.Revision
+	apply := func(i int, detection uint32) {
+		t.Helper()
+		next := state
+		revision++
+		next.Revision = revision
+		next.Networks = append([]model.Network(nil), state.Networks...)
+		next.Networks[0].FailureDetection = detection
+		snapshot, err := routing.Compile(next, next.Agents[i].ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := agents[i].Apply(context.Background(), snapshot); err != nil {
+			t.Fatal(err)
+		}
+	}
+	hold("before", time.Second)
+	for _, detection := range []uint32{model.MaxFailureDetection, 1000} {
+		for _, i := range []int{0, 1} {
+			apply(i, detection)
+			hold(fmt.Sprintf("%d ms on agent %d", detection, i), 3*time.Second)
 		}
 	}
 }

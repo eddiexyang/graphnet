@@ -177,6 +177,7 @@ type Link struct {
 	dataHead, dataCount           int
 	dataBytes                     int
 	dataReady                     chan struct{}
+	retime                        chan struct{} // SetTiming wakes the health loop
 	selection                     chan Selection
 	retirements                   chan Retirement
 	pathEnabled, pathAcknowledged bool
@@ -243,10 +244,17 @@ type Link struct {
 	sizeFailed   bool
 }
 
+func validTiming(heartbeat, timeout time.Duration) error {
+	if heartbeat <= 0 || timeout < 2*heartbeat || timeout/heartbeat > 64 {
+		return errors.New("link timeout must span 2–64 heartbeats")
+	}
+	return nil
+}
+
 func New(parent context.Context, channel Channel, info Info, options Options) (*Link, error) {
 	options = options.defaults()
-	if options.Timeout < 2*options.Heartbeat || options.Timeout/options.Heartbeat > 64 {
-		return nil, errors.New("link timeout must span 2–64 heartbeats")
+	if err := validTiming(options.Heartbeat, options.Timeout); err != nil {
+		return nil, err
 	}
 	if channel == nil || channel.ID() == "" || info.CandidateID == "" || !info.Transport.Valid() {
 		return nil, errors.New("invalid link identity")
@@ -257,7 +265,7 @@ func New(parent context.Context, channel Channel, info Info, options Options) (*
 		}
 	}
 	ctx, cancel := context.WithCancel(parent)
-	l := &Link{channel: channel, info: info, options: options, ctx: ctx, cancel: cancel, done: make(chan struct{}), dataReady: make(chan struct{}, 1), selection: make(chan Selection, 8), control: make(chan []byte, 8), packets: make(chan []byte, queueSize), pending: map[uint64]time.Time{}, started: time.Now()}
+	l := &Link{channel: channel, info: info, options: options, ctx: ctx, cancel: cancel, done: make(chan struct{}), dataReady: make(chan struct{}, 1), retime: make(chan struct{}, 1), selection: make(chan Selection, 8), control: make(chan []byte, 8), packets: make(chan []byte, queueSize), pending: map[uint64]time.Time{}, started: time.Now()}
 	l.pathEnabled = options.PathExchange
 	l.retirements = make(chan Retirement, 8)
 	l.streamWake = make(chan struct{}, 1)
@@ -595,6 +603,24 @@ func (l *Link) sawStream(now time.Time) { l.streamSeen.Store(now.UnixNano()) }
 // round trip plus up to one of the dialer's heartbeats, so one retransmission
 // on top of it must not fail the Link, even when that exceeds the Network's
 // failure detection.
+// SetTiming changes the heartbeat and timeout of a live Link.
+func (l *Link) SetTiming(heartbeat, timeout time.Duration) error {
+	if err := validTiming(heartbeat, timeout); err != nil {
+		return err
+	}
+	l.mu.Lock()
+	changed := l.options.Heartbeat != heartbeat || l.options.Timeout != timeout
+	l.options.Heartbeat, l.options.Timeout = heartbeat, timeout
+	l.mu.Unlock()
+	if changed {
+		select {
+		case l.retime <- struct{}{}:
+		default:
+		}
+	}
+	return nil
+}
+
 func (l *Link) timeoutLocked() time.Duration {
 	if l.rtt == 0 || !l.tcpBacked() {
 		return l.options.Timeout
@@ -1010,11 +1036,11 @@ func (l *Link) healthLoop() {
 			l.logDown("rekey")
 			return
 		}
+		l.mu.Lock()
 		for !next.After(now) {
 			next = next.Add(l.options.Heartbeat)
 		}
 		wake := next
-		l.mu.Lock()
 		if deadline := l.deadlineLocked(); !deadline.IsZero() && deadline.Before(wake) {
 			wake = deadline
 		}
@@ -1024,6 +1050,10 @@ func (l *Link) healthLoop() {
 		case <-l.ctx.Done():
 			l.logDown("closed")
 			return
+		case <-l.retime:
+			// The next probe follows the new heartbeat.
+			now = time.Now()
+			next = now
 		case <-timer.C:
 			// A timer reports when it was due, not when this goroutine woke:
 			// a probe stamped with that time would add the wake-up delay to

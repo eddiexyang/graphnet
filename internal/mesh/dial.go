@@ -105,6 +105,7 @@ func (g *group) schedule() {
 							retireFallback = append(retireFallback, l)
 							delete(g.links, id)
 							delete(g.linkCandidates, id)
+							delete(g.linkCaps, id)
 							delete(g.draining, id)
 							g.edge.Remove(id)
 						}
@@ -363,6 +364,10 @@ func (g *group) connect(ctx context.Context, candidate link.Candidate) (*peer.Ch
 	if err := channel.Send(ctx, append([]byte{0}, encoded...)); err != nil {
 		channel.Close()
 		return nil, linkCaps{}, err
+	}
+	offered.heartbeat = legacyHeartbeat
+	if intro.Heartbeat != 0 {
+		offered.heartbeat = time.Duration(intro.Heartbeat) * time.Millisecond
 	}
 	return channel, offered, nil
 }

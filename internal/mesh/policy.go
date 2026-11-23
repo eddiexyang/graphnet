@@ -111,7 +111,15 @@ func (g *group) wakeSchedule() {
 func (g *group) updatePolicy(cfg *policy) []*link.Link {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	previous := g.policy.Load()
 	g.policy.Store(cfg)
+	if previous != nil && previous.detection != cfg.detection && g.mesh.linkOptions.Heartbeat == 0 {
+		// A new failover time applies to the live Links in place: rebuilding
+		// them would cut every session they carry.
+		for id, l := range g.links {
+			l.SetTiming(linkTiming(cfg.detection, g.linkCaps[id]))
+		}
+	}
 	g.edge.SetPreferred(cfg.peer.Edge.PreferredCandidate)
 	var retired []*link.Link
 	var stale []string
@@ -142,6 +150,7 @@ func (g *group) updatePolicy(cfg *policy) []*link.Link {
 		retired = append(retired, l)
 		delete(g.links, id)
 		delete(g.linkCandidates, id)
+		delete(g.linkCaps, id)
 		delete(g.draining, id)
 		g.edge.Remove(id)
 	}
@@ -198,6 +207,7 @@ func (g *group) drain() {
 		retired = append(retired, l)
 		delete(g.links, id)
 		delete(g.linkCandidates, id)
+		delete(g.linkCaps, id)
 		delete(g.draining, id)
 		g.edge.Remove(id)
 	}

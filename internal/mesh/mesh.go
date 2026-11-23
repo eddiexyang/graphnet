@@ -277,7 +277,7 @@ func (m *Mesh) Apply(snapshot model.Snapshot) error {
 	return nil
 }
 func compatible(a, b *policy) bool {
-	return a.network == b.network && a.self == b.self && a.cipher == b.cipher && a.detection == b.detection && a.peer.Node.ID == b.peer.Node.ID && a.peer.Edge.ID == b.peer.Edge.ID && bytes.Equal(a.peer.PublicKey, b.peer.PublicKey)
+	return a.network == b.network && a.self == b.self && a.cipher == b.cipher && a.peer.Node.ID == b.peer.Node.ID && a.peer.Edge.ID == b.peer.Edge.ID && bytes.Equal(a.peer.PublicKey, b.peer.PublicKey)
 }
 
 func (m *Mesh) Send(ctx context.Context, network, remote model.ID, frame []byte) error {
@@ -490,6 +490,7 @@ type group struct {
 	mu                sync.Mutex
 	links             map[string]*link.Link
 	linkCandidates    map[string]link.Candidate
+	linkCaps          map[string]linkCaps
 	attempts          map[string]*attempt
 	retained          map[string]link.Candidate
 	suppressed        map[string]string
@@ -509,7 +510,7 @@ type attempt struct {
 
 func (m *Mesh) newGroup(cfg *policy) *group {
 	ctx, cancel := context.WithCancel(m.ctx)
-	g := &group{mesh: m, edge: link.NewCoordinatedEdge(cfg.self, cfg.peer.Node.ID, cfg.peer.Edge.PreferredCandidate), ctx: ctx, cancel: cancel, wake: make(chan struct{}, 1), links: map[string]*link.Link{}, linkCandidates: map[string]link.Candidate{}, attempts: map[string]*attempt{}, retained: map[string]link.Candidate{}}
+	g := &group{mesh: m, edge: link.NewCoordinatedEdge(cfg.self, cfg.peer.Node.ID, cfg.peer.Edge.PreferredCandidate), ctx: ctx, cancel: cancel, wake: make(chan struct{}, 1), links: map[string]*link.Link{}, linkCandidates: map[string]link.Candidate{}, linkCaps: map[string]linkCaps{}, attempts: map[string]*attempt{}, retained: map[string]link.Candidate{}}
 	g.policy.Store(cfg)
 	g.suppressed = map[string]string{}
 	g.retiring = map[string]*retirement{}
@@ -545,6 +546,9 @@ type linkCaps struct {
 	accepted                                        bool
 	// peerHeartbeat is the dialer's heartbeat, as its introduction stated.
 	peerHeartbeat time.Duration
+	// heartbeat is the dialer's heartbeat as the acceptor understood its
+	// introduction; the dialer never probes more slowly than that.
+	heartbeat time.Duration
 }
 
 // legacyHeartbeat is the heartbeat of dialers that do not state theirs.
@@ -565,7 +569,16 @@ func linkTiming(detection time.Duration, caps linkCaps) (heartbeat, timeout time
 		}
 		timeout = max(timeout, 3*min(peer, model.MaxFailureDetection*time.Millisecond/3))
 	}
-	return timeout / 3, timeout
+	heartbeat = timeout / 3
+	if !caps.accepted && caps.heartbeat > 0 && caps.heartbeat < heartbeat {
+		// The acceptor's timeout allows three of the heartbeats this side
+		// stated when the Link was set up; probing more slowly than that
+		// would have the acceptor take the Link for failed. The timeout still
+		// spans at most 64 heartbeats.
+		heartbeat = caps.heartbeat
+		timeout = min(timeout, 64*heartbeat)
+	}
+	return heartbeat, timeout
 }
 
 func (g *group) register(channel *peer.Channel, candidate link.Candidate, pathExchange bool, caps linkCaps) {
@@ -611,6 +624,7 @@ func (g *group) register(channel *peer.Channel, candidate link.Candidate, pathEx
 	}
 	g.links[l.ID()] = l
 	g.linkCandidates[l.ID()] = candidate
+	g.linkCaps[l.ID()] = caps
 	if candidate.Endpoint.Source == model.Observed || candidate.Target.IsValid() {
 		g.retained[candidate.ID] = candidate
 	}
