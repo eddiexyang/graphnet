@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -43,6 +44,9 @@ func TestDialSNATIsolatesHostAndOtherNetworkRoutes(t *testing.T) {
 			}
 			t.Fatalf("netns helper failed: %v\n%s", err, out)
 		}
+		if strings.Contains(string(out), "--- SKIP:") {
+			t.Skipf("netns helper skipped:\n%s", out)
+		}
 		return
 	}
 
@@ -51,6 +55,9 @@ func TestDialSNATIsolatesHostAndOtherNetworkRoutes(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := netlink.LinkSetUp(lo); err != nil {
+		if errors.Is(err, unix.EPERM) {
+			t.Skipf("CAP_NET_ADMIN unavailable in netns: %v", err)
+		}
 		t.Fatal(err)
 	}
 
