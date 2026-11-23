@@ -28,6 +28,8 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: .go-version
+      - name: Run SNAT netns tests
+        run: sudo -E env "PATH=$PATH" go test -v -count=1 ./internal/agent -run 'TestDialSNAT|TestDeliver'
       - name: Run Go tests
         run: sudo -E env "PATH=$PATH" go test -count=1 ./...
       - name: Check non-Linux build

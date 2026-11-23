@@ -334,7 +334,14 @@ func TestDialSNATIsolatesHostAndOtherNetworkRoutes(t *testing.T) {
 
 	netBConn, err := dp.dialSNAT(ctx, state, netAID, netip.MustParseAddrPort("7.7.7.2:8083"))
 	if err != nil {
-		t.Fatalf("explicitly advertised other network self dialSNAT failed: %v", err)
+		routes, rerr := netlink.RouteGet(net.ParseIP("7.7.7.2"))
+		cerr := checkSNATRoute(state, netAID, netip.MustParseAddr("7.7.7.2"))
+		var probeLocal string
+		if pc, perr := net.Dial("tcp4", "7.7.7.2:8083"); perr == nil {
+			probeLocal = pc.LocalAddr().String()
+			pc.Close()
+		}
+		t.Fatalf("explicitly advertised other network self dialSNAT failed: %v (checkSNATRoute=%v routes=%+v rerr=%v probeLocal=%q)", err, cerr, routes, rerr, probeLocal)
 	}
 	netBGot, err := io.ReadAll(netBConn)
 	netBConn.Close()
