@@ -41,9 +41,10 @@ func (r Registration) clone() Registration {
 	return out
 }
 
-// Cache holds an Agent runtime state strictly in memory. Nothing is written to
-// disk; on every start the node registers by its configured key and fetches
-// configuration from the controller.
+// Cache holds an Agent runtime state in memory; on every start the node
+// registers by its configured key and fetches configuration from the
+// controller. A cache from OpenDiskCache also writes configuration through to
+// disk as an offline fallback (see diskcache.go); memory stays authoritative.
 type Cache struct {
 	mu      sync.Mutex
 	key     ed25519.PrivateKey
@@ -52,6 +53,9 @@ type Cache struct {
 	applied []byte
 	routes  []byte
 	lastSrv string
+
+	disk     *diskState
+	fallback *fallback
 }
 
 // NewMemoryCache creates an in-memory cache for identity. If identity is nil,
@@ -72,7 +76,7 @@ func NewMemoryCache(identity ed25519.PrivateKey) (*Cache, error) {
 	return &Cache{key: key}, nil
 }
 
-func (c *Cache) Close() error                   { return nil }
+func (c *Cache) Close() error                   { return c.disk.close() }
 func (c *Cache) PrivateKey() ed25519.PrivateKey { return bytes.Clone(c.key) }
 func (c *Cache) PublicKey() ed25519.PublicKey   { return c.key.Public().(ed25519.PublicKey) }
 func (c *Cache) CSR() ([]byte, error) {
@@ -179,13 +183,28 @@ func (c *Cache) saveSnapshot(applied bool, snapshot model.Snapshot) error {
 	if len(raw) > maxSnapshotBytes {
 		return errors.New("snapshot too large")
 	}
+	id, changed, err := c.storeSnapshot(applied, snapshot, raw)
+	if err != nil || !changed {
+		return err
+	}
+	// Writes are ordered by the Reconciler's apply lock, not by c.mu, so a slow
+	// disk never blocks readers of the in-memory state.
+	key := keyDesired
+	if applied {
+		key = keyApplied
+	}
+	c.disk.put(id, key, raw)
+	return nil
+}
+
+func (c *Cache) storeSnapshot(applied bool, snapshot model.Snapshot, raw []byte) (model.ID, bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.reg == nil {
-		return errors.New("missing registration")
+		return "", false, errors.New("missing registration")
 	}
 	if err := snapshot.Validate(c.reg.AgentID); err != nil {
-		return err
+		return "", false, err
 	}
 	slot := c.desired
 	if applied {
@@ -193,35 +212,35 @@ func (c *Cache) saveSnapshot(applied bool, snapshot model.Snapshot) error {
 	}
 	prior, err := c.snapshotFromLocked(slot)
 	if err != nil {
-		return err
+		return "", false, err
 	}
 	if prior != nil {
 		if snapshot.Revision < prior.Revision {
-			return errors.New("snapshot revision rollback rejected")
+			return "", false, errors.New("snapshot revision rollback rejected")
 		}
 		if snapshot.Revision == prior.Revision {
 			previous, _ := json.Marshal(prior)
 			if !bytes.Equal(raw, previous) {
-				return errors.New("snapshot revision changed content")
+				return "", false, errors.New("snapshot revision changed content")
 			}
-			return nil
+			return "", false, nil
 		}
 	}
 	if applied {
 		desired, err := c.snapshotFromLocked(c.desired)
 		if err != nil {
-			return err
+			return "", false, err
 		}
 		if desired == nil {
-			return errors.New("cannot apply before persisting desired snapshot")
+			return "", false, errors.New("cannot apply before persisting desired snapshot")
 		}
 		expected, _ := json.Marshal(desired)
 		if !bytes.Equal(raw, expected) {
-			return errors.New("applied snapshot differs from desired state")
+			return "", false, errors.New("applied snapshot differs from desired state")
 		}
 		c.applied = raw
-		return nil
+	} else {
+		c.desired = raw
 	}
-	c.desired = raw
-	return nil
+	return c.reg.AgentID, true, nil
 }

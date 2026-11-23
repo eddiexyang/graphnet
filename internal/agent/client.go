@@ -64,6 +64,8 @@ type Client struct {
 	endpointsSet        bool
 	endpointsChanged    chan struct{}
 	pendingUpdate       *model.UpdateRequest
+	fallbackTried       bool // Run-only state
+	fallbackRunning     bool
 }
 
 func serverURL(raw string) (string, error) {
@@ -262,9 +264,12 @@ func (c *Client) registration(ctx context.Context) (*Registration, error) {
 	req.Header.Set("Authorization", "Bearer "+c.options.EnrollmentToken)
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("enroll: %w", err)
+		return nil, &unreachableError{fmt.Errorf("enroll: %w", err)}
 	}
 	defer resp.Body.Close()
+	if gatewayFailure(resp.StatusCode) {
+		return nil, &unreachableError{fmt.Errorf("enroll: controller unavailable: HTTP %d", resp.StatusCode)}
+	}
 	if resp.StatusCode != 201 {
 		return nil, fmt.Errorf("enrollment rejected: HTTP %d", resp.StatusCode)
 	}
@@ -318,20 +323,51 @@ func (c *Client) registration(ctx context.Context) (*Registration, error) {
 	return reg, nil
 }
 
-// Run restores local runtime first and maintains control synchronization until
-// canceled. Reconnect attempts never tear down working runtime resources.
+// unreachableError marks a controller that could not be reached, as opposed
+// to one that answered and refused.
+type unreachableError struct{ err error }
+
+func (e *unreachableError) Error() string { return e.err.Error() }
+func (e *unreachableError) Unwrap() error { return e.err }
+
+func controllerUnreachable(err error) bool {
+	var u *unreachableError
+	return errors.As(err, &u)
+}
+
+// gatewayFailure is an HTTPS gateway answering for a controller it cannot reach.
+func gatewayFailure(code int) bool {
+	return code == http.StatusBadGateway || code == http.StatusServiceUnavailable || code == http.StatusGatewayTimeout
+}
+
+// startupFallbackAfter bounds how long an Agent without configuration keeps
+// trying controllers before it applies its disk fallback.
+const startupFallbackAfter = 10 * time.Second
+
+// Run maintains control synchronization until canceled. Reconnect attempts
+// never tear down working runtime resources. The disk fallback is applied only
+// when no controller can be reached at startup (see restoreFallback).
 // A Client instance must have at most one concurrent Run call.
 func (c *Client) Run(ctx context.Context) error {
-	if err := c.reconcile.Restore(ctx); err != nil {
-		var apply *ApplyError
-		if !errors.As(err, &apply) {
+	runStart := time.Now()
+	reg, err := c.registration(ctx)
+	for delay := 250 * time.Millisecond; err != nil; delay = min(delay*2, 30*time.Second) {
+		// Without a fallback running, exit as before and let the supervisor retry.
+		if ctx.Err() != nil || !controllerUnreachable(err) || !c.restoreFallback(ctx, err) {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			return err
 		}
-		c.options.Logger.Error("cached configuration failed", "error", err)
-	}
-	reg, err := c.registration(ctx)
-	if err != nil {
-		return err
+		c.options.Logger.Warn("controller unreachable; retrying registration", "server", c.server, "error", err)
+		timer := time.NewTimer(delay/2 + time.Duration(rand.Int64N(int64(delay/2)+1)))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+		reg, err = c.registration(ctx)
 	}
 	runtimeCtx, stopRuntime := context.WithCancel(ctx)
 	updates := make(chan model.Snapshot, 1)
@@ -347,6 +383,9 @@ func (c *Client) Run(ctx context.Context) error {
 			break
 		}
 		c.options.Logger.Warn("controller disconnected; retaining local configuration", "server", c.server, "error", err)
+		if !c.reconcile.Configured() && (len(c.failedTargets) >= len(c.targets(*reg)) || time.Since(runStart) >= startupFallbackAfter) {
+			c.restoreFallback(ctx, err)
+		}
 		if time.Since(start) > time.Minute {
 			delay = 250 * time.Millisecond
 		}
@@ -363,6 +402,24 @@ func (c *Client) Run(ctx context.Context) error {
 		delay = min(delay*2, 30*time.Second)
 	}
 	return ctx.Err()
+}
+
+// restoreFallback applies the disk fallback once, the first time the
+// controller is found unreachable before any configuration runs. It reports
+// whether a fallback configuration is running.
+func (c *Client) restoreFallback(ctx context.Context, cause error) bool {
+	if !c.fallbackTried {
+		c.fallbackTried = true
+		revision, err := c.reconcile.RestoreFallback(ctx)
+		if revision != 0 {
+			c.options.Logger.Warn("controller unreachable at startup; running cached configuration", "revision", revision, "cause", cause)
+		}
+		if err != nil {
+			c.options.Logger.Error("cached configuration failed", "error", err)
+		}
+		c.fallbackRunning = revision != 0
+	}
+	return c.fallbackRunning
 }
 
 func (c *Client) connect(parent context.Context, id model.ID, updates chan model.Snapshot, acks chan struct{}) error {

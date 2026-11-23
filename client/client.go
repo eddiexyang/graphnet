@@ -68,6 +68,12 @@ type Config struct {
 	// example "quic" or "tcp") when allowed by the Edge, falling back to other
 	// allowed transports automatically if unreachable.
 	PreferredTransport string
+	// StateFile, when set, keeps the last controller configuration in this
+	// file. It is applied only if no controller can be reached when the node
+	// starts; registration still comes from the controller. Empty keeps no
+	// state on disk. Requires PrivateKey. A file held by another running node
+	// is skipped with a warning.
+	StateFile string
 }
 
 func parseServerURL(raw, explicitTransport string) (origin, transport string, err error) {
@@ -145,7 +151,19 @@ func Start(ctx context.Context, cfg Config) (*Client, error) {
 		}
 	}
 	c := &Client{stacks: map[netip.Addr]*netstack{}, rawIP: newRawIPRelay(), done: make(chan struct{})}
-	if c.cache, err = agent.NewMemoryCache(cfg.PrivateKey); err != nil {
+	if cfg.StateFile != "" {
+		c.cache, err = agent.OpenDiskCache(cfg.StateFile, cfg.PrivateKey, cfg.Logger)
+		if errors.Is(err, agent.ErrCacheInUse) {
+			// An embedding application may start a replacement node before it
+			// closes the previous one; that node keeps the file, this one runs
+			// without an offline fallback instead of failing.
+			cfg.Logger.Warn("graphnet state file in use; running without disk state", "file", cfg.StateFile)
+			c.cache, err = agent.NewMemoryCache(cfg.PrivateKey)
+		}
+	} else {
+		c.cache, err = agent.NewMemoryCache(cfg.PrivateKey)
+	}
+	if err != nil {
 		return nil, fmt.Errorf("graphnet: open state: %w", err)
 	}
 	c.ctx, c.cancel = context.WithCancel(sockets.With(context.WithoutCancel(ctx), sockets.Hooks{Control: cfg.Control, Lookup: cfg.Lookup}))

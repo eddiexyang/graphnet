@@ -26,9 +26,12 @@ func (c *Client) keyRegistration(ctx context.Context) (*Registration, error) {
 	client := &http.Client{Transport: &challengeSigner{base: c.transport, key: c.cache.PrivateKey(), byKey: true}, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("register by public key: %w", err)
+		return nil, &unreachableError{fmt.Errorf("register by public key: %w", err)}
 	}
 	defer resp.Body.Close()
+	if gatewayFailure(resp.StatusCode) {
+		return nil, &unreachableError{fmt.Errorf("register by public key: controller unavailable: HTTP %d", resp.StatusCode)}
+	}
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("registration by public key rejected: HTTP %d; add this Agent's public key on the controller, or enroll it with a token", resp.StatusCode)
 	}

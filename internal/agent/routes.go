@@ -74,18 +74,21 @@ func (c *Cache) saveRoutes(update model.RouteUpdate) error {
 		return errors.New("route update too large")
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	snapshot, err := c.snapshotFromLocked(c.applied)
+	if err == nil && snapshot == nil {
+		err = errors.New("missing applied configuration")
+	}
+	if err == nil {
+		_, err = update.Apply(*snapshot)
+	}
 	if err != nil {
-		return err
-	}
-	if snapshot == nil {
-		return errors.New("missing applied configuration")
-	}
-	if _, err := update.Apply(*snapshot); err != nil {
+		c.mu.Unlock()
 		return err
 	}
 	c.routes = raw
+	id := c.reg.AgentID
+	c.mu.Unlock()
+	c.disk.put(id, keyRoutes, raw)
 	return nil
 }
 
@@ -127,7 +130,8 @@ func (r *Reconciler) AcceptRoutes(update model.RouteUpdate) error {
 	r.applyMu.Lock()
 	defer r.applyMu.Unlock()
 	r.mu.Lock()
-	current := r.running && r.applied == update.Revision
+	// Routes for a restored disk snapshot wait for the controller's own snapshot.
+	current := r.running && r.applied == update.Revision && r.restored == nil
 	r.mu.Unlock()
 	if !current {
 		return nil

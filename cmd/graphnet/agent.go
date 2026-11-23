@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime/debug"
 	"strings"
 	"syscall"
@@ -74,7 +75,7 @@ func runAgentContext(parent context.Context, args []string) error {
 		}
 		*name = hostname
 	}
-	cache, explicit, err := openAgentCache(*data)
+	cache, explicit, err := openAgentStateCache(*data)
 	if err != nil {
 		return err
 	}
@@ -217,18 +218,37 @@ func runAgentEnroll(args []string) error {
 const agentPrivateKeyEnv = "GRAPHNET_PRIVATE_KEY"
 
 // openAgentCache opens an in-memory cache for the key in agentPrivateKeyEnv.
-// Agent nodes keep no disk state and fetch configuration from the controller on every start.
 func openAgentCache(_ string) (cache *agent.Cache, explicit bool, err error) {
-	text := strings.TrimSpace(os.Getenv(agentPrivateKeyEnv))
-	if text == "" {
-		return nil, false, errors.New(agentPrivateKeyEnv + " is required for stateless agent startup")
-	}
-	key, ok := model.ParseAgentPrivateKey(text)
-	if !ok {
-		return nil, false, errors.New(agentPrivateKeyEnv + " is not a base64 Ed25519 private key")
+	key, err := agentPrivateKey()
+	if err != nil {
+		return nil, false, err
 	}
 	cache, err = agent.NewMemoryCache(key)
 	return cache, true, err
+}
+
+// openAgentStateCache is openAgentCache for a running Agent: its configuration
+// is also kept in the data directory as a fallback for starts without a
+// reachable controller. Registration still comes from the controller each start.
+func openAgentStateCache(data string) (*agent.Cache, bool, error) {
+	key, err := agentPrivateKey()
+	if err != nil {
+		return nil, false, err
+	}
+	cache, err := agent.OpenDiskCache(filepath.Join(data, "agent.db"), key, nil)
+	return cache, true, err
+}
+
+func agentPrivateKey() (ed25519.PrivateKey, error) {
+	text := strings.TrimSpace(os.Getenv(agentPrivateKeyEnv))
+	if text == "" {
+		return nil, errors.New(agentPrivateKeyEnv + " is required for agent startup")
+	}
+	key, ok := model.ParseAgentPrivateKey(text)
+	if !ok {
+		return nil, errors.New(agentPrivateKeyEnv + " is not a base64 Ed25519 private key")
+	}
+	return key, nil
 }
 
 // runAgentKey prints the Agent's public key, creating its identity on first
