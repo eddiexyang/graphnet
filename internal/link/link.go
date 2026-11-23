@@ -14,7 +14,6 @@ import (
 	"github.com/eddiexyang/graphnet/internal/model"
 	"github.com/eddiexyang/graphnet/internal/packet"
 	"github.com/eddiexyang/graphnet/internal/packetbuf"
-	"github.com/eddiexyang/graphnet/internal/peer"
 )
 
 const (
@@ -45,14 +44,6 @@ const (
 	// The acceptor confirms stream windows taken from the kernel's receive
 	// buffer, offered in the introduction; see Options.Windows.
 	windowHelloMessage = 24
-	// A stream message whose data is sealed end to end, which the channel
-	// does not encrypt again; see peer.SealedPayload.
-	sealedStreamMessage = peer.SealedPayload
-	// A packet sealed end to end travels as peer.Masked, which the channel
-	// does not encrypt again: [peer.Masked|hop limit][source index][destination
-	// index][IP packet][trailer]. Its source and destination Nodes, which its
-	// seal depends on, travel as their wire indexes; see model.Node.Index.
-	maskedHeader = 1 + 2 + 2
 	// Leave room for multiple kernel GSO bursts while writers process bounded
 	// batches. The queue is still finite; control messages use a separate queue.
 	queueSize = 512
@@ -491,15 +482,7 @@ func (l *Link) enqueue(ctx context.Context, frames [][]byte, owners []*packetbuf
 			break
 		}
 		var buffer *packetbuf.Buffer
-		if l.options.Compact != nil && packet.IsSealed(frame) {
-			if buffer = l.maskedFrame(frame, owners, i); buffer == nil {
-				// A Node without an index is one this Link's table no
-				// longer has: the packet is lost as on a full queue.
-				l.dropped.Add(1)
-				accepted, consumed = accepted+1, i+1
-				continue
-			}
-		} else if l.options.Compact != nil {
+		if l.options.Compact != nil {
 			buffer = compactFrame(frame, owners, i)
 		} else if owners != nil && owners[i].PrependByte(dataMessage) {
 			buffer = owners[i]
@@ -542,31 +525,6 @@ func compactFrame(frame []byte, owners []*packetbuf.Buffer, i int) *packetbuf.Bu
 	buffer := packetbuf.Get(len(frame) - packet.HeaderSize + 2)
 	buffer.Data[0], buffer.Data[1] = compactDataMessage, frame[3]
 	copy(buffer.Data[2:], frame[packet.HeaderSize:])
-	return buffer
-}
-
-// maskedFrame replaces the packet header of a sealed packet with the masked
-// one, in place for an owned buffer, or returns nil when a Node has no index.
-func (l *Link) maskedFrame(frame []byte, owners []*packetbuf.Buffer, i int) *packetbuf.Buffer {
-	source, ok := l.options.Compact.Index(l.networkWire, [16]byte(frame[24:40]))
-	destination, found := l.options.Compact.Index(l.networkWire, [16]byte(frame[40:56]))
-	if !ok || !found {
-		if owners != nil {
-			owners[i].Release()
-		}
-		return nil
-	}
-	var buffer *packetbuf.Buffer
-	if owners != nil {
-		buffer = owners[i]
-		buffer.Data = buffer.Data[packet.HeaderSize-maskedHeader:]
-	} else {
-		buffer = packetbuf.Get(len(frame) - packet.HeaderSize + maskedHeader)
-		copy(buffer.Data[maskedHeader:], frame[packet.HeaderSize:])
-	}
-	buffer.Data[0] = peer.Masked | min(frame[3], peer.MaxHopLimit)
-	binary.BigEndian.PutUint16(buffer.Data[1:3], source)
-	binary.BigEndian.PutUint16(buffer.Data[3:5], destination)
 	return buffer
 }
 
@@ -754,30 +712,6 @@ func (l *Link) readLoop() {
 		if len(raw) == 0 {
 			return
 		}
-		if raw[0] >= peer.Masked {
-			// Masked packets are not authenticated per hop: one that does not
-			// parse is dropped, never taken for the peer's failure.
-			buffer := l.unmasked(raw, owning)
-			if buffer == nil {
-				l.dropped.Add(1)
-				continue
-			}
-			l.rx.Add(uint64(len(buffer.Data)))
-			if owning {
-				ready[count] = buffer
-				count++
-				if count == len(ready) {
-					flush()
-				}
-				continue
-			}
-			select {
-			case l.packets <- buffer.Data:
-			default:
-				l.dropped.Add(1)
-			}
-			continue
-		}
 		switch raw[0] {
 		case pathMessage, retireMessage, retiredMessage:
 			if !l.handlePathControl(raw) {
@@ -868,7 +802,7 @@ func (l *Link) readLoop() {
 				return
 			}
 			l.options.LinkState.ReceiveLinkState(l, raw[1:])
-		case streamMessage, sealedStreamMessage:
+		case streamMessage:
 			if !l.streamsReady.Load() {
 				return
 			}
@@ -1004,7 +938,7 @@ func (l *Link) writeLoop() {
 		if count == 0 {
 			continue
 		}
-		preferStreams = len(messages[0]) == 0 || messages[0][0] != streamMessage && messages[0][0] != sealedStreamMessage
+		preferStreams = len(messages[0]) == 0 || messages[0][0] != streamMessage
 		ctx, cancel := context.WithTimeout(l.ctx, l.options.WriteTimeout)
 		var err error
 		if batching {
@@ -1018,9 +952,7 @@ func (l *Link) writeLoop() {
 		}
 		for i, raw := range messages[:count] {
 			switch {
-			case raw[0] >= peer.Masked:
-				l.tx.Add(uint64(len(raw) - maskedHeader + packet.HeaderSize))
-			case raw[0] == dataMessage, raw[0] == streamMessage, raw[0] == sealedStreamMessage:
+			case raw[0] == dataMessage, raw[0] == streamMessage:
 				l.tx.Add(uint64(len(raw) - 1))
 			case raw[0] == compactDataMessage:
 				l.tx.Add(uint64(len(raw) - 2 + packet.HeaderSize))
@@ -1338,28 +1270,4 @@ func (l *Link) heartbeat(now time.Time) bool {
 	default:
 	}
 	return true
-}
-
-// unmasked rebuilds the overlay frame of a masked packet the channel
-// revealed, or returns nil for one that does not parse.
-func (l *Link) unmasked(raw []byte, owning bool) *packetbuf.Buffer {
-	if l.options.Compact == nil || len(raw) <= maskedHeader+packet.Trailer || len(raw)-maskedHeader > packet.MaxPayload || raw[0]&^peer.Masked == 0 {
-		return nil
-	}
-	source, ok := l.options.Compact.Node(l.networkWire, binary.BigEndian.Uint16(raw[1:3]))
-	destination, found := l.options.Compact.Node(l.networkWire, binary.BigEndian.Uint16(raw[3:5]))
-	if !ok || !found {
-		return nil
-	}
-	size := packet.HeaderSize + len(raw) - maskedHeader
-	var buffer *packetbuf.Buffer
-	if owning {
-		buffer = packetbuf.Get(size)
-	} else {
-		buffer = packetbuf.Wrap(make([]byte, size))
-	}
-	packet.PutHeader(buffer.Data, l.networkWire, source, destination, raw[0]&^peer.Masked, len(raw)-maskedHeader)
-	packet.SetSealed(buffer.Data, true)
-	copy(buffer.Data[packet.HeaderSize:], raw[maskedHeader:])
-	return buffer
 }

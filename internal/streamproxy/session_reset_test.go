@@ -71,7 +71,7 @@ func TestAbortReachesReplacingHop(t *testing.T) {
 				close(opening)
 				<-release
 				return replacement, 0, nil
-			}, &Counters{}, nil)
+			}, &Counters{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -114,7 +114,7 @@ func TestAbortReachesUnansweredOpening(t *testing.T) {
 		close(waiting)
 		<-ctx.Done()
 		return nil, 0, ctx.Err()
-	}, &Counters{}, nil)
+	}, &Counters{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +137,7 @@ func TestAbortReachesUnansweredOpening(t *testing.T) {
 }
 
 func TestEgressEndsOnResetWhileAnsweringReplacement(t *testing.T) {
-	e := NewEgress(t.Context(), newReplacementResetHop(), func(uint32) {}, &Counters{}, nil)
+	e := NewEgress(t.Context(), newReplacementResetHop(), func(uint32) {}, &Counters{})
 	defer e.Abort()
 	newHop := &receivedResetHop{replacementResetHop: newReplacementResetHop(), reset: true}
 	err := e.Accept(newHop, 1, 0, 0, true, func(uint64) error { return io.ErrClosedPipe })

@@ -21,23 +21,16 @@ func FuzzParseHello(f *testing.F) {
 	f.Fuzz(func(t *testing.T, raw []byte) { parseHello(raw) })
 }
 
-// An established channel receives whatever its transport delivers: masked
-// packets nobody authenticates, forged sealed and data messages. None may
-// panic; masked ones too short or without a hop are dropped.
+// An established channel receives whatever its transport delivers, such as
+// forged data messages. None may panic.
 func FuzzChannelDecode(f *testing.F) {
 	_, receiver := channelPair(f)
-	f.Add([]byte{Masked | 9, 1, 2, 3, 4})
-	f.Add(append([]byte{Masked | 1}, make([]byte, 100)...))
-	f.Add(append([]byte{sealedKind}, make([]byte, 60)...))
 	f.Add(append([]byte{dataKind}, make([]byte, 30)...))
 	f.Fuzz(func(t *testing.T, raw []byte) {
 		if len(raw) == 0 {
 			return
 		}
-		got, _ := receiver.decode(context.Background(), bytes.Clone(raw))
-		if raw[0] >= Masked && got != nil && (len(got) < minMasked || got[0]&^Masked == 0) {
-			t.Fatal("a malformed masked message passed")
-		}
+		receiver.decode(context.Background(), bytes.Clone(raw))
 	})
 }
 

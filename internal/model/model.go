@@ -7,12 +7,11 @@ import (
 )
 
 const (
-	// SchemaVersion 2 masks sealed packets and names Nodes by index; it
-	// carries only UDP and TCP.
+	// SchemaVersion 2 names Nodes by index; it carries only UDP and TCP.
 	SchemaVersion = 2
 	DefaultPort   = 24752
 	// DefaultMTU fills a 1500-byte underlay: an IPv6 and UDP header, 48
-	// bytes, and a packet sealed end to end, 30 more; see link.maskedHeader.
+	// bytes, and up to 30 more for a Link's per-packet framing and seal.
 	DefaultMTU = 1500 - 48 - 30
 	// MinMTU is IPv6's minimum.
 	MinMTU       = 1280

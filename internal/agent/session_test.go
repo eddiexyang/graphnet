@@ -140,23 +140,6 @@ func sessionExchange(t *testing.T, devices []*kernelTUN, state model.State, targ
 	}
 }
 
-// assertSealed fails unless the ingress's connections toward the egress were
-// sealed with a session the egress accepted.
-func assertSealed(t *testing.T, agents []*DataPlane, state model.State, ingress, egress int) {
-	t.Helper()
-	network, nodes := state.Networks[0].ID, state.Networks[0].Nodes
-	s := outgoingE2E(agents[ingress], network, nodes[egress].ID)
-	if s == nil {
-		t.Fatal("no end-to-end session")
-	}
-	s.mu.Lock()
-	used := s.channel
-	s.mu.Unlock()
-	if used == 0 || agents[egress].e2eAccepted(network, nodes[ingress].ID, s.id) == nil {
-		t.Fatal("the connection was not sealed end to end")
-	}
-}
-
 func applyAll(t *testing.T, agents []*DataPlane, state model.State) {
 	t.Helper()
 	for i, agent := range agents {
@@ -195,7 +178,6 @@ func TestTCPSessionFollowsRouteChange(t *testing.T) {
 		applyAll(t, agents, state)
 		waitFor(t, 10*time.Second, "the chain to move to D", func() bool { return relaying(agents[3]) > 0 && relaying(agents[1]) == 0 })
 	})
-	assertSealed(t, agents, state, 0, 2)
 	assertNoTCPOverTCP(t, agents)
 	if agents[0].Counters()["session_rebuilds"] == 0 {
 		t.Fatal("no rebuild counted")
@@ -219,7 +201,6 @@ func TestTCPSessionSurvivesRelayFailure(t *testing.T) {
 		agents[1].Close()
 		waitFor(t, 30*time.Second, "the chain to move to D", func() bool { return relaying(agents[3]) > 0 })
 	})
-	assertSealed(t, agents, state, 0, 2)
 	assertNoTCPOverTCP(t, []*DataPlane{agents[0], agents[2], agents[3]})
 }
 
@@ -237,7 +218,6 @@ func TestTCPSessionSurvivesLinkFlap(t *testing.T) {
 		}
 		waitFor(t, 20*time.Second, "the chain back through B", func() bool { return relaying(agents[1]) > 0 })
 	})
-	assertSealed(t, agents, state, 0, 2)
 	assertNoTCPOverTCP(t, agents)
 }
 

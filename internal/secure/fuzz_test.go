@@ -20,12 +20,5 @@ func FuzzOpen(f *testing.F) {
 			t.Fatal("forged message opened")
 		}
 		receiver.OpenBatchInPlace([][]byte{bytes.Clone(raw)})
-		if len(raw) > 0 {
-			receiver.OpenPacket(raw[:len(raw)/2], bytes.Clone(raw[len(raw)/2:]), 1)
-		}
-		header := bytes.Clone(raw)
-		if len(raw) >= MaskSample {
-			receiver.MaskReceive(header, raw[:MaskSample])
-		}
 	})
 }

@@ -312,8 +312,32 @@ func (r *DataPlane) OpenEmbeddedTCP(ctx context.Context, network model.ID, from,
 	if err != nil {
 		return nil, err
 	}
-	return r.openAccessTCP(ctx, request)
+	// A kernel's SYN that finds no route is dropped and retransmitted; an
+	// embedded dial has no retransmission, so it retries here until the path
+	// exists or its context ends.
+	delay := embeddedRetryMin
+	for {
+		conn, err := r.openAccessTCP(ctx, request)
+		if err == nil || !errors.Is(err, streamproxy.ErrNoRoute) {
+			return conn, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, err
+		case <-r.ctx.Done():
+			return nil, err
+		case <-time.After(delay):
+		}
+		delay = min(2*delay, embeddedRetryMax)
+	}
 }
+
+// An embedded dial without a path retries from embeddedRetryMin, doubling to
+// embeddedRetryMax, as a kernel's SYN retransmission would.
+const (
+	embeddedRetryMin = 100 * time.Millisecond
+	embeddedRetryMax = time.Second
+)
 
 func (r *DataPlane) openAccessTCP(ctx context.Context, request streamproxy.Request) (streamproxy.Conn, error) {
 	// A session survives route changes and failed relays when all hops support it.

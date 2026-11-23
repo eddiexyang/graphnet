@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"net"
-	"net/netip"
 	"sync"
 	"testing"
 	"time"
@@ -252,68 +251,5 @@ func TestTCPBackedLinkRefusesTCPPackets(t *testing.T) {
 		if queued := uint64(l.dataCount); queued != 2-want {
 			t.Fatalf("%s Link queued %d packets", transport, queued)
 		}
-	}
-}
-
-// A sealed packet's frame travels masked, owned or copied, with its Nodes as
-// their indexes, which no inner address implies. One whose Nodes have no index
-// is dropped, as is a masked message that does not parse, without closing the
-// Link.
-func TestSealedFrames(t *testing.T) {
-	ip := packet.UDP(netip.MustParseAddrPort("10.0.0.1:1"), netip.MustParseAddrPort("10.0.0.2:2"), []byte("sealed payload"))
-	frame := compactTestFrame(t, append(ip, bytes.Repeat([]byte{7}, packet.Trailer)...))
-	packet.SetSealed(frame, true)
-	dialerEnd, acceptorEnd := pipePair()
-	dialer := newCompactTestLink(t, dialerEnd, Options{Compact: compactTestHeader})
-	acceptor := newCompactTestLink(t, acceptorEnd, Options{Compact: compactTestHeader})
-	owned := packetbuf.GetHeadroom(len(frame), 3)
-	copy(owned.Data, frame)
-	if err := acceptor.SendOwnedBatch(context.Background(), []*packetbuf.Buffer{owned}); err != nil {
-		t.Fatal(err)
-	}
-	if err := acceptor.Send(context.Background(), frame); err != nil {
-		t.Fatal(err)
-	}
-	for range 2 {
-		if got := receiveFrame(t, dialer); !bytes.Equal(got, wantRebuilt(frame)) {
-			t.Fatalf("received %x", got)
-		}
-	}
-	acceptorEnd.mu.Lock()
-	masked := 0
-	for _, m := range acceptorEnd.sent {
-		if m[0] < 0x80 {
-			continue
-		}
-		masked++
-		if m[0] != 0x80|9 || !bytes.Equal(m[1:maskedHeader], []byte{0, 1, 0, 2}) || !bytes.Equal(m[maskedHeader:], frame[packet.HeaderSize:]) {
-			t.Fatalf("masked frame %x", m[:maskedHeader])
-		}
-	}
-	acceptorEnd.mu.Unlock()
-	if masked != 2 {
-		t.Fatalf("%d masked frames", masked)
-	}
-
-	unknown := newCompactTestLink(t, acceptorEnd, Options{Compact: compactTest{unroutable: true}})
-	if err := unknown.Send(context.Background(), frame); err != nil {
-		t.Fatal(err)
-	}
-	if unknown.dropped.Load() != 1 {
-		t.Fatal("frame without indexes was not dropped")
-	}
-
-	local, remote := pipePair()
-	l := newCompactTestLink(t, local, Options{Compact: compactTestHeader})
-	good := append([]byte{0x80 | 9, 0, 1, 0, 2}, frame[packet.HeaderSize:]...)
-	for _, bad := range [][]byte{{0x80 | 9}, append([]byte{0x80, 0, 1, 0, 2}, frame[packet.HeaderSize:]...), append([]byte{0x80 | 9, 0, 3, 0, 2}, frame[packet.HeaderSize:]...)} {
-		remote.Send(context.Background(), bad)
-	}
-	remote.Send(context.Background(), good)
-	if got := receiveFrame(t, l); !bytes.Equal(got, wantRebuilt(frame)) {
-		t.Fatalf("received %x", got)
-	}
-	if l.dropped.Load() != 3 {
-		t.Fatalf("dropped = %d", l.dropped.Load())
 	}
 }

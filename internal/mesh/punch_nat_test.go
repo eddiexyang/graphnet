@@ -150,8 +150,8 @@ func TestUDPPunchAcrossPortRestrictedConeAndBlockAllFirewall(t *testing.T) {
 	edgeID := testutil.ID(31)
 
 	dir := []model.Destination{
-		{NodeID: nodeA, Address: netip.MustParseAddr("10.99.0.1"), Client: true, PublicKey: keyA.Public().(ed25519.PublicKey), Index: 1},
-		{NodeID: nodeB, Address: netip.MustParseAddr("10.99.0.2"), PublicKey: keyB.Public().(ed25519.PublicKey), Index: 2},
+		{NodeID: nodeA, Address: netip.MustParseAddr("10.99.0.1"), Client: true, Index: 1},
+		{NodeID: nodeB, Address: netip.MustParseAddr("10.99.0.2"), Index: 2},
 	}
 	snapA := func(rev uint64) model.Snapshot {
 		return model.Snapshot{
@@ -317,8 +317,8 @@ func TestTCPPunchIgnoresDirectDialStarvation(t *testing.T) {
 	epB := model.Endpoint{ID: testutil.ID(42), Transport: model.TCP, Source: model.Manual, URL: fmt.Sprintf("tcp://127.0.0.1:%d", mB.Port())}
 
 	dir := []model.Destination{
-		{NodeID: nodeA, Address: netip.MustParseAddr("10.99.0.1"), Client: true, PublicKey: keyA.Public().(ed25519.PublicKey), Index: 1},
-		{NodeID: nodeB, Address: netip.MustParseAddr("10.99.0.2"), PublicKey: keyB.Public().(ed25519.PublicKey), Index: 2},
+		{NodeID: nodeA, Address: netip.MustParseAddr("10.99.0.1"), Client: true, Index: 1},
+		{NodeID: nodeB, Address: netip.MustParseAddr("10.99.0.2"), Index: 2},
 	}
 	// A has 8 stalling Direct endpoints + 1 Punch endpoint to B.
 	aPeersEndpoints := append([]model.Endpoint{}, stalledEndpoints...)
@@ -406,8 +406,8 @@ func TestWaitForInstalledPunchWakesImmediately(t *testing.T) {
 			ID: netID, Name: "net", CIDR: netip.MustParsePrefix("10.99.0.0/24"), MTU: 1280, Cipher: model.AES128GCM,
 			Self: model.Node{ID: nodeA, AgentID: testutil.ID(11), Name: "A", Address: netip.MustParseAddr("10.99.0.1"), Client: true},
 			Directory: []model.Destination{
-				{NodeID: nodeA, Address: netip.MustParseAddr("10.99.0.1"), Client: true, PublicKey: keyA.Public().(ed25519.PublicKey), Index: 1},
-				{NodeID: nodeB, Address: netip.MustParseAddr("10.99.0.2"), PublicKey: keyB.Public().(ed25519.PublicKey), Index: 2},
+				{NodeID: nodeA, Address: netip.MustParseAddr("10.99.0.1"), Client: true, Index: 1},
+				{NodeID: nodeB, Address: netip.MustParseAddr("10.99.0.2"), Index: 2},
 			},
 			Peers: []model.Peer{{
 				Node:      model.Node{ID: nodeB, AgentID: testutil.ID(12), Name: "B", Address: netip.MustParseAddr("10.99.0.2")},

@@ -24,9 +24,6 @@ var (
 	ErrPeer        = errors.New("packet arrived from an unconfigured neighbor")
 	ErrUnreachable = errors.New("no route to destination")
 	ErrMTU         = errors.New("packet exceeds network MTU")
-	// ErrSealed drops a packet that arrived sealed when it should not be, or
-	// not sealed or failing to open when it should be.
-	ErrSealed = errors.New("packet failed end-to-end authentication")
 	// ErrTCPOverTCP drops a TCP packet whose next Edge sends on a TCP-backed
 	// Link; its sender receives a reset.
 	ErrTCPOverTCP = errors.New("TCP packet refused: its next Edge carries TCP only as streams")
@@ -39,18 +36,6 @@ type TCPIntercept func(network model.ID, raw []byte, next model.ID) bool
 // TCPCarrier reports whether the Edge to next sends on a TCP, WS, WSS or gRPC
 // Link, which carries TCP only as streams.
 type TCPCarrier func(network, next model.ID) bool
-
-// EndToEnd seals the packets this Node sends to other Nodes and opens the
-// packets they send it, between end-to-end sessions of the two Nodes: see
-// packet.Trailer. Seal takes a non-TCP IP packet with packet.Trailer bytes of
-// spare capacity and reports false, leaving it as it is, when the packet
-// travels sealed per hop only. Open takes a packet for this Node, sealed or
-// not, and returns the IP packet, or an error when it should have been
-// sealed and was not, or was and fails to open.
-type EndToEnd interface {
-	Seal(network, destination model.ID, raw []byte) ([]byte, bool, error)
-	Open(network, source model.ID, raw []byte, sealed bool) ([]byte, error)
-}
 
 type Send func(context.Context, model.ID, model.ID, []byte) error
 type Deliver func(context.Context, model.ID, []byte) error
@@ -112,16 +97,6 @@ type Router struct {
 	sendOwnedBatch func(context.Context, model.ID, model.ID, []*packetbuf.Buffer) error
 	tcpIntercept   atomic.Pointer[TCPIntercept]
 	tcpCarrier     atomic.Pointer[TCPCarrier]
-	e2e            atomic.Pointer[EndToEnd]
-}
-
-// SetEndToEnd installs or removes (nil) end-to-end sealing.
-func (r *Router) SetEndToEnd(e2e EndToEnd) {
-	if e2e == nil {
-		r.e2e.Store(nil)
-		return
-	}
-	r.e2e.Store(&e2e)
 }
 
 // SetTCPCarrier installs or removes (nil) the check that keeps TCP packets
@@ -354,8 +329,8 @@ func (r *Router) encapsulateSource(ctx context.Context, n *network, raw []byte, 
 	if client != nil && packet.IPHopLimit(raw) <= 1 {
 		return nil, "", r.timeExceeded(ctx, n, raw)
 	}
-	// Room for a Link's two-byte prefix of a sealed frame, and the trailer.
-	buffer := packetbuf.GetHeadroom(packet.HeaderSize+len(raw)+packet.Trailer, 2)
+	// Room for a Link's two-byte prefix of a compact frame.
+	buffer := packetbuf.GetHeadroom(packet.HeaderSize+len(raw), 2)
 	frame := buffer.Data[:packet.HeaderSize+len(raw)]
 	copy(frame, n.header[:])
 	if client != nil {
@@ -366,16 +341,6 @@ func (r *Router) encapsulateSource(ctx context.Context, n *network, raw []byte, 
 	copy(frame[packet.HeaderSize:], raw)
 	if client != nil {
 		packet.DecrementIPHopLimit(frame[packet.HeaderSize:])
-	} else if e2e := r.e2e.Load(); e2e != nil && !packet.IsTCP(raw) {
-		sealed, ok, err := (*e2e).Seal(n.id, destination.id, frame[packet.HeaderSize:])
-		if err != nil {
-			buffer.Release()
-			return nil, "", err
-		}
-		if ok {
-			frame = frame[:packet.HeaderSize+len(sealed)]
-			packet.SetSealed(frame, true)
-		}
 	}
 	binary.BigEndian.PutUint16(frame[4:6], uint16(len(frame)-packet.HeaderSize))
 	buffer.Data = frame
@@ -512,10 +477,7 @@ func (r *Router) fromPeer(ctx context.Context, peerID model.ID, frame []byte, de
 	if !n.peers[peerID] {
 		return ErrPeer
 	}
-	raw, ok := packet.IPOf(p.Payload, p.Sealed)
-	if !ok {
-		return ErrSealed
-	}
+	raw := p.Payload
 	if len(raw) > n.mtu {
 		return ErrMTU
 	}
@@ -537,18 +499,7 @@ func (r *Router) fromPeer(ctx context.Context, peerID model.ID, frame []byte, de
 	if info.Destination != destination.address && !n.admits(destination, info.Destination) {
 		return ErrDestination
 	}
-	if p.Sealed && packet.IsTCP(raw) {
-		// TCP is sealed per hop only.
-		return ErrSealed
-	}
 	if destination.id == n.self.ID {
-		if e2e := r.e2e.Load(); e2e != nil {
-			if raw, err = (*e2e).Open(n.id, source.id, p.Payload, p.Sealed); err != nil {
-				return err
-			}
-		} else if p.Sealed {
-			return ErrSealed
-		}
 		return deliver(ctx, n.id, raw)
 	}
 	if p.HopLimit <= 1 {
@@ -719,8 +670,9 @@ func (n *network) exitCost(e exit) (uint64, bool) {
 }
 
 // admits reports whether candidate may send or receive traffic for ip: it is
-// the overlay host, or it advertises a prefix containing ip. Each hop chooses
-// its own exit, so a transit Node need not agree with the ingress's choice.
+// the overlay host, or it advertises a prefix containing ip. The ingress
+// chooses the exit; transit Nodes forward toward the frame's Destination and
+// only check that it admits the packet's address.
 func (n *network) admits(candidate *node, ip netip.Addr) bool {
 	if candidate == nil {
 		return false

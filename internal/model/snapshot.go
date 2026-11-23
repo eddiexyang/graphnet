@@ -49,9 +49,6 @@ type Destination struct {
 	Client  bool       `json:"client,omitempty"`
 	NodeID  ID         `json:"node_id"`
 	Address netip.Addr `json:"address"`
-	// PublicKey is the Node's Agent identity, which end-to-end sessions
-	// authenticate.
-	PublicKey []byte `json:"public_key,omitempty"`
 	// Index names the Node on the wire; see Node.Index.
 	Index uint16 `json:"index"`
 }
@@ -85,7 +82,6 @@ func (s Snapshot) Clone() Snapshot {
 		n.Directory = append([]Destination{}, n.Directory...)
 		for j := range n.Directory {
 			n.Directory[j].AdvertisedSubnets = append([]AdvertisedSubnet(nil), n.Directory[j].AdvertisedSubnets...)
-			n.Directory[j].PublicKey = append([]byte(nil), n.Directory[j].PublicKey...)
 		}
 		n.Routes = append([]Route{}, n.Routes...)
 		for j := range n.Routes {

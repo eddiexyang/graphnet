@@ -151,10 +151,17 @@ func idleBytes(t *testing.T, detection uint32) float64 {
 	var relays []*countingRelay
 	agents, _, _ := graphAgents(t, model.UDP, streamOptions{}, 2, 1, func(s *model.State) {
 		s.Networks[0].FailureDetection = detection
-		relay := newCountingRelay(t, int(s.Agents[0].ListenPort))
+		// One Node dials the other through the relay. An embedded client
+		// accepts no Links on its configured port, so with the client fixture
+		// A dials B; otherwise B dials A.
+		acceptor, dialer := 0, 1
+		if clientFixtureEnabled() {
+			acceptor, dialer = 1, 0
+		}
+		relay := newCountingRelay(t, int(s.Agents[acceptor].ListenPort))
 		relays = append(relays, relay)
-		s.Agents[0].Endpoints[0].URL = fmt.Sprintf("udp://127.0.0.1:%d", relay.port())
-		s.Agents[1].Endpoints = []model.Endpoint{}
+		s.Agents[acceptor].Endpoints[0].URL = fmt.Sprintf("udp://127.0.0.1:%d", relay.port())
+		s.Agents[dialer].Endpoints = []model.Endpoint{}
 	})
 	waitFor(t, 10*time.Second, "a healthy Link", func() bool {
 		for _, l := range agents[0].Report() {
@@ -181,7 +188,14 @@ func idleBytes(t *testing.T, detection uint32) float64 {
 // Heartbeats every third of the detection time; the test reports the bytes
 // an idle Edge carries in UDP payloads.
 func TestFailureDetectionHeartbeatBytes(t *testing.T) {
-	fast, slow := idleBytes(t, 1000), idleBytes(t, 0)
+	// Each measurement runs in its own subtest, so its Agents are gone
+	// before the next one starts.
+	var fast, slow float64
+	t.Run("1s", func(t *testing.T) { fast = idleBytes(t, 1000) })
+	t.Run("default", func(t *testing.T) { slow = idleBytes(t, 0) })
+	if t.Failed() {
+		return
+	}
 	t.Logf("idle UDP payload bytes per second on one Edge: 1 s %.0f, default %.0f", fast, slow)
 	if fast <= slow {
 		t.Fatalf("a shorter detection time did not send more heartbeats: %.0f <= %.0f", fast, slow)
@@ -189,22 +203,22 @@ func TestFailureDetectionHeartbeatBytes(t *testing.T) {
 }
 
 // An acceptor allows three of the dialer's heartbeats, so Agents whose
-// Networks have different detection times keep their Links up. B has no
-// endpoint, so its only Link is B's, at the default 1 s heartbeat, to A with
-// 1 s.
+// Networks have different detection times keep their Links up. A has no
+// endpoint, so its only Link is A's, at the default detection time, to B with
+// 1 s. B, never an embedded client, accepts on its configured port.
 func TestFailureDetectionMixedSettings(t *testing.T) {
 	agents, _, state := graphAgents(t, model.UDP, streamOptions{}, 2, 1, func(s *model.State) {
-		s.Agents[1].Endpoints = []model.Endpoint{}
+		s.Agents[0].Endpoints = []model.Endpoint{}
 	})
 	fast := state
 	fast.Revision++
 	fast.Networks = append([]model.Network(nil), state.Networks...)
 	fast.Networks[0].FailureDetection = 1000
-	snapshot, err := routing.Compile(fast, fast.Agents[0].ID)
+	snapshot, err := routing.Compile(fast, fast.Agents[1].ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := agents[0].Apply(context.Background(), snapshot); err != nil {
+	if err := agents[1].Apply(context.Background(), snapshot); err != nil {
 		t.Fatal(err)
 	}
 	edgeUp := func(agent *DataPlane) bool {

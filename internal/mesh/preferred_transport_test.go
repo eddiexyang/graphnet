@@ -57,8 +57,8 @@ func newPreferredFixture(t *testing.T, seedOffset byte, pref model.Transport) (*
 	}
 	addrA, addrB := netip.MustParseAddr("10.42.0.1"), netip.MustParseAddr("10.42.0.2")
 	dir := []model.Destination{
-		{NodeID: nodeA, Address: addrA, PublicKey: keyA.Public().(ed25519.PublicKey), Index: 1},
-		{NodeID: nodeB, Address: addrB, Client: true, PublicKey: keyB.Public().(ed25519.PublicKey), Index: 2},
+		{NodeID: nodeA, Address: addrA, Index: 1},
+		{NodeID: nodeB, Address: addrB, Client: true, Index: 2},
 	}
 	snapA := model.Snapshot{
 		Schema:     model.SchemaVersion,

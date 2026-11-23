@@ -14,6 +14,7 @@ import (
 
 	"github.com/eddiexyang/graphnet/internal/model"
 	"github.com/eddiexyang/graphnet/internal/packet"
+	"github.com/eddiexyang/graphnet/internal/routing"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
@@ -30,11 +31,7 @@ func TestTCPConnectionResetsOnExitChange(t *testing.T) {
 		s.Networks[0].Nodes[1].AdvertisedSubnets = []model.AdvertisedSubnet{{Prefix: prefix, GatewayMode: model.GatewayOff}}
 		s.Networks[0].Nodes[3].AdvertisedSubnets = []model.AdvertisedSubnet{{Prefix: prefix, GatewayMode: model.GatewayOff, Metric: 20}}
 	})
-	network, nodes := state.Networks[0].ID, state.Networks[0].Nodes
-	waitFor(t, 10*time.Second, "end-to-end sessions toward both exits", func() bool {
-		return outgoingE2E(agents[0], network, nodes[1].ID) != nil && outgoingE2E(agents[0], network, nodes[3].ID) != nil
-	})
-	toB, toD := outgoingE2E(agents[0], network, nodes[1].ID), outgoingE2E(agents[0], network, nodes[3].ID)
+	waitConverged(t, agents[0], state, 0)
 	server := tcpip.AddrFrom4(netip.MustParseAddr("192.168.0.7").As4())
 	accepted := make(chan int, 4)
 	for _, exit := range []int{1, 3} {
@@ -153,14 +150,6 @@ func TestTCPConnectionResetsOnExitChange(t *testing.T) {
 	}
 	echo(second)
 	assertNoTCPOverTCP(t, agents)
-	// Both connections were sealed with the sessions A prepared toward each
-	// exit before it needed them: none was replaced on the way.
-	if outgoingE2E(agents[0], network, nodes[1].ID) != toB || outgoingE2E(agents[0], network, nodes[3].ID) != toD {
-		t.Fatal("the ingress replaced a prepared session")
-	}
-	if agents[1].e2eAccepted(network, nodes[0].ID, toB.id) == nil || agents[3].e2eAccepted(network, nodes[0].ID, toD.id) == nil {
-		t.Fatal("an exit did not open the connection with A's prepared session")
-	}
 }
 
 // exitServer is the address B and D's prefix holds in the exit tests.
@@ -177,12 +166,9 @@ func exitAgents(t *testing.T, carrier model.Transport, dMetric uint32, paths mod
 		s.Networks[0].Nodes[3].AdvertisedSubnets = []model.AdvertisedSubnet{{Prefix: prefix, GatewayMode: model.GatewayOff, Metric: dMetric}}
 	})
 	for _, exit := range []int{1, 3} {
-		devices[exit].udp = make(chan []byte, 4096)
+		devices[exit].setUDP(make(chan []byte, 4096))
 	}
-	network, nodes := state.Networks[0].ID, state.Networks[0].Nodes
-	waitFor(t, 10*time.Second, "end-to-end sessions toward both exits", func() bool {
-		return outgoingE2E(agents[0], network, nodes[1].ID) != nil && outgoingE2E(agents[0], network, nodes[3].ID) != nil
-	})
+	waitConverged(t, agents[0], state, 0)
 	return agents, devices, state
 }
 
@@ -216,12 +202,9 @@ func checkDatagram(t *testing.T, got []byte, source, destination netip.AddrPort,
 	return exit
 }
 
-// Sealed datagrams move to the cheaper exit with the next packet, sealed with
-// the session the ingress prepared toward it: no handshake on the way.
-func TestSealedPacketsFollowExitChange(t *testing.T) {
+// Datagrams move to the cheaper exit with the next packet.
+func TestPacketsFollowExitChange(t *testing.T) {
 	agents, devices, state := exitAgents(t, model.UDP, 20, model.EqualCostLowestID)
-	network, nodes := state.Networks[0].ID, state.Networks[0].Nodes
-	toB, toD := outgoingE2E(agents[0], network, nodes[1].ID), outgoingE2E(agents[0], network, nodes[3].ID)
 	if exit := datagramExit(t, devices, state, 6000); exit != 1 {
 		t.Fatalf("datagram exits at node %d, want B", exit)
 	}
@@ -232,12 +215,6 @@ func TestSealedPacketsFollowExitChange(t *testing.T) {
 		if exit := datagramExit(t, devices, state, port); exit != 3 {
 			t.Fatalf("datagram %d after the change exits at node %d, want D", port, exit)
 		}
-	}
-	if outgoingE2E(agents[0], network, nodes[1].ID) != toB || outgoingE2E(agents[0], network, nodes[3].ID) != toD {
-		t.Fatal("the ingress replaced a prepared session")
-	}
-	if agents[3].e2eAccepted(network, nodes[0].ID, toD.id) == nil {
-		t.Fatal("D did not open the datagrams with A's prepared session")
 	}
 }
 
@@ -274,11 +251,9 @@ func TestSealedECMPKeepsEachFlowOnOneExit(t *testing.T) {
 }
 
 // With ECMP between two exits of equal cost, TCP connections spread over both
-// exits, each sealed with the session A prepared toward its exit.
-func TestSealedECMPSpreadsConnections(t *testing.T) {
-	agents, devices, state := exitAgents(t, model.TCP, 9, model.EqualCostECMP) // B: 10, D: 10
-	network, nodes := state.Networks[0].ID, state.Networks[0].Nodes
-	toB, toD := outgoingE2E(agents[0], network, nodes[1].ID), outgoingE2E(agents[0], network, nodes[3].ID)
+// exits.
+func TestECMPSpreadsConnections(t *testing.T) {
+	agents, devices, _ := exitAgents(t, model.TCP, 9, model.EqualCostECMP) // B: 10, D: 10
 	server := tcpip.AddrFrom4(exitServer.As4())
 	accepted := make(chan int, 64)
 	for _, exit := range []int{1, 3} {
@@ -329,8 +304,52 @@ func TestSealedECMPSpreadsConnections(t *testing.T) {
 	if used[1] == 0 || used[3] == 0 || used[1]+used[3] != 64 {
 		t.Fatalf("connections per exit %v, want both", used)
 	}
-	if outgoingE2E(agents[0], network, nodes[1].ID) != toB || outgoingE2E(agents[0], network, nodes[3].ID) != toD {
-		t.Fatal("the ingress replaced a prepared session")
-	}
 	assertNoTCPOverTCP(t, agents)
+}
+
+// waitConverged waits until the routes the agent of Node index forwards on
+// equal the routes compiled from state: each destination's next hop and cost
+// are final, so traffic chooses between the exits on settled costs.
+func waitConverged(t *testing.T, agent *DataPlane, state model.State, index int) {
+	t.Helper()
+	compiled, err := routing.Compile(state, state.Agents[index].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type hop struct {
+		next model.ID
+		cost uint64
+	}
+	want := map[model.ID]hop{}
+	for _, r := range compiled.Networks[0].Routes {
+		want[r.Destination] = hop{r.NextHop, r.Cost}
+	}
+	network := state.Networks[0].ID
+	waitFor(t, 15*time.Second, "converged routes", func() bool {
+		agent.applyMu.Lock()
+		installed := agent.lastRoutes
+		agent.applyMu.Unlock()
+		if installed == nil {
+			return false
+		}
+		for _, n := range installed.Networks {
+			if n.ID != network {
+				continue
+			}
+			got := map[model.ID]hop{}
+			for _, r := range n.Routes {
+				got[r.Destination] = hop{r.NextHop, r.Cost}
+			}
+			if len(got) != len(want) {
+				return false
+			}
+			for d, h := range want {
+				if got[d] != h {
+					return false
+				}
+			}
+			return true
+		}
+		return false
+	})
 }

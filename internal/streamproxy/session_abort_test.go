@@ -48,7 +48,7 @@ func TestReadFromEndsOnPeerSessionReset(t *testing.T) {
 		case replayed <- struct{}{}:
 		default:
 		}
-	}, counters, nil)
+	}, counters)
 	defer e.Abort()
 
 	_, err := e.ReadFrom(&onceReader{p: []byte("payload")})
@@ -78,7 +78,7 @@ func TestCloseBeforeBothDirectionsEndedAbortsSession(t *testing.T) {
 	hop := newAbortTestHop(false)
 	end, err := StartIngress(t.Context(), func(_ context.Context, _ uint32, _, _ uint64) (Hop, uint64, error) {
 		return hop, 0, nil
-	}, counters, nil)
+	}, counters)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,7 +113,7 @@ func TestEgressOrphanExpiresAfterFailLocked(t *testing.T) {
 
 	counters := &Counters{}
 	hop := newAbortTestHop(false)
-	e := NewEgress(t.Context(), hop, func(uint32) {}, counters, nil)
+	e := NewEgress(t.Context(), hop, func(uint32) {}, counters)
 	defer e.Abort()
 
 	// Trigger failLocked (hop failure without peer session reset).

@@ -9,14 +9,13 @@ import (
 
 	"github.com/eddiexyang/graphnet/internal/model"
 	"github.com/eddiexyang/graphnet/internal/packet"
-	"github.com/eddiexyang/graphnet/internal/streamproxy"
 	"github.com/eddiexyang/graphnet/internal/testutil"
 )
 
-// Every pairing of carriers on a two-hop path seals end to end: a TCP
-// connection, where the path allows one, and a datagram from A reach C, each Edge's Link uses its own
-// transport, only A and C hold their session, and C refuses B's seal for A.
-func TestMixedCarriersSealEndToEnd(t *testing.T) {
+// Every pairing of carriers on a two-hop path delivers: a TCP connection,
+// where the path allows one, and a datagram from A reach C, and each Edge's
+// Link uses its own transport.
+func TestMixedCarriersDeliver(t *testing.T) {
 	pairs := [][2]model.Transport{{model.QUIC, model.TCP}, {model.TCP, model.QUIC}, {model.QUIC, model.UDP}, {model.UDP, model.QUIC}, {model.QUIC, model.QUIC}, {model.TCP, model.UDP}, {model.UDP, model.TCP}}
 	for _, pair := range pairs {
 		t.Run(fmt.Sprintf("%s-%s", pair[0], pair[1]), func(t *testing.T) {
@@ -32,7 +31,7 @@ func TestMixedCarriersSealEndToEnd(t *testing.T) {
 					s.Networks[0].Edges[i].Transports = []model.Transport{pair[i]}
 				}
 			})
-			network, nodes := state.Networks[0].ID, state.Networks[0].Nodes
+			nodes := state.Networks[0].Nodes
 			for i, edge := range state.Networks[0].Edges {
 				waitCarrier(t, agents[i], edge.ID, pair[i])
 			}
@@ -43,26 +42,15 @@ func TestMixedCarriersSealEndToEnd(t *testing.T) {
 				transferApplication(t, devices[0], devices[2], nodes[2].Address)
 			}
 
-			devices[2].udp = make(chan []byte, 16)
+			devices[2].setUDP(make(chan []byte, 16))
 			from := netip.AddrPortFrom(nodes[0].Address, 5000)
 			to := netip.AddrPortFrom(nodes[2].Address, 5001)
-			message := bytes.Repeat([]byte("sealed across carriers "), 50)
+			message := bytes.Repeat([]byte("across carriers "), 50)
 			got := sendUDP(t, devices[0], devices[2], packet.UDP(from, to, message))
 			if source, destination, payload, ok := packet.UDPDatagram(got); !ok || source != from || destination != to || !bytes.Equal(payload, message) {
 				t.Fatal("the datagram changed")
 			}
 
-			sealed := outgoingE2E(agents[0], network, nodes[2].ID)
-			if sealed == nil || agents[2].e2eAccepted(network, nodes[0].ID, sealed.id) == nil {
-				t.Fatal("no end-to-end session between the ends")
-			}
-			if agents[1].e2eAccepted(network, nodes[0].ID, sealed.id) != nil {
-				t.Fatal("the relay holds the session")
-			}
-			request := streamproxy.Request{Network: network, Source: nodes[0].ID, Destination: nodes[2].ID, Conn: streamproxy.NewSessionID(), Sealer: nodes[1].ID, E2E: sealed.id, Channel: 1}
-			if _, ok := agents[2].egressRecords(network, request); ok {
-				t.Fatal("the egress accepted the relay's seal for the Source")
-			}
 		})
 	}
 }
@@ -83,4 +71,23 @@ func waitCarrier(t *testing.T, agent *DataPlane, edge model.ID, carrier model.Tr
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("edge %s has no active %s Link", edge, carrier)
+}
+
+// sendUDP sends raw from one device until the other receives a datagram.
+func sendUDP(t *testing.T, from, to *kernelTUN, raw []byte) []byte {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case from.packets <- kernelPacket{raw: bytes.Clone(raw)}:
+		case <-time.After(time.Second):
+		}
+		select {
+		case got := <-to.udp:
+			return got
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	t.Fatal("the datagram did not arrive")
+	return nil
 }

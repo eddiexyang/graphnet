@@ -1,8 +1,6 @@
 package secure
 
 import (
-	"crypto/hkdf"
-	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"runtime"
@@ -12,7 +10,6 @@ import (
 
 	"github.com/eddiexyang/graphnet/internal/packet"
 	"github.com/flynn/noise"
-	"golang.org/x/crypto/chacha20"
 )
 
 const (
@@ -21,15 +18,13 @@ const (
 	MaxMessages   = uint64(1) << 32
 	MaxSessionAge = time.Hour
 	// Plaintext includes a message type and, for data, a complete overlay
-	// frame, which a sealed packet's envelope precedes with two more bytes.
+	// frame, which a compact frame's prefix precedes with two more bytes.
 	MaxPlaintext = packet.MaxFrame + 3
 	// Overhead is a message's nonce, its sequence in 4 bytes, and its tag.
 	Overhead = NonceSize + 16
 	// NonceSize is the bytes of a message's sequence on the wire; a session
 	// never reaches MaxMessages, so they hold all of it.
 	NonceSize = 4
-	// MaskSample is the bytes of ciphertext that key a header's mask.
-	MaskSample = 16
 )
 
 var ErrReplay = errors.New("replayed or stale encrypted packet")
@@ -45,8 +40,6 @@ type Session struct {
 	receiveMu   sync.Mutex
 	send        noise.Cipher
 	receive     noise.Cipher
-	maskSend    [32]byte
-	maskReceive [32]byte
 	sequence    uint64
 	highest     uint64
 	seen        [ReplayWindow]uint64
@@ -55,28 +48,10 @@ type Session struct {
 	batchNonces [128]uint64
 }
 
-func newSession(id string, binding []byte, send, receive noise.Cipher, maskSend, maskReceive [32]byte) *Session {
-	return &Session{id: id, binding: binding, sendAD: append(append([]byte{}, binding...), make([]byte, NonceSize)...), receiveAD: append(append([]byte{}, binding...), make([]byte, NonceSize)...), created: time.Now(), send: send, receive: receive, maskSend: maskSend, maskReceive: maskReceive}
+func newSession(id string, binding []byte, send, receive noise.Cipher) *Session {
+	return &Session{id: id, binding: binding, sendAD: append(append([]byte{}, binding...), make([]byte, NonceSize)...), receiveAD: append(append([]byte{}, binding...), make([]byte, NonceSize)...), created: time.Now(), send: send, receive: receive}
 }
 
-// maskKey derives a direction's header protection key from its cipher key.
-func maskKey(state *noise.CipherState) (key [32]byte) {
-	raw := state.UnsafeKey()
-	derived, _ := hkdf.Key(sha256.New, raw[:], nil, "GraphNet header protection v1", len(key))
-	copy(key[:], derived)
-	return key
-}
-
-// MaskSend hides header from everyone but the peer: it XORs header with a
-// keystream that sample, MaskSample bytes of the ciphertext sent with it,
-// selects. MaskReceive, given the same sample, reveals it again.
-func (s *Session) MaskSend(header, sample []byte)    { mask(&s.maskSend, header, sample) }
-func (s *Session) MaskReceive(header, sample []byte) { mask(&s.maskReceive, header, sample) }
-
-func mask(key *[32]byte, header, sample []byte) {
-	stream, _ := chacha20.NewUnauthenticatedCipher(key[:], sample[:chacha20.NonceSize])
-	stream.XORKeyStream(header, header)
-}
 func (s *Session) ID() string         { return s.id }
 func (s *Session) Created() time.Time { return s.created }
 func (s *Session) NeedsRekey() bool {
@@ -155,98 +130,6 @@ func (s *Session) SealBatchAppend(dst, plaintexts [][]byte) error {
 		seal(0, 0, len(plaintexts))
 	}
 	return nil
-}
-
-// TagSize is what SealChannel adds to a message.
-const TagSize = 16
-
-// An end-to-end session carries independent ordered channels, such as its TCP
-// connections. A channel message's nonce is the channel in its high 32 bits
-// and the message's index within the channel in its low 32 bits: no nonce
-// travels, and a reordered, repeated or missing message fails to open.
-// Channel 0 is the session's packets: Seal and SealPacket take its nonces
-// from one sequence.
-func channelNonce(channel, index uint32) uint64 { return uint64(channel)<<32 | uint64(index) }
-
-// SealChannel seals plaintext in place; it needs TagSize bytes of spare
-// capacity and returns the sealed message.
-func (s *Session) SealChannel(channel, index uint32, plaintext []byte) []byte {
-	return s.send.Encrypt(plaintext[:0], channelNonce(channel, index), s.binding, plaintext)
-}
-
-// OpenChannel opens a SealChannel message in place.
-func (s *Session) OpenChannel(channel, index uint32, sealed []byte) ([]byte, error) {
-	if len(sealed) < TagSize {
-		return nil, errors.New("invalid channel message size")
-	}
-	return s.receive.Decrypt(sealed[:0], channelNonce(channel, index), s.binding, sealed)
-}
-
-// PacketSequence is the packet's sequence that SealPacket writes after the
-// ciphertext: its nonce in channel 0.
-const PacketSequence = 4
-
-// SealPacket seals body in place, authenticating ad with it, and appends the
-// packet's sequence, then label, then the tag; body needs
-// PacketSequence+len(label)+TagSize spare capacity. label, such as the
-// session's identity, travels in the clear.
-func (s *Session) SealPacket(ad, body, label []byte) ([]byte, error) {
-	if cap(body)-len(body) < PacketSequence+len(label)+TagSize {
-		return nil, errors.New("invalid end-to-end packet")
-	}
-	s.sendMu.Lock()
-	if s.sequence >= MaxMessages-1 || time.Since(s.created) >= MaxSessionAge {
-		s.sendMu.Unlock()
-		return nil, ErrRekey
-	}
-	s.sequence++
-	nonce := s.sequence
-	s.sendMu.Unlock()
-	n := len(body)
-	sealed := s.send.Encrypt(body[:0], nonce, ad, body)
-	var tag [TagSize]byte
-	copy(tag[:], sealed[n:])
-	sealed = binary.BigEndian.AppendUint32(sealed[:n], uint32(nonce))
-	sealed = append(sealed, label...)
-	return append(sealed, tag[:]...), nil
-}
-
-// Sequence reports how many channel 0 nonces the session used.
-func (s *Session) Sequence() uint64 {
-	s.sendMu.Lock()
-	defer s.sendMu.Unlock()
-	return s.sequence
-}
-
-// OpenPacket opens a SealPacket body whose label has labelSize bytes in
-// place. Like Open, it accepts bounded out-of-order delivery and refuses a
-// sequence it already opened.
-func (s *Session) OpenPacket(ad, sealed []byte, labelSize int) ([]byte, error) {
-	n := len(sealed) - PacketSequence - labelSize - TagSize
-	if labelSize < 0 || n < 0 {
-		return nil, errors.New("invalid end-to-end packet")
-	}
-	if time.Since(s.created) >= MaxSessionAge {
-		return nil, ErrRekey
-	}
-	nonce := uint64(binary.BigEndian.Uint32(sealed[n:]))
-	if nonce == 0 {
-		return nil, ErrReplay
-	}
-	s.receiveMu.Lock()
-	defer s.receiveMu.Unlock()
-	if s.seen[nonce%ReplayWindow] == nonce || s.highest >= ReplayWindow && nonce <= s.highest-ReplayWindow {
-		return nil, ErrReplay
-	}
-	// The tag moves next to the ciphertext, over the sequence and label.
-	copy(sealed[n:], sealed[len(sealed)-TagSize:])
-	plaintext, err := s.receive.Decrypt(sealed[:0], nonce, ad, sealed[:n+TagSize])
-	if err != nil {
-		return nil, err
-	}
-	s.seen[nonce%ReplayWindow] = nonce
-	s.highest = max(s.highest, nonce)
-	return plaintext, nil
 }
 
 // Open accepts bounded out-of-order delivery. Replay state advances only after

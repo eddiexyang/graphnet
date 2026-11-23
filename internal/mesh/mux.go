@@ -16,7 +16,6 @@ import (
 
 	"github.com/eddiexyang/graphnet/internal/link"
 	"github.com/eddiexyang/graphnet/internal/packetbuf"
-	"github.com/eddiexyang/graphnet/internal/peer"
 	"github.com/eddiexyang/graphnet/internal/secure"
 	"github.com/eddiexyang/graphnet/internal/streamproxy"
 )
@@ -78,15 +77,8 @@ const (
 	muxMaxTombstones     = 1 << 16
 )
 
-// streamMessageKind mirrors the Link message kind that prefixes every frame;
-// a data frame of a session sealed end to end has sealedStreamKind, so the
-// Link seals only its header.
-const (
-	streamMessageKind = 12
-	sealedStreamKind  = peer.SealedPayload
-)
-
-var _ [0]struct{} = [muxDataHeader - peer.SealedHeader]struct{}{}
+// streamMessageKind mirrors the Link message kind that prefixes every frame.
+const streamMessageKind = 12
 
 var errStreamReset = &streamError{syscall.ECONNRESET}
 
@@ -852,13 +844,7 @@ type muxStream struct {
 	leftover      []byte
 	keep          *streamproxy.Keep
 	progress      time.Time // when sent frames last saw an acknowledgement
-	// sealed: the data written from now on is sealed end to end.
-	sealed atomic.Bool
 }
-
-// CarrySealed marks the data written from now on as sealed end to end, so
-// the Link seals only the frames' headers.
-func (s *muxStream) CarrySealed() { s.sealed.Store(true) }
 
 // windowLocked is the bytes past what the stream consumed that it lets the
 // sender send.
@@ -915,62 +901,41 @@ func (s *muxStream) ackFrameLocked() []byte {
 // Each frame's buffer has one owner per holder: the stream until the frame is
 // acknowledged, a session end's keep until delivery, and a Link while it
 // sends the frame.
-//
-// With records, each frame carries one record of an end-to-end sealed
-// session: its bytes arrive as plaintext after the record's length, and seal
-// turns them into the record in place.
 type frameBuilder struct {
-	kind    byte // the Link message kind of its frames
-	flags   byte // its data frames' flags
-	id      uint64
-	offset  uint64
-	limit   int
-	bytes   int // session bytes, records' length and tag included
-	frames  []muxFrame
-	records *streamproxy.Records
+	flags  byte // its data frames' flags
+	id     uint64
+	offset uint64
+	limit  int
+	bytes  int
+	frames []muxFrame
 }
 
-func newFrameBuilder(id, offset uint64, limit int, records *streamproxy.Records) *frameBuilder {
-	return &frameBuilder{kind: streamMessageKind, id: id, offset: offset, limit: limit, frames: make([]muxFrame, 0, (limit+muxMaxData-1)/muxMaxData), records: records}
+func newFrameBuilder(id, offset uint64, limit int) *frameBuilder {
+	return &frameBuilder{id: id, offset: offset, limit: limit, frames: make([]muxFrame, 0, (limit+muxMaxData-1)/muxMaxData)}
 }
 
 // newBuilder returns a builder for s's data frames.
-func (s *muxStream) newBuilder(offset uint64, limit int, records *streamproxy.Records) *frameBuilder {
-	b := newFrameBuilder(s.id, offset, limit, records)
+func (s *muxStream) newBuilder(offset uint64, limit int) *frameBuilder {
+	b := newFrameBuilder(s.id, offset, limit)
 	b.flags = s.dataFlags()
-	if s.sealed.Load() {
-		b.kind = sealedStreamKind
-	}
 	return b
 }
 
-// layout reports a frame's plaintext room, the record length bytes before it
-// and the bytes a frame adds to the session's offsets.
-func (b *frameBuilder) layout() (room, prefix, overhead int) {
-	if b.records != nil {
-		return muxMaxData - streamproxy.RecordOverhead, streamproxy.RecordHeader, streamproxy.RecordOverhead
-	}
-	return muxMaxData, 0, 0
-}
-
-// space returns the last frame with room for more plaintext, starting a frame
+// space returns the last frame with room for more data, starting a frame
 // when the last one is full, or nil when the credit is used up.
 func (b *frameBuilder) space() *muxFrame {
-	room, prefix, overhead := b.layout()
 	last := len(b.frames) - 1
-	if last < 0 || len(b.frames[last].raw)-muxDataHeader-prefix == room {
-		if b.bytes >= b.limit || b.limit-b.bytes <= overhead {
+	if last < 0 || len(b.frames[last].raw)-muxDataHeader == muxMaxData {
+		if b.bytes >= b.limit {
 			return nil
 		}
 		buf := packetbuf.Get(muxDataHeader + muxMaxData)
 		// Pooled storage is not cleared: every header byte is written.
 		raw := buf.Data[:muxDataHeader]
 		frameHeader(raw, muxData, b.id)
-		raw[0] = b.kind
+		raw[0] = streamMessageKind
 		binary.BigEndian.PutUint64(raw[10:18], b.offset+uint64(b.bytes))
 		raw[18] = b.flags
-		raw = raw[:muxDataHeader+prefix]
-		b.bytes += overhead
 		b.frames = append(b.frames, muxFrame{raw: raw, buf: buf})
 		last++
 	}
@@ -979,13 +944,12 @@ func (b *frameBuilder) space() *muxFrame {
 
 func (b *frameBuilder) Write(data []byte) (int, error) {
 	written := 0
-	room, prefix, _ := b.layout()
 	for len(data) > 0 && b.bytes < b.limit {
 		frame := b.space()
 		if frame == nil {
 			break
 		}
-		n := min(len(data), b.limit-b.bytes, room-(len(frame.raw)-muxDataHeader-prefix))
+		n := min(len(data), b.limit-b.bytes, muxMaxData-(len(frame.raw)-muxDataHeader))
 		frame.raw = append(frame.raw, data[:n]...)
 		b.bytes += n
 		written += n
@@ -999,35 +963,7 @@ func (b *frameBuilder) Write(data []byte) (int, error) {
 
 // Room is how many bytes Write takes now, for a source that must not read
 // more than it can write.
-func (b *frameBuilder) Room() int {
-	room, prefix, overhead := b.layout()
-	credit, total := b.limit-b.bytes, 0
-	if last := len(b.frames) - 1; last >= 0 {
-		take := min(credit, room-(len(b.frames[last].raw)-muxDataHeader-prefix))
-		total, credit = take, credit-take
-	}
-	for credit > overhead {
-		take := min(credit-overhead, room)
-		total, credit = total+take, credit-take-overhead
-	}
-	return total
-}
-
-// seal turns each frame's plaintext into its record. The frames' offsets
-// already count the records' length and tag.
-func (b *frameBuilder) seal() error {
-	if b.records == nil {
-		return nil
-	}
-	for i := range b.frames {
-		record, err := b.records.Seal(b.frames[i].raw[muxDataHeader:])
-		if err != nil {
-			return err
-		}
-		b.frames[i].raw = b.frames[i].raw[:muxDataHeader+len(record)]
-	}
-	return nil
-}
+func (b *frameBuilder) Room() int { return b.limit - b.bytes }
 
 func (b *frameBuilder) finish() []muxFrame {
 	offset := b.offset
@@ -1240,9 +1176,6 @@ func (s *muxStream) WriteKept(kept streamproxy.Kept) (bool, error) {
 	at := kept.At - muxDataHeader
 	raw := kept.Owner.Data[at : kept.At+len(kept.Data) : kept.At+len(kept.Data)]
 	frameHeader(raw, muxData, s.id)
-	if s.sealed.Load() {
-		raw[0] = sealedStreamKind
-	}
 	binary.BigEndian.PutUint64(raw[10:18], start)
 	raw[18] = s.dataFlags()
 	kept.Owner.Retain()
@@ -1290,7 +1223,7 @@ func (s *muxStream) Write(p []byte) (int, error) {
 			return written, err
 		}
 		limit = min(limit, room)
-		b := s.newBuilder(start, min(len(p), limit), nil)
+		b := s.newBuilder(start, min(len(p), limit))
 		b.Write(p[:b.limit])
 		if err := s.publish(b); err != nil {
 			b.release()
@@ -1311,21 +1244,11 @@ func (s *muxStream) ReadFrom(src io.Reader) (int64, error) {
 	if !ok {
 		return io.CopyBuffer(muxWriterOnly{s}, src, make([]byte, 64*1024))
 	}
-	// A session's end that seals it end to end has its bytes sealed here,
-	// in the frames that carry them.
-	var records *streamproxy.Records
-	if sealed, ok := src.(interface{ Records() *streamproxy.Records }); ok {
-		records = sealed.Records()
-	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	need := 1
-	if records != nil {
-		need = streamproxy.RecordOverhead + 1
-	}
 	var total int64
 	for {
-		room, err := s.waitKeep(need)
+		room, err := s.waitKeep(1)
 		if err != nil {
 			return total, s.errOr(err)
 		}
@@ -1334,22 +1257,9 @@ func (s *muxStream) ReadFrom(src io.Reader) (int64, error) {
 			return total, err
 		}
 		limit = min(limit, room)
-		if records != nil && limit <= streamproxy.RecordOverhead {
-			// Too little credit for a record's plaintext.
-			if _, err := s.reserveAll(streamproxy.RecordOverhead + 1); err != nil {
-				return total, err
-			}
-			continue
-		}
-		b := s.newBuilder(start, limit, records)
+		b := s.newBuilder(start, limit)
 		n, readErr := reader.ReadInto(b)
 		if n > 0 {
-			if err := b.seal(); err != nil {
-				// A channel out of record numbers ends the connection.
-				b.release()
-				s.AbortSession()
-				return total, err
-			}
 			if err := s.publish(b); err != nil {
 				// What was read from the access connection but not sent goes to
 				// the session's next hop.
@@ -1572,7 +1482,7 @@ func (s *muxStream) forward(data []byte, owner *packetbuf.Buffer) error {
 			if err != nil {
 				return err
 			}
-			b := s.newBuilder(start, min(len(data), limit), nil)
+			b := s.newBuilder(start, min(len(data), limit))
 			b.Write(data[:b.limit])
 			if err := s.publish(b); err != nil {
 				b.release()
@@ -1590,9 +1500,6 @@ func (s *muxStream) forward(data []byte, owner *packetbuf.Buffer) error {
 	end := at + len(data)
 	raw := owner.Data[at-muxDataHeader : end : end]
 	frameHeader(raw, muxData, s.id)
-	if s.sealed.Load() {
-		raw[0] = sealedStreamKind
-	}
 	binary.BigEndian.PutUint64(raw[10:18], start)
 	raw[18] = s.dataFlags()
 	frames := [1]muxFrame{{raw: raw, buf: owner, at: at - muxDataHeader}}

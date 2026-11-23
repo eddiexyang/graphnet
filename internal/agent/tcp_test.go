@@ -49,9 +49,11 @@ type kernelTUN struct {
 	readGSOs atomic.Uint64
 	once     sync.Once
 	// udp and icmp, when set, receive the UDP and ICMP packets written to the
-	// device, which its stack does not take.
-	udp  chan []byte
-	icmp chan []byte
+	// device, which its stack does not take. Set them with setUDP once the
+	// device is running; Write reads them under channels.
+	channels sync.Mutex
+	udp      chan []byte
+	icmp     chan []byte
 	embedded *embeddedClientFixture
 }
 
@@ -113,18 +115,29 @@ func (d *kernelTUN) Read(p []byte) (int, error) {
 		return 0, net.ErrClosed
 	}
 }
+
+// setUDP routes the UDP packets written to the device to udp.
+func (d *kernelTUN) setUDP(udp chan []byte) {
+	d.channels.Lock()
+	d.udp = udp
+	d.channels.Unlock()
+}
+
 func (d *kernelTUN) Write(p []byte) (int, error) {
 	d.writes.Add(1)
-	if d.udp != nil && packet.IsUDP(p) {
+	d.channels.Lock()
+	udp, icmp := d.udp, d.icmp
+	d.channels.Unlock()
+	if udp != nil && packet.IsUDP(p) {
 		select {
-		case d.udp <- bytes.Clone(p):
+		case udp <- bytes.Clone(p):
 		default:
 		}
 		return len(p), nil
 	}
-	if d.icmp != nil && len(p) >= 20 && p[0]>>4 == 4 && p[9] == 1 {
+	if icmp != nil && len(p) >= 20 && p[0]>>4 == 4 && p[9] == 1 {
 		select {
-		case d.icmp <- bytes.Clone(p):
+		case icmp <- bytes.Clone(p):
 		default:
 		}
 		return len(p), nil
@@ -460,13 +473,14 @@ func TestTCPStreamsAcrossGraph(t *testing.T) {
 			if count := devices[1].writes.Load(); count != 0 {
 				t.Fatalf("transit TCP escaped to TUN: %d packets", count)
 			}
-			if devices[0].batches.Load() == 0 || devices[2].batches.Load() == 0 {
+			// An embedded client's TCP leaves as a stream, never through a TUN.
+			if devices[0].embedded == nil && devices[0].batches.Load() == 0 || devices[2].batches.Load() == 0 {
 				t.Fatal("TCP access bypassed the TUN batch interface")
 			}
 			if streamCarrier(carrier) && devices[2].gsos.Load() == 0 {
 				t.Fatal("native access TCP bypassed host segmentation offload")
 			}
-			if devices[0].readGSOs.Load() == 0 {
+			if devices[0].embedded == nil && devices[0].readGSOs.Load() == 0 {
 				t.Fatal("native access TCP was split before stack ingress")
 			}
 			assertNoTCPOverTCP(t, agents[:])

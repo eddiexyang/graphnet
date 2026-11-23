@@ -28,12 +28,8 @@ func FuzzFromPeer(f *testing.F) {
 	}
 	ip := packet.UDP(netipPort(n.Nodes[0].Address, 1), netipPort(n.Nodes[2].Address, 2), []byte("payload"))
 	frame, _ := (packet.Packet{Header: packet.Header{Network: n.ID, Source: n.Nodes[0].ID, Destination: n.Nodes[2].ID, HopLimit: 9}, Payload: ip}).MarshalBinary()
-	f.Add(frame, true)
-	f.Add(frame, false)
-	f.Fuzz(func(t *testing.T, raw []byte, sealed bool) {
-		if len(raw) > packet.HeaderSize {
-			packet.SetSealed(raw, sealed)
-		}
+	f.Add(frame)
+	f.Fuzz(func(t *testing.T, raw []byte) {
 		r.FromPeer(context.Background(), n.Nodes[0].ID, raw)
 		if len(raw) > packet.HeaderSize {
 			var header [packet.HeaderSize]byte

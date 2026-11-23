@@ -26,13 +26,8 @@ func FuzzPacketParsers(f *testing.F) {
 		if _, err := InspectIP(raw); err != nil {
 			return
 		}
-		HeaderLen(raw)
-		var readable [MaxReadable]byte
-		Authenticated(&readable, raw)
-		IPOf(raw, true)
 		IPHopLimit(raw)
 		DecrementIPHopLimit(bytes.Clone(raw))
-		RestoreChecksums(bytes.Clone(raw))
 		TimeExceeded(raw, netip.MustParseAddr("10.0.0.9"))
 		TCPReset(raw)
 		SegmentTCP(bytes.Clone(raw), 536, func([]byte) error { return nil })

@@ -55,8 +55,6 @@ const (
 	// StatusNoRoute: a hop has no route or no Link toward the destination
 	// for now, as while routes converge. An older hop answers StatusRefused.
 	StatusNoRoute = 5
-	// StatusNoKey: the egress has no such end-to-end session, or requires one.
-	StatusNoKey = 6
 	// StatusEnded: the egress ended the session after each end delivered the
 	// other's end, so the asking end lacks only that news.
 	StatusEnded = 7
@@ -64,7 +62,6 @@ const (
 
 var ErrLegacy = errors.New("a hop does not support resumable TCP")
 var ErrUnknownSession = errors.New("egress has no such TCP session")
-var ErrNoKey = errors.New("egress has no such end-to-end session")
 var ErrSessionEnded = errors.New("egress ended the TCP session")
 
 // ErrNoRoute is a connection that has no path for now. As for a packet with
@@ -104,8 +101,6 @@ func ResponseError(status byte) error {
 		return ErrUnknownSession
 	case StatusNoRoute:
 		return ErrNoRoute
-	case StatusNoKey:
-		return ErrNoKey
 	case StatusEnded:
 		return ErrSessionEnded
 	default:
@@ -442,7 +437,6 @@ type End struct {
 	askReplay func(gen uint32) // egress
 	counters  *Counters
 	keep      *Keep
-	records   *Records // nil when the session's bytes are not sealed
 
 	mu   sync.Mutex
 	cond *sync.Cond
@@ -474,9 +468,9 @@ type End struct {
 	err      error
 }
 
-func newEnd(parent context.Context, counters *Counters, records *Records) *End {
+func newEnd(parent context.Context, counters *Counters) *End {
 	ctx, cancel := context.WithCancel(parent)
-	e := &End{ctx: ctx, cancel: cancel, keep: NewKeep(), counters: counters, records: records}
+	e := &End{ctx: ctx, cancel: cancel, keep: NewKeep(), counters: counters}
 	if counters != nil {
 		e.keep.budget = &counters.retained
 		e.keep.budget.join()
@@ -486,14 +480,13 @@ func newEnd(parent context.Context, counters *Counters, records *Records) *End {
 }
 
 // StartIngress opens the first chain before the access connection is
-// accepted, as a connected stream would be. records, if not nil, seals the
-// session end to end.
-func StartIngress(ctx context.Context, open OpenChain, counters *Counters, records *Records) (*End, error) {
+// accepted, as a connected stream would be.
+func StartIngress(ctx context.Context, open OpenChain, counters *Counters) (*End, error) {
 	hop, _, err := open(ctx, 0, 0, 0)
 	if err != nil {
 		return nil, err
 	}
-	e := newEnd(context.Background(), counters, records)
+	e := newEnd(context.Background(), counters)
 	e.open = open
 	// An end, not a relay, from its first acknowledgement on.
 	hop.DeliverLocal()
@@ -505,8 +498,8 @@ func StartIngress(ctx context.Context, open OpenChain, counters *Counters, recor
 }
 
 // NewEgress serves a session's first chain, answered already.
-func NewEgress(parent context.Context, hop Hop, askReplay func(gen uint32), counters *Counters, records *Records) *End {
-	e := newEnd(parent, counters, records)
+func NewEgress(parent context.Context, hop Hop, askReplay func(gen uint32), counters *Counters) *End {
+	e := newEnd(parent, counters)
 	e.askReplay = askReplay
 	// An end, not a relay, from its first acknowledgement on.
 	hop.DeliverLocal()
@@ -520,7 +513,6 @@ func NewEgress(parent context.Context, hop Hop, askReplay func(gen uint32), coun
 // useLocked makes hop the session's chain; its received bytes start at in.
 // Callers began it at its sent offset and resent the kept bytes from there.
 func (e *End) useLocked(hop Hop, out, in uint64) {
-	e.sealHop(hop)
 	hop.DeliverLocal()
 	hop.SetRetention(e.keep)
 	hop.OnDelivered(func() {
@@ -554,7 +546,6 @@ func (e *End) useLocked(hop Hop, out, in uint64) {
 // resend begins a new chain at out and writes the kept bytes it lacks. It
 // runs without the lock: the writes wait for the hop's acknowledgements.
 func (e *End) resend(hop Hop, out uint64) error {
-	e.sealHop(hop)
 	// An end, not a relay, from its first acknowledgement on.
 	hop.DeliverLocal()
 	hop.Begin(out)
@@ -584,22 +575,6 @@ func (e *End) resend(hop Hop, out uint64) error {
 		}
 	}
 	return nil
-}
-
-// sealHop tells a hop of a session sealed end to end that what it carries
-// from now on is sealed already.
-func (e *End) sealHop(hop Hop) {
-	if e.records != nil {
-		CarrySealed(hop)
-	}
-}
-
-// CarrySealed tells a hop, if it can be told, that the bytes written to it
-// from now on are sealed end to end.
-func CarrySealed(hop Hop) {
-	if sealed, ok := hop.(interface{ CarrySealed() }); ok {
-		sealed.CarrySealed()
-	}
 }
 
 // Accept takes an egress's newer chain: it carries the upstream bytes from
@@ -897,9 +872,6 @@ func (e *End) OnDone(fn func()) {
 }
 
 func (e *End) HasUnread() bool {
-	if e.records != nil && e.records.available() > 0 {
-		return true
-	}
 	e.mu.Lock()
 	hop := e.hop
 	e.mu.Unlock()
@@ -1016,7 +988,7 @@ func (e *End) finishLocked(err error) {
 // ReadFrom sends the local connection's bytes on the current chain. A chain
 // that fails leaves what it read but did not send for the next one.
 func (e *End) ReadFrom(src io.Reader) (int64, error) {
-	local := &localSource{conn: src, records: e.records}
+	local := &localSource{conn: src}
 	var total int64
 	for {
 		hop := e.current()
@@ -1119,12 +1091,6 @@ func (e *End) input() (Hop, uint64, error) {
 
 // ReadWindow reports bytes Read can return without waiting.
 func (e *End) ReadWindow() (int, error) {
-	if e.records != nil {
-		if err := e.openRecord(window); err != nil {
-			return 0, err
-		}
-		return e.records.available(), nil
-	}
 	for {
 		hop, skip, err := e.input()
 		if err != nil {
@@ -1151,12 +1117,6 @@ func (e *End) Read(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	if r := e.records; r != nil {
-		if err := e.openRecord(min(len(p), window)); err != nil {
-			return 0, err
-		}
-		return r.read(p), nil
-	}
 	for {
 		hop, skip, err := e.input()
 		if err != nil {
@@ -1176,113 +1136,6 @@ func (e *End) Read(p []byte) (int, error) {
 			return n, err
 		}
 	}
-}
-
-// openRecord reads the chains until a record is open with bytes to read,
-// then opens what the current chain has of the records after it without
-// waiting. A record that fails to open, or that the direction ends within,
-// resets the connection.
-func (e *End) openRecord(limit int) error {
-	r := e.records
-	for r.available() == 0 {
-		hop, skip, err := e.input()
-		if err == nil && skip > 0 && e.discard(hop, skip) != nil {
-			continue
-		}
-		if err == nil {
-			err = e.openFrom(hop, true, limit)
-		}
-		if err = e.recordError(err); err != nil {
-			return err
-		}
-	}
-	if r.available() >= limit {
-		return nil
-	}
-	e.mu.Lock()
-	hop := e.hop
-	current := hop != nil && !e.done && e.read <= e.in+e.inRead
-	e.mu.Unlock()
-	if !current {
-		return nil
-	}
-	if err := e.openFrom(hop, false, limit); errors.Is(err, errRecord) {
-		// What opened before the record is not read: the connection is
-		// reset as it would be at that record.
-		return e.recordError(err)
-	}
-	return nil
-}
-
-// openFrom opens records hop received: until one opened when wait, and what
-// hop has without waiting otherwise up to limit opened bytes. A record that
-// arrived whole in one of hop's buffers opens there; other bytes are read
-// into the window. A failed chain returns nil, so the caller reads the next one.
-func (e *End) openFrom(hop Hop, wait bool, limit int) error {
-	r := e.records
-	taker, takes := hop.(interface {
-		TakeChunk() ([]byte, *packetbuf.Buffer, error)
-	})
-	buffered, hasBuffered := hop.(interface{ Buffered() int })
-	read := func(p []byte) (int, error) {
-		if r.pending != nil {
-			return r.readPending(p), nil
-		}
-		n, err := hop.Read(p)
-		return n, e.received(hop, n, err)
-	}
-	for {
-		budget := -1
-		if !wait {
-			// What is opened is bounded by limit (at most window): the rest
-			// stays with the hop, whose window holds the sender back.
-			if !hasBuffered || r.available() >= limit {
-				return nil
-			}
-			if budget = buffered.Buffered(); budget == 0 && r.pending == nil {
-				return nil
-			}
-		}
-		if takes && r.pending == nil && !r.partial() && len(r.plain()) == 0 {
-			data, owner, err := taker.TakeChunk()
-			if failed := e.received(hop, len(data), err); failed != nil || err != nil {
-				owner.Release()
-				return failed
-			}
-			opened, err := r.whole(data, owner)
-			if err != nil {
-				return err
-			}
-			if opened {
-				wait = false
-			}
-			continue
-		}
-		if budget >= 0 {
-			budget += len(r.pending)
-		}
-		opened, err := r.fillLimit(read, budget, limit)
-		if err != nil || !wait {
-			return err
-		}
-		if opened {
-			wait = false
-		}
-	}
-}
-
-// recordError resets the connection for a record that failed to open or
-// that the direction ended within.
-func (e *End) recordError(err error) error {
-	if err == io.EOF && e.records.partial() {
-		err = errRecord
-	}
-	if errors.Is(err, errRecord) {
-		e.mu.Lock()
-		e.finishLocked(errRecord)
-		e.mu.Unlock()
-	}
-	return err
 }
 
 // discard reads bytes of a newer chain that this end already delivered.
@@ -1376,13 +1229,9 @@ var errAborted = ErrSessionReset
 // localSource reads the local connection for a hop's ReadFrom, keeping its
 // error apart from the hop's.
 type localSource struct {
-	conn    io.Reader
-	err     error
-	records *Records
+	conn io.Reader
+	err  error
 }
-
-// Records returns what seals the bytes read, or nil.
-func (l *localSource) Records() *Records { return l.records }
 
 func (l *localSource) Read(p []byte) (int, error) {
 	n, err := l.conn.Read(p)

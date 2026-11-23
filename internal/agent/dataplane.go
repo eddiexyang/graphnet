@@ -66,8 +66,6 @@ type runtimeState struct {
 	// selfAddress is this Agent's overlay address per network, for replay
 	// requests of its TCP sessions.
 	selfAddress map[model.ID]netip.Addr
-	// keys are the Agent keys of the directory's other Nodes.
-	keys map[e2ePeer]ed25519.PublicKey
 }
 
 type DataPlane struct {
@@ -86,7 +84,6 @@ type DataPlane struct {
 	linkState     *linkstate.Engine
 	damper        *edgeDamper
 	sessions      sessions
-	e2e           e2eSessions
 }
 
 func NewDataPlane(parent context.Context, identity ed25519.PrivateKey, options DataPlaneOptions) (*DataPlane, error) {
@@ -106,9 +103,7 @@ func NewDataPlane(parent context.Context, identity ed25519.PrivateKey, options D
 	runtime := &DataPlane{identity: append(ed25519.PrivateKey{}, identity...), options: options, ctx: ctx, cancel: cancel, discoveryWake: make(chan struct{}, 1), repairWake: make(chan struct{}, 1)}
 	runtime.linkState = runtime.newLinkState()
 	runtime.sessions.init()
-	runtime.e2e.init()
-	runtime.wg.Add(4)
-	go runtime.e2eLoop()
+	runtime.wg.Add(3)
 	go runtime.rerouteLoop()
 	go runtime.repairLoop()
 	go func() { defer runtime.wg.Done(); runtime.linkState.Run(ctx) }()
@@ -138,7 +133,6 @@ func (r *DataPlane) Apply(ctx context.Context, snapshot model.Snapshot) error {
 	for _, network := range snapshot.Networks {
 		next.selfAddress[network.ID] = network.Self.Address
 	}
-	next.keys = e2eKeys(next)
 	prepared := []tunnel.Device{}
 	var preparedTCP []*runtimeTCP
 	type tunnelUpdate struct {
@@ -243,7 +237,6 @@ func (r *DataPlane) Apply(ctx context.Context, snapshot model.Snapshot) error {
 	}
 	router.SetTCPIntercept(r.interceptTCP)
 	router.SetTCPCarrier(next.mesh.TCPCarrier)
-	router.SetEndToEnd(e2ePackets{r})
 	next.router = router
 	for _, network := range snapshot.Networks {
 		fingerprint := tcpFingerprint(network)
@@ -279,7 +272,6 @@ func (r *DataPlane) Apply(ctx context.Context, snapshot model.Snapshot) error {
 		return err
 	}
 	r.state.Store(next)
-	r.wakeE2E()
 	if linkstate.Active(snapshot) {
 		// Install link-state routes with the configuration, so forwarding never
 		// uses the controller's routes for a revision, even briefly.
@@ -359,31 +351,11 @@ func (r *DataPlane) NetworkFor(destination netip.Addr) (model.ID, netip.Addr, er
 // SendIP forwards a single raw L3 IP packet originating from this node's
 // overlay address in network through the data plane router.
 func (r *DataPlane) SendIP(ctx context.Context, network model.ID, raw []byte) error {
-	delay := 10 * time.Millisecond
-	// A packet waits a short while for a session that is being set up, then
-	// drops like any undeliverable packet. Waiting out the caller's deadline
-	// instead would hold its per-packet resources: an embedding proxy bounds
-	// in-flight packets, so a Node without a session then blackholes every
-	// other destination's packets too.
-	giveUp := time.Now().Add(e2eSendWait)
-	for {
-		state := r.state.Load()
-		if state == nil {
-			return ErrNotConfigured
-		}
-		err := state.router.FromTunnel(ctx, network, raw)
-		if !errors.Is(err, errE2ESession) || !time.Now().Before(giveUp) {
-			return err
-		}
-		select {
-		case <-ctx.Done():
-			return err
-		case <-r.ctx.Done():
-			return err
-		case <-time.After(delay):
-		}
-		delay = min(2*delay, 100*time.Millisecond)
+	state := r.state.Load()
+	if state == nil {
+		return ErrNotConfigured
 	}
+	return state.router.FromTunnel(ctx, network, raw)
 }
 
 func (r *DataPlane) Report() []model.LinkStatus {
@@ -501,7 +473,7 @@ func (r *DataPlane) deliver(ctx context.Context, network model.ID, raw []byte) e
 	if state == nil {
 		return errors.New("agent runtime is not configured")
 	}
-	if r.replayRequest(state, network, raw) || r.e2eRequest(state, network, raw) {
+	if r.replayRequest(state, network, raw) {
 		return nil
 	}
 	if crossNetwork(state, network, raw) {
@@ -641,11 +613,11 @@ func (r *DataPlane) deliverBatch(ctx context.Context, network model.ID, packets 
 	if state == nil {
 		return errors.New("agent runtime is not configured")
 	}
-	// Replay requests and end-to-end handshakes of this Agent's TCP sessions
-	// never reach the TUN, nor do packets addressed to another network.
+	// Replay requests of this Agent's TCP sessions never reach the TUN, nor do
+	// packets addressed to another network.
 	var kept [][]byte
 	for i, raw := range packets {
-		if r.replayRequest(state, network, raw) || r.e2eRequest(state, network, raw) || crossNetwork(state, network, raw) {
+		if r.replayRequest(state, network, raw) || crossNetwork(state, network, raw) {
 			if kept == nil {
 				kept = append(make([][]byte, 0, len(packets)), packets[:i]...)
 			}

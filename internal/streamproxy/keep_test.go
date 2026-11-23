@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"sync"
 	"testing"
 	"time"
 
@@ -96,7 +97,7 @@ func TestPeerResetWhileWritingReleasesKeep(t *testing.T) {
 		case replay <- struct{}{}:
 		default:
 		}
-	}, counters, nil)
+	}, counters)
 	t.Cleanup(end.Abort)
 	end.mu.Lock()
 	end.ended = true
@@ -138,3 +139,58 @@ func (h *writeResetHop) ReadFrom(r io.Reader) (int64, error) {
 	h.keep.Add(data, nil, 0)
 	return int64(len(data)), io.ErrClosedPipe
 }
+
+// chunkHop holds received chunks as a mux stream's hop does.
+type chunkHop struct {
+	mu     sync.Mutex
+	chunks []*packetbuf.Buffer
+	done   chan struct{}
+}
+
+func (h *chunkHop) TakeChunk() ([]byte, *packetbuf.Buffer, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.chunks) == 0 {
+		return nil, nil, io.EOF
+	}
+	b := h.chunks[0]
+	h.chunks = h.chunks[1:]
+	return b.Data, b, nil
+}
+
+func (h *chunkHop) Buffered() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	n := 0
+	for _, b := range h.chunks {
+		n += len(b.Data)
+	}
+	return n
+}
+
+func (h *chunkHop) Read(p []byte) (int, error) {
+	data, owner, err := h.TakeChunk()
+	if err != nil {
+		return 0, err
+	}
+	defer owner.Release()
+	return copy(p, data), nil
+}
+
+func (h *chunkHop) Write(p []byte) (int, error)         { return len(p), nil }
+func (h *chunkHop) ReadFrom(r io.Reader) (int64, error) { return io.Copy(io.Discard, r) }
+func (h *chunkHop) Close() error                        { return nil }
+func (h *chunkHop) CloseWrite() error                   { return nil }
+func (h *chunkHop) Begin(uint64)                        {}
+func (h *chunkHop) DeliverLocal()                       {}
+func (h *chunkHop) SetDelivered(uint64)                 {}
+func (h *chunkHop) PeerDelivered() uint64               { return 0 }
+func (h *chunkHop) OnDelivered(func())                  {}
+func (h *chunkHop) PeerEnded() bool                     { return false }
+func (h *chunkHop) Done() <-chan struct{}               { return h.done }
+func (h *chunkHop) SetRetention(*Keep)                  {}
+func (h *chunkHop) Leftover() []byte                    { return nil }
+func (h *chunkHop) Ended() bool                         { return false }
+func (h *chunkHop) Aborted() bool                       { return false }
+func (h *chunkHop) Abort()                              {}
+func (h *chunkHop) AbortSession()                       {}

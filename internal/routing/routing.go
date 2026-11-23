@@ -202,11 +202,7 @@ func Compile(state model.State, agentID model.ID) (model.Snapshot, error) {
 		slices.SortFunc(config.Topology, func(a, b model.TopologyEdge) int { return cmp.Compare(a.ID, b.ID) })
 		for _, node := range network.Nodes {
 			if !excluded[node.ID] {
-				var key []byte
-				if node.AgentID != "" {
-					key = append(key, agents[node.AgentID].PublicKey...)
-				}
-				config.Directory = append(config.Directory, model.Destination{NodeID: node.ID, Address: node.Address, AdvertisedSubnets: append([]model.AdvertisedSubnet(nil), node.AdvertisedSubnets...), Client: node.Client, PublicKey: key, Index: node.Index})
+				config.Directory = append(config.Directory, model.Destination{NodeID: node.ID, Address: node.Address, AdvertisedSubnets: append([]model.AdvertisedSubnet(nil), node.AdvertisedSubnets...), Client: node.Client, Index: node.Index})
 			}
 		}
 		for _, edge := range network.EffectiveEdges() {

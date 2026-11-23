@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/ed25519"
 	"net"
-	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -88,8 +87,7 @@ func TestPacketChannelBatchWithLegacyReceiver(t *testing.T) {
 						} else if i == count-1 {
 							size = secure.MaxPlaintext
 						}
-						// First bytes stay below Masked, which a packet is.
-						payloads[i] = bytes.Repeat([]byte{byte(i%(Masked-1) + 1)}, size)
+						payloads[i] = bytes.Repeat([]byte{byte(i%0x7f + 1)}, size)
 						originals[i] = bytes.Clone(payloads[i])
 					}
 					done := make(chan error, 1)
@@ -117,106 +115,6 @@ func TestPacketChannelBatchWithLegacyReceiver(t *testing.T) {
 					t.Fatal("incorrect framed transport selection", framed.framed.Load())
 				}
 			})
-		}
-	}
-}
-
-type recordingTransport struct {
-	*transport.Stream
-	sent  bytes.Buffer
-	parts [][]byte // the parts of the last gathered write
-}
-
-func (c *recordingTransport) SendFramedBatch(ctx context.Context, data []byte) error {
-	c.sent.Write(data)
-	return c.Stream.SendFramedBatch(ctx, data)
-}
-
-func (c *recordingTransport) SendFramedParts(ctx context.Context, parts [][]byte, frames int) error {
-	c.parts = append(c.parts[:0], parts...)
-	for _, part := range parts {
-		c.sent.Write(part)
-	}
-	return c.Stream.SendFramedParts(ctx, parts, frames)
-}
-
-// A sealed payload's header, or a prefixed payload's prefix, is encrypted and
-// the rest travels as it is; the receiver gets the payload back, alone or
-// among data messages in a batch.
-func TestSealedPayloadIsEncryptedOnce(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	seedA, seedB := make([]byte, ed25519.SeedSize), make([]byte, ed25519.SeedSize)
-	seedA[0], seedB[0] = 1, 2
-	keyA, keyB := ed25519.NewKeyFromSeed(seedA), ed25519.NewKeyFromSeed(seedB)
-	a := secure.Config{Network: testutil.ID(1), Edge: testutil.ID(2), Local: testutil.ID(3), Peer: testutil.ID(4), Transport: model.TCP, Cipher: model.AES128GCM, Identity: keyA, PeerIdentity: keyB.Public().(ed25519.PublicKey)}
-	b := a
-	b.Local, b.Peer, b.Identity, b.PeerIdentity = a.Peer, a.Local, keyB, keyA.Public().(ed25519.PublicKey)
-	x, y := net.Pipe()
-	defer x.Close()
-	defer y.Close()
-	recording := &recordingTransport{Stream: transport.NewStream(x)}
-	accepted := make(chan *Channel, 1)
-	go func() {
-		channel, err := Accept(ctx, transport.NewStream(y), model.TCP, func(Hello) (secure.Config, error) { return b, nil })
-		if err != nil {
-			t.Error(err)
-		}
-		accepted <- channel
-	}()
-	sender, err := Dial(ctx, recording, a)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer sender.Close()
-	receiver := <-accepted
-	if receiver == nil {
-		t.FailNow()
-	}
-	defer receiver.Close()
-	header := append([]byte{SealedPayload}, bytes.Repeat([]byte("H"), SealedHeader-1)...)
-	sealed := append(bytes.Clone(header), bytes.Repeat([]byte("already sealed"), 500)...)
-	data := bytes.Repeat([]byte("D"), 1000)
-	readable := append([]byte{Masked | 32}, bytes.Repeat([]byte("R"), MaskedRegion)...)
-	packet := append(bytes.Clone(readable), bytes.Repeat([]byte("sealed packet"), 100)...)
-	for _, batch := range [][][]byte{{sealed}, {packet}, {data, sealed, packet, data, sealed}} {
-		recording.sent.Reset()
-		done := make(chan error, 1)
-		go func() { done <- sender.SendBatch(ctx, batch) }()
-		var got [][]byte
-		for len(got) < len(batch) {
-			messages, err := receiver.ReceiveBatch(ctx)
-			if err != nil {
-				t.Fatal(err)
-			}
-			for _, m := range messages {
-				got = append(got, bytes.Clone(m))
-			}
-		}
-		if err := <-done; err != nil {
-			t.Fatal(err)
-		}
-		for i := range batch {
-			if !bytes.Equal(got[i], batch[i]) {
-				t.Fatalf("message %d of %d changed", i, len(batch))
-			}
-		}
-		wire := recording.sent.Bytes()
-		if bytes.Contains(wire, header) || bytes.Contains(wire, readable[1:]) || bytes.Contains(wire, data[:64]) {
-			t.Fatal("the channel sent bytes it should have encrypted")
-		}
-		for _, m := range batch {
-			end := prefix(m)
-			if m[0] >= Masked {
-				end = maskedSpan(m)
-			}
-			if rest := m[end:]; len(rest) > 0 && !bytes.Contains(wire, rest) {
-				t.Fatal("the channel encrypted bytes already sealed")
-			}
-			// The rest went to the transport where it was, not copied.
-			if rest := m[end:]; len(rest) > 0 && !slices.ContainsFunc(recording.parts, func(part []byte) bool { return len(part) > 0 && &part[0] == &rest[0] }) {
-				t.Fatal("the channel copied bytes past its seal")
-			}
 		}
 	}
 }
