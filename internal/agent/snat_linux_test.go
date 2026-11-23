@@ -128,8 +128,9 @@ func TestDialSNATIsolatesHostAndOtherNetworkRoutes(t *testing.T) {
 	listenerReady := make(chan error, 1)
 	serverDone := make(chan error, 1)
 	go func() {
+		// Stay locked to this OS thread without unlocking so the Go runtime
+		// terminates the peerNS thread on exit instead of returning it to the pool.
 		runtime.LockOSThread()
-		defer runtime.UnlockOSThread()
 		if err := netns.Set(peerNS); err != nil {
 			listenerReady <- err
 			return
@@ -334,14 +335,7 @@ func TestDialSNATIsolatesHostAndOtherNetworkRoutes(t *testing.T) {
 
 	netBConn, err := dp.dialSNAT(ctx, state, netAID, netip.MustParseAddrPort("7.7.7.2:8083"))
 	if err != nil {
-		routes, rerr := netlink.RouteGet(net.ParseIP("7.7.7.2"))
-		cerr := checkSNATRoute(state, netAID, netip.MustParseAddr("7.7.7.2"))
-		var probeLocal string
-		if pc, perr := net.Dial("tcp4", "7.7.7.2:8083"); perr == nil {
-			probeLocal = pc.LocalAddr().String()
-			pc.Close()
-		}
-		t.Fatalf("explicitly advertised other network self dialSNAT failed: %v (checkSNATRoute=%v routes=%+v rerr=%v probeLocal=%q)", err, cerr, routes, rerr, probeLocal)
+		t.Fatalf("explicitly advertised other network self dialSNAT failed: %v", err)
 	}
 	netBGot, err := io.ReadAll(netBConn)
 	netBConn.Close()
