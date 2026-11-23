@@ -360,13 +360,19 @@ func (r *DataPlane) NetworkFor(destination netip.Addr) (model.ID, netip.Addr, er
 // overlay address in network through the data plane router.
 func (r *DataPlane) SendIP(ctx context.Context, network model.ID, raw []byte) error {
 	delay := 10 * time.Millisecond
+	// A packet waits a short while for a session that is being set up, then
+	// drops like any undeliverable packet. Waiting out the caller's deadline
+	// instead would hold its per-packet resources: an embedding proxy bounds
+	// in-flight packets, so a Node without a session then blackholes every
+	// other destination's packets too.
+	giveUp := time.Now().Add(e2eSendWait)
 	for {
 		state := r.state.Load()
 		if state == nil {
 			return ErrNotConfigured
 		}
 		err := state.router.FromTunnel(ctx, network, raw)
-		if !errors.Is(err, errE2ESession) {
+		if !errors.Is(err, errE2ESession) || !time.Now().Before(giveUp) {
 			return err
 		}
 		select {

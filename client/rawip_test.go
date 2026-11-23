@@ -95,27 +95,42 @@ func TestClientRawIPTracerouteEchoAndGRE(t *testing.T) {
 	tunSrc := netip.MustParseAddr("198.18.0.1")
 
 	// Wait until client has route to node 2 (via node 0 -> node 1 -> node 2).
+	// Routes and the end-to-end session come up after Start returns, and a
+	// packet sent before then is dropped: resend until the echo is answered.
 	probe := buildICMPv4Echo(tunSrc, node2Addr, 64, 0x1234, 1, []byte("ping-gn"))
-	if err := c.WriteIP(ctx, probe); err != nil {
-		t.Fatalf("WriteIP echo: %v", err)
-	}
-	select {
-	case rep := <-replies:
-		if len(rep) < 28 || rep[0]>>4 != 4 || rep[9] != 1 || rep[20] != 0 {
-			t.Fatalf("unexpected echo reply: %x", rep)
+	var echo []byte
+	for echo == nil {
+		err := c.WriteIP(ctx, probe)
+		select {
+		case echo = <-replies:
+		case <-time.After(200 * time.Millisecond):
+		case <-ctx.Done():
+			t.Fatalf("WriteIP echo: no reply before deadline (last error: %v)", err)
 		}
-		src, dst, _ := ipAddresses(rep)
+	}
+	{
+		if len(echo) < 28 || echo[0]>>4 != 4 || echo[9] != 1 || echo[20] != 0 {
+			t.Fatalf("unexpected echo reply: %x", echo)
+		}
+		src, dst, _ := ipAddresses(echo)
 		if src != node2Addr || dst != tunSrc {
 			t.Fatalf("echo reply addrs = %s -> %s, want %s -> %s", src, dst, node2Addr, tunSrc)
 		}
-		if rawInternetChecksum(rep[:20]) != 0 || rawInternetChecksum(rep[20:]) != 0 {
+		if rawInternetChecksum(echo[:20]) != 0 || rawInternetChecksum(echo[20:]) != 0 {
 			t.Fatalf("invalid echo reply checksums")
 		}
-		if binary.BigEndian.Uint16(rep[24:26]) != 0x1234 || binary.BigEndian.Uint16(rep[26:28]) != 1 {
+		if binary.BigEndian.Uint16(echo[24:26]) != 0x1234 || binary.BigEndian.Uint16(echo[26:28]) != 1 {
 			t.Fatalf("echo reply id/seq mismatch")
 		}
-	case <-time.After(8 * time.Second):
-		t.Fatal("timed out waiting for ICMP echo reply")
+	}
+
+	// Resent echoes are each answered: drop their late replies first.
+	for drained := false; !drained; {
+		select {
+		case <-replies:
+		case <-time.After(300 * time.Millisecond):
+			drained = true
+		}
 	}
 
 	// TTL=1 probe must trigger ICMP Time Exceeded from first transit node (node 0)

@@ -44,6 +44,8 @@ const (
 	e2eRetry    = 200 * time.Millisecond
 	e2eRetryMax = 2 * time.Second
 	e2eAttempt  = 10 * time.Second
+	// e2eSendWait bounds how long SendIP holds a packet for a session.
+	e2eSendWait = time.Second
 	// A session is replaced this long before it may no longer seal new
 	// channels; open channels keep it.
 	e2eRenew = 10 * time.Minute
