@@ -261,24 +261,21 @@ function EditServer({
           setBusy(true)
           setError('')
           try {
+            const body = {
+              name,
+              stun_servers: stun
+                .split('\n')
+                .map((s) => s.trim())
+                .filter(Boolean),
+              manual_endpoints: endpoints,
+            }
             const next = await saveConfiguration(
               `/servers/${server.id}`,
-              {
-                method: 'PATCH',
-                csrf,
-                revision: state.revision,
-                body: {
-                  name,
-                  stun_servers: stun
-                    .split('\n')
-                    .map((s) => s.trim())
-                    .filter(Boolean),
-                  manual_endpoints: endpoints,
-                },
-              },
+              { method: 'PATCH', csrf, revision: state.revision, body },
               (latest) =>
                 equal(settings(latest.servers?.find((s) => s.id === server.id)), settings(server)),
               updated,
+              (latest) => equal(settings(latest.servers?.find((s) => s.id === server.id)), body),
             )
             updated(next)
             close()

@@ -1,8 +1,12 @@
 export class APIError extends Error {
   status: number
-  constructor(status: number, message: string) {
+  // unreadable: the response did not carry the controller's JSON answer, as
+  // when the connection drops mid-response; the request may have been applied.
+  unreadable: boolean
+  constructor(status: number, message: string, unreadable = false) {
     super(message)
     this.status = status
+    this.unreadable = unreadable
   }
 }
 export async function request<T>(
@@ -33,6 +37,7 @@ export async function request<T>(
       [502, 503, 504].includes(response.status)
         ? 'Cannot reach the controller. Check the backend connection and retry.'
         : 'The server returned an unreadable response.',
+      true,
     )
   })
   if (!response.ok)

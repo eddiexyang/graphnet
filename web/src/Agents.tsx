@@ -154,6 +154,27 @@ function AgentEditor({
                 JSON.stringify(editable(latest.agents.find((a) => a.id === agent.id))) ===
                 JSON.stringify(editable(agent)),
               updated,
+              (latest) => {
+                const sent = body as {
+                  name: string
+                  listen_port: number
+                  revoked: boolean
+                  stun_servers: string[]
+                  exclude_container_ips: boolean
+                  manual_endpoints: Endpoint[]
+                }
+                return (
+                  JSON.stringify(editable(latest.agents.find((a) => a.id === agent.id))) ===
+                  JSON.stringify({
+                    name: sent.name,
+                    listen_port: sent.listen_port,
+                    revoked: sent.revoked,
+                    stun_servers: sent.stun_servers,
+                    exclude_container_ips: sent.exclude_container_ips,
+                    endpoints: sent.manual_endpoints,
+                  })
+                )
+              },
             )
           : await request<State>(`/agents/${agent.id}`, options),
       )

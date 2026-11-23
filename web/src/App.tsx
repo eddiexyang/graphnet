@@ -269,6 +269,11 @@ export default function App() {
                 base,
               ),
             loadState,
+            (latest) =>
+              equal(
+                latest.networks.find((n) => n.id === base.id),
+                body,
+              ),
           )
         : await request<State>(path, { method, body, csrf: csrf!, revision })
       loadState(next)

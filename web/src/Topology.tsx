@@ -72,6 +72,10 @@ export type Selection =
 // Fit new graph membership, and keep a fitted view fitted when the canvas
 // resizes, as when a notice appears above it. A view the user panned or zoomed
 // stays where it is until the fit-view control fits it again.
+// A fitted graph fills the canvas but for a thin margin; the default leaves a
+// tenth of it empty on each side.
+const fitOptions = { padding: 0.03 }
+
 function FitLayout({ count, follow }: { count: number; follow: { current: boolean } }) {
   const { fitView } = useReactFlow()
   const initialized = useNodesInitialized()
@@ -86,7 +90,7 @@ function FitLayout({ count, follow }: { count: number; follow: { current: boolea
     const task = requestAnimationFrame(() => {
       fitted.current = { count, size }
       follow.current = true
-      void fitView()
+      void fitView(fitOptions)
     })
     return () => cancelAnimationFrame(task)
   }, [fitView, follow, initialized, width, height, count])
@@ -566,11 +570,19 @@ export default function Topology({
       ),
     }
   }, [geometryKey, edgeKey, dragging, lineStyle])
+  // A group link's member edges at the selected node: selecting a member
+  // shows that member's own edges rather than the whole link.
+  const memberEdges = (id: string, node: string) => {
+    const link = !scope ? network.group_links?.find((l) => l.id === id) : undefined
+    return link ? childEdges(network, link).filter((c) => c.a === node || c.b === node) : []
+  }
   const focus = new Set(
     (viewStyle === 'globe' ? allEdges : displayEdges)
       .filter((e) =>
         selection?.type === 'node'
-          ? e.a === selection.id || e.b === selection.id
+          ? e.a === selection.id ||
+            e.b === selection.id ||
+            memberEdges(e.id, selection.id).length > 0
           : selection?.type === 'path'
             ? path?.edges.includes(e.id) ||
               (!scope &&
@@ -597,11 +609,22 @@ export default function Topology({
     [geometry, labelScale, labelSizes],
   )
   const edges = displayEdges.map((e) => {
-    const link = !scope ? network.group_links?.find((l) => l.id === e.id) : undefined
+    const members = selection?.type === 'node' ? memberEdges(e.id, selection.id) : []
+    // One member edge stands for itself; several are summarized among
+    // themselves.
+    const single = members.length === 1 ? members[0] : undefined
+    const link = !scope && !single ? network.group_links?.find((l) => l.id === e.id) : undefined
     const summary = link
-      ? aggregate(network, childEdges(network, link), statuses, rates, live, showSpeeds)
+      ? aggregate(
+          network,
+          members.length ? members : childEdges(network, link),
+          statuses,
+          rates,
+          live,
+          showSpeeds,
+        )
       : undefined
-    const view = edgeView(network, e, statuses, rates, live)
+    const view = edgeView(network, single ?? e, statuses, rates, live)
     if (summary) view.state = summary.state
     const focused = focus.has(e.id)
     return {
@@ -623,16 +646,16 @@ export default function Topology({
       },
       zIndex: focused ? 100 : 0,
       label: summary
-        ? `${summary.label}${showWeights ? ` · Weight ${e.weight}` : ''}`
+        ? `${summary.label}${showWeights ? ` · Weight ${(single ?? e).weight}` : ''}`
         : editing
-          ? `Weight ${e.weight}`
+          ? `Weight ${(single ?? e).weight}`
           : view.state === 'Connected'
-            ? `${view.active!.transport.toUpperCase()} · ${latencyLabel(view.active)}${showSpeeds ? ` · ↑ ${rate(view.tx)} ↓ ${rate(view.rx)}` : ''}${showWeights ? ` · Weight ${e.weight}` : ''}`
+            ? `${view.active!.transport.toUpperCase()} · ${latencyLabel(view.active)}${showSpeeds ? ` · ↑ ${rate(view.tx)} ↓ ${rate(view.rx)}` : ''}${showWeights ? ` · Weight ${(single ?? e).weight}` : ''}`
             : showWeights
-              ? `${view.state} · Weight ${e.weight}`
+              ? `${view.state} · Weight ${(single ?? e).weight}`
               : view.state,
       style: {
-        stroke: focused ? '#087b66' : view.state === 'Connected' ? '#278f79' : '#91a3a0',
+        stroke: focused ? '#087b66' : '#91a3a0',
         strokeWidth: focused ? 3.5 : 1.8,
         strokeDasharray: view.state === 'Connected' ? undefined : '5 5',
       },
@@ -930,6 +953,7 @@ export default function Topology({
               <Background color="#c9d9d4" gap={22} size={1} />
               <Controls
                 showInteractive={false}
+                fitViewOptions={fitOptions}
                 onZoomIn={() => (followFit.current = false)}
                 onZoomOut={() => (followFit.current = false)}
                 onFitView={() => (followFit.current = true)}
