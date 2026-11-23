@@ -139,11 +139,7 @@ func serveController(ctx context.Context, listen, data, hosts string, insecure b
 		if err != nil {
 			return false, err
 		}
-		endpoints, err := cluster.InterfaceEndpoints(identity, listener.Addr())
-		if err != nil {
-			return false, err
-		}
-		if err = cluster.Initialize(db, app.Authority(), &identity, endpoints); err != nil {
+		if err = cluster.Initialize(db, app.Authority(), &identity, []model.ServerEndpoint{}); err != nil {
 			return false, err
 		}
 		runtime, err = app.StartCluster(identity, data)
@@ -158,7 +154,9 @@ func serveController(ctx context.Context, listen, data, hosts string, insecure b
 		}
 		carriers = controltransport.NewServer(listener, app, server.TLSConfig)
 		defer carriers.Close()
-		runtime.StartDiscovery(listener)
+		if err := runtime.PublishEndpoints(nil); err != nil {
+			slog.Warn("clear discovered server endpoints", "error", err)
+		}
 	}
 	done := make(chan error, 1)
 	go func() {
