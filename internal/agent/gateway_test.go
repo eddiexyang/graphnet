@@ -55,3 +55,49 @@ func TestDeliverDropsPacketsForAnotherNetwork(t *testing.T) {
 		t.Fatal("a packet for another network reached the TUN")
 	}
 }
+
+func TestDeliverAllowsExplicitCrossNetworkAdvertisement(t *testing.T) {
+	a, b, c := model.ID("a"), model.ID("b"), model.ID("c")
+	d := &packetTestTUN{out: make(chan []byte, 4), done: make(chan struct{})}
+	defer d.Close()
+	r := &DataPlane{}
+	r.state.Store(&runtimeState{
+		snapshot: model.Snapshot{Networks: []model.NetworkConfig{
+			{
+				ID:   a,
+				CIDR: netip.MustParsePrefix("6.6.6.0/24"),
+				Self: model.Node{
+					AdvertisedSubnets: []model.AdvertisedSubnet{
+						{Prefix: netip.MustParsePrefix("0.0.0.0/0"), GatewayMode: model.GatewaySNAT},
+						{Prefix: netip.MustParsePrefix("7.7.7.0/24"), GatewayMode: model.GatewaySNAT},
+					},
+				},
+			},
+			{ID: b, CIDR: netip.MustParsePrefix("7.7.7.0/24")},
+			{ID: c, CIDR: netip.MustParsePrefix("8.8.8.0/24")},
+		}},
+		devices: map[model.ID]*runtimeTunnel{a: newRuntimeTunnel(d)},
+		selfAddress: map[model.ID]netip.Addr{
+			a: netip.MustParseAddr("6.6.6.4"),
+			b: netip.MustParseAddr("7.7.7.13"),
+			c: netip.MustParseAddr("8.8.8.9"),
+		},
+	})
+	src := netip.MustParseAddr("6.6.6.11")
+	// Unadvertised Network C must stay blocked even with 0.0.0.0/0 advertised.
+	for _, dst := range []string{"8.8.8.1", "8.8.8.9"} {
+		if err := r.deliver(context.Background(), a, icmpTo(src, netip.MustParseAddr(dst))); !errors.Is(err, forwarding.ErrDestination) {
+			t.Fatalf("deliver to unadvertised network %s: %v, want ErrDestination", dst, err)
+		}
+	}
+	// Explicitly advertised Network B must be delivered to TUN so host NAT can forward it.
+	for _, dst := range []string{"7.7.7.2", "7.7.7.13"} {
+		if err := r.deliver(context.Background(), a, icmpTo(src, netip.MustParseAddr(dst))); err != nil {
+			t.Fatalf("deliver to explicitly advertised network %s: %v", dst, err)
+		}
+		got, _ := netip.AddrFromSlice((<-d.out)[16:20])
+		if got.String() != dst {
+			t.Fatalf("TUN received %s, want %s", got, dst)
+		}
+	}
+}

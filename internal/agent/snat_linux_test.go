@@ -205,10 +205,47 @@ func TestDialSNATIsolatesHostAndOtherNetworkRoutes(t *testing.T) {
 
 	netAID := model.ID("00000000000000000000000000000001")
 	netBID := model.ID("00000000000000000000000000000002")
+	// Bind an extra unicast IP on lo (e.g. Anycast/BGP loopback /32).
+	loExtraAddr, _ := netlink.ParseAddr("1.2.3.4/32")
+	if err := netlink.AddrAdd(lo, loExtraAddr); err != nil {
+		t.Fatal(err)
+	}
+
+	// Start local TCP listeners on WAN IP (198.51.100.1:8081), lo extra IP (1.2.3.4:8082),
+	// and Network B self IP (7.7.7.2:8083).
+	startEcho := func(addr, msg string) {
+		ln, err := net.Listen("tcp4", addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { ln.Close() })
+		go func() {
+			for {
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				_, _ = c.Write([]byte(msg))
+				_ = c.Close()
+			}
+		}()
+	}
+	startEcho("198.51.100.1:8081", "wan-self-ok")
+	startEcho("1.2.3.4:8082", "lo-vip-ok")
+	startEcho("7.7.7.2:8083", "netb-self-ok")
+
 	state := &runtimeState{
 		snapshot: model.Snapshot{
 			Networks: []model.NetworkConfig{
-				{ID: netAID, CIDR: netip.MustParsePrefix("6.6.6.0/24")},
+				{
+					ID:   netAID,
+					CIDR: netip.MustParsePrefix("6.6.6.0/24"),
+					Self: model.Node{
+						AdvertisedSubnets: []model.AdvertisedSubnet{
+							{Prefix: netip.MustParsePrefix("0.0.0.0/0"), GatewayMode: model.GatewaySNAT},
+						},
+					},
+				},
 				{ID: netBID, CIDR: netip.MustParsePrefix("7.7.7.0/24")},
 			},
 		},
@@ -235,16 +272,16 @@ func TestDialSNATIsolatesHostAndOtherNetworkRoutes(t *testing.T) {
 		name string
 		dst  string
 	}{
-		{"other network peer", "7.7.7.1:8080"},
-		{"other network self", "7.7.7.2:8080"},
+		{"other network peer via 0/0", "7.7.7.1:8080"},
+		{"other network self via 0/0", "7.7.7.2:8083"},
 		{"same network peer", "6.6.6.11:8080"},
 		{"same network self", "6.6.6.2:8080"},
 		{"static route via other TUN", "10.99.0.5:8080"},
-		{"host WAN local address", "198.51.100.1:8080"},
+		{"lo extra unicast via 0/0", "1.2.3.4:8082"},
 		{"loopback", "127.0.0.1:8080"},
 	}
 	for _, tc := range blocked {
-		conn, err := dp.dialSNAT(ctx, state, netip.MustParseAddrPort(tc.dst))
+		conn, err := dp.dialSNAT(ctx, state, netAID, netip.MustParseAddrPort(tc.dst))
 		if conn != nil {
 			conn.Close()
 		}
@@ -253,8 +290,19 @@ func TestDialSNATIsolatesHostAndOtherNetworkRoutes(t *testing.T) {
 		}
 	}
 
+	// Host WAN local address (on wan0, not lo) must be allowed even via 0.0.0.0/0 SNAT.
+	wanConn, err := dp.dialSNAT(ctx, state, netAID, netip.MustParseAddrPort("198.51.100.1:8081"))
+	if err != nil {
+		t.Fatalf("host WAN local dialSNAT failed: %v", err)
+	}
+	wanGot, err := io.ReadAll(wanConn)
+	wanConn.Close()
+	if err != nil || string(wanGot) != "wan-self-ok" {
+		t.Fatalf("host WAN local read=%q, err=%v", wanGot, err)
+	}
+
 	// External destination over dual-NIC ECMP default route must succeed.
-	conn, err := dp.dialSNAT(ctx, state, netip.MustParseAddrPort("203.0.113.10:8080"))
+	conn, err := dp.dialSNAT(ctx, state, netAID, netip.MustParseAddrPort("203.0.113.10:8080"))
 	if err != nil {
 		t.Fatalf("external ECMP dialSNAT failed: %v", err)
 	}
@@ -265,5 +313,42 @@ func TestDialSNATIsolatesHostAndOtherNetworkRoutes(t *testing.T) {
 	}
 	if err := <-serverDone; err != nil {
 		t.Fatal(err)
+	}
+
+	// Now explicitly advertise lo VIP (1.2.3.4/32) and Network B (7.7.7.0/24) in Network A.
+	state.snapshot.Networks[0].Self.AdvertisedSubnets = append(
+		state.snapshot.Networks[0].Self.AdvertisedSubnets,
+		model.AdvertisedSubnet{Prefix: netip.MustParsePrefix("1.2.3.4/32"), GatewayMode: model.GatewaySNAT},
+		model.AdvertisedSubnet{Prefix: netip.MustParsePrefix("7.7.7.0/24"), GatewayMode: model.GatewaySNAT},
+	)
+
+	loConn, err := dp.dialSNAT(ctx, state, netAID, netip.MustParseAddrPort("1.2.3.4:8082"))
+	if err != nil {
+		t.Fatalf("explicitly advertised lo VIP dialSNAT failed: %v", err)
+	}
+	loGot, err := io.ReadAll(loConn)
+	loConn.Close()
+	if err != nil || string(loGot) != "lo-vip-ok" {
+		t.Fatalf("explicitly advertised lo VIP read=%q, err=%v", loGot, err)
+	}
+
+	netBConn, err := dp.dialSNAT(ctx, state, netAID, netip.MustParseAddrPort("7.7.7.2:8083"))
+	if err != nil {
+		t.Fatalf("explicitly advertised other network self dialSNAT failed: %v", err)
+	}
+	netBGot, err := io.ReadAll(netBConn)
+	netBConn.Close()
+	if err != nil || string(netBGot) != "netb-self-ok" {
+		t.Fatalf("explicitly advertised other network self read=%q, err=%v", netBGot, err)
+	}
+
+	if err := checkSNATRoute(state, netAID, netip.MustParseAddr("7.7.7.1")); err != nil {
+		t.Fatalf("explicitly advertised other network peer checkSNATRoute failed: %v", err)
+	}
+	// Unadvertised 10.99.0.5 via tunB and standard 127.0.0.1 must remain blocked.
+	for _, dst := range []string{"10.99.0.5", "127.0.0.1", "6.6.6.11"} {
+		if err := checkSNATRoute(state, netAID, netip.MustParseAddr(dst)); !errors.Is(err, forwarding.ErrDestination) {
+			t.Fatalf("checkSNATRoute(%s) = %v, want ErrDestination", dst, err)
+		}
 	}
 }

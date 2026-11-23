@@ -340,7 +340,7 @@ func (r *DataPlane) openTCP(ctx context.Context, request streamproxy.Request, in
 		waitStreams(ctx, state, request.Network, next)
 	}
 	if local && snatDestination(state, request.Network, request.To.Addr()) {
-		return r.dialSNAT(ctx, state, request.To)
+		return r.dialSNAT(ctx, state, request.Network, request.To)
 	}
 	if local || !state.mesh.StreamsAvailable(request.Network, next) {
 		// The connection leaves the stream here: either it is delivered on this
@@ -384,14 +384,14 @@ func (r *DataPlane) openTCP(ctx context.Context, request streamproxy.Request, in
 
 // dialSNAT connects to an external SNAT destination with the host kernel's TCP
 // stack instead of the userspace access stack.
-func (r *DataPlane) dialSNAT(ctx context.Context, state *runtimeState, to netip.AddrPort) (streamproxy.Conn, error) {
+func (r *DataPlane) dialSNAT(ctx context.Context, state *runtimeState, netID model.ID, to netip.AddrPort) (streamproxy.Conn, error) {
 	network := "tcp4"
 	if to.Addr().Is6() {
 		network = "tcp6"
 	}
 	dial := r.options.snatDial
 	if dial == nil {
-		if err := checkSNATRoute(state, to.Addr()); err != nil {
+		if err := checkSNATRoute(state, netID, to.Addr()); err != nil {
 			return nil, err
 		}
 		var d net.Dialer
@@ -413,7 +413,7 @@ func (r *DataPlane) dialSNAT(ctx context.Context, state *runtimeState, to netip.
 				local = ap.Addr().Unmap()
 			}
 		}
-		if !local.IsValid() || local.IsLoopback() || ownedSelfAddress(state, local) {
+		if !allowedSNATLocalAddr(state, netID, local, to.Addr()) {
 			if tcp, ok := conn.(interface{ SetLinger(int) error }); ok {
 				_ = tcp.SetLinger(0)
 			}

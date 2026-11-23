@@ -25,33 +25,69 @@ func gatewayEntries(state *runtimeState) []gateway.Entry {
 	return entries
 }
 
+// matchedAdvertisedSubnet returns the longest-prefix AdvertisedSubnet on
+// network's Self node that contains addr (excluding network's own overlay CIDR).
+func matchedAdvertisedSubnet(state *runtimeState, network model.ID, addr netip.Addr) (model.AdvertisedSubnet, bool) {
+	if state == nil || !addr.IsGlobalUnicast() {
+		return model.AdvertisedSubnet{}, false
+	}
+	for _, n := range state.snapshot.Networks {
+		if n.ID != network || n.CIDR.Contains(addr) {
+			continue
+		}
+		bestBits := -1
+		var best model.AdvertisedSubnet
+		for _, s := range n.Self.AdvertisedSubnets {
+			if s.Prefix.Contains(addr) && s.Prefix.Bits() > bestBits {
+				bestBits = s.Prefix.Bits()
+				best = s
+			}
+		}
+		if bestBits >= 0 {
+			return best, true
+		}
+		return model.AdvertisedSubnet{}, false
+	}
+	return model.AdvertisedSubnet{}, false
+}
+
+// explicitCrossNetwork reports whether network explicitly advertised a prefix
+// at least as specific as targetNet's CIDR covering addr (so broad routes such
+// as 0.0.0.0/0 never cross between networks, while an explicit advertisement
+// of another network's CIDR or subnet does).
+func explicitCrossNetwork(state *runtimeState, network, targetNet model.ID, addr netip.Addr) bool {
+	if state == nil || network == targetNet {
+		return false
+	}
+	best, ok := matchedAdvertisedSubnet(state, network, addr)
+	if !ok || best.Prefix.Bits() == 0 {
+		return false
+	}
+	for _, n := range state.snapshot.Networks {
+		if n.ID == targetNet {
+			return best.Prefix.Bits() >= n.CIDR.Bits() && n.CIDR.Contains(best.Prefix.Addr())
+		}
+	}
+	return false
+}
+
 // snatDestination reports whether addr matches an advertised subnet of this
 // Node whose longest matching prefix in network uses SNAT gateway mode.
 func snatDestination(state *runtimeState, network model.ID, addr netip.Addr) bool {
 	if state == nil || !addr.IsGlobalUnicast() {
 		return false
 	}
-	for _, n := range state.snapshot.Networks {
-		device := state.devices[n.ID]
-		if n.ID != network || device == nil || device.failure.Load() != nil || n.CIDR.Contains(addr) {
-			continue
-		}
-		bestBits := -1
-		mode := model.GatewayOff
-		for _, s := range n.Self.AdvertisedSubnets {
-			if s.Prefix.Contains(addr) && s.Prefix.Bits() > bestBits {
-				bestBits = s.Prefix.Bits()
-				mode = s.GatewayMode
-			}
-		}
-		return mode == model.GatewaySNAT
+	device := state.devices[network]
+	if device == nil || device.failure.Load() != nil {
+		return false
 	}
-	return false
+	best, ok := matchedAdvertisedSubnet(state, network, addr)
+	return ok && best.GatewayMode == model.GatewaySNAT
 }
 
 // crossNetwork reports whether a packet delivered from network is addressed to
-// another network this Agent belongs to. The kernel would route it from one TUN
-// into the other, so a gateway never hands such packets to the host.
+// another network this Agent belongs to without an explicit advertisement of
+// that target network's prefix.
 func crossNetwork(state *runtimeState, network model.ID, raw []byte) bool {
 	info, err := packet.InspectAddresses(raw)
 	if err != nil {
@@ -59,21 +95,30 @@ func crossNetwork(state *runtimeState, network model.ID, raw []byte) bool {
 	}
 	for _, n := range state.snapshot.Networks {
 		if n.ID != network && n.CIDR.Contains(info.Destination) {
-			return true
+			return !explicitCrossNetwork(state, network, n.ID, info.Destination)
 		}
 	}
 	return false
 }
 
-func ownedSelfAddress(state *runtimeState, addr netip.Addr) bool {
-	if state == nil || !addr.IsValid() {
+func allowedSNATLocalAddr(state *runtimeState, network model.ID, local, dst netip.Addr) bool {
+	if state == nil || !local.IsValid() {
 		return false
 	}
-	addr = addr.Unmap()
-	for _, self := range state.selfAddress {
-		if self == addr {
-			return true
+	local = local.Unmap()
+	if local.IsLoopback() {
+		return false
+	}
+	for id, self := range state.selfAddress {
+		if self != local {
+			continue
+		}
+		if id == network {
+			return false
+		}
+		if !explicitCrossNetwork(state, network, id, dst) {
+			return false
 		}
 	}
-	return false
+	return true
 }

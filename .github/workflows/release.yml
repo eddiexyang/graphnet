@@ -16,8 +16,28 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  test:
+    name: Test
+    if: ${{ !github.event.deleted }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: .go-version
+      - name: Run Go tests
+        run: go test -count=1 ./...
+      - name: Run privileged Linux SNAT netns tests
+        run: sudo -E env "PATH=$PATH" go test -v -count=1 ./internal/agent -run 'TestDialSNAT|TestDeliver'
+      - name: Check non-Linux build
+        run: GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build ./client ./cmd/graphnet
+
   release:
     name: Build Linux releases
+    needs: test
     if: ${{ !github.event.deleted }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
