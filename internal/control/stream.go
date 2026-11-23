@@ -349,7 +349,7 @@ func validateReport(snapshot model.Snapshot, report model.AgentReport) error {
 			return errors.New("invalid link metrics")
 		}
 		if link.Active {
-			if active[key] || !link.Healthy {
+			if active[key] || (!link.Healthy && !link.Unhealthy) {
 				return errors.New("invalid active link")
 			}
 			active[key] = true
@@ -472,7 +472,7 @@ func (s *Server) telemetry(state model.State) []model.AgentStatus {
 				continue
 			}
 			if !status.Connected {
-				link.Healthy, link.Active = false, false
+				link.Healthy, link.Unhealthy, link.Active = false, false, false
 			}
 			links = append(links, link)
 		}
