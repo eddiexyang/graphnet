@@ -235,6 +235,7 @@ func (m *mux) newStreamLocked(id uint64, windowed bool) *muxStream {
 }
 
 // StreamsReady is called once per Link, possibly with the group lock held.
+// A Link only becomes current once Healthy() confirms liveness and size probes.
 func (m *mux) StreamsReady(l *link.Link) {
 	m.mu.Lock()
 	if m.closed {
@@ -243,7 +244,7 @@ func (m *mux) StreamsReady(l *link.Link) {
 	}
 	m.ready[l] = true
 	switched := false
-	if m.current == nil || !m.current.Healthy() {
+	if l.Healthy() && (m.current == nil || !m.current.Healthy()) {
 		m.switchLocked(l)
 		switched = true
 	}
@@ -255,6 +256,23 @@ func (m *mux) StreamsReady(l *link.Link) {
 		<-l.Done()
 		m.linkDone(l)
 	}()
+}
+
+// LinkHealthy is called when a stream-capable Link becomes healthy or recovers.
+func (m *mux) LinkHealthy(l *link.Link) {
+	m.mu.Lock()
+	switched := false
+	if !m.closed && m.ready[l] && l.Healthy() && (m.current == nil || !m.current.Healthy()) {
+		m.switchLocked(l)
+		switched = true
+	}
+	m.mu.Unlock()
+	if switched {
+		l.WakeStreams()
+	}
+	if m.g != nil {
+		m.g.wakeSchedule()
+	}
 }
 
 func (m *mux) linkDone(l *link.Link) {

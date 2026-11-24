@@ -912,3 +912,149 @@ func TestMuxRelayForwardsReceivedBuffers(t *testing.T) {
 		t.Fatalf("forwarding allocates %v times per frame", allocs)
 	}
 }
+
+type mtuDropChannel struct {
+	*memChannel
+	maxSize int
+}
+
+func (c *mtuDropChannel) Send(ctx context.Context, raw []byte) error {
+	if len(raw) >= c.maxSize {
+		return nil
+	}
+	return c.memChannel.Send(ctx, raw)
+}
+
+func TestMuxRejectsLinkWithFailingSizeProbe(t *testing.T) {
+	p := newMuxPair(t)
+	ca, cb := memChannelPair()
+	info := func(peer int) link.Info {
+		return link.Info{NetworkID: testutil.ID(1), EdgeID: testutil.ID(2), PeerID: testutil.ID(peer), CandidateID: ca.id, Transport: model.TCP}
+	}
+	oa, ob := linkOptions, linkOptions
+	oa.Streams, oa.SizeProbe, oa.Resume = p.a, true, true
+	ob.Accepted, ob.Streams, ob.StreamHello, ob.SizeProbe, ob.SizeProbeHello, ob.Resume = true, p.b, true, true, true, true
+
+	la, err := link.New(p.ctx, &mtuDropChannel{memChannel: ca, maxSize: 1500}, info(3), oa)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lb, err := link.New(p.ctx, &mtuDropChannel{memChannel: cb, maxSize: 1500}, info(4), ob)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { la.Close(); lb.Close() })
+
+	// streamHello and resumeHello arrive (both < 1500B), so la enters ready,
+	// yet 2048B sizeProbe never completes so la must NEVER become mux.current.
+	waitFor(t, "streamHello", func() bool {
+		p.a.mu.Lock()
+		defer p.a.mu.Unlock()
+		return p.a.ready[la]
+	})
+	if !la.Resume() {
+		t.Fatal("resumeHello did not precede streamHello")
+	}
+	for range 10 {
+		p.a.maintain()
+		p.b.maintain()
+		if p.a.Available() || p.b.Available() {
+			t.Fatal("link with failing 2048B size probe became mux.current")
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+}
+
+func TestMuxResumableImmediatelyOnStreamsAvailable(t *testing.T) {
+	p := newMuxPair(t)
+	ca, cb := memChannelPair()
+	info := func(peer int) link.Info {
+		return link.Info{NetworkID: testutil.ID(1), EdgeID: testutil.ID(2), PeerID: testutil.ID(peer), CandidateID: ca.id, Transport: model.TCP}
+	}
+	oa, ob := linkOptions, linkOptions
+	oa.Streams, oa.SizeProbe, oa.Resume = p.a, true, true
+	ob.Accepted, ob.Streams, ob.StreamHello, ob.SizeProbe, ob.SizeProbeHello, ob.Resume = true, p.b, true, true, true, true
+
+	la, err := link.New(p.ctx, ca, info(3), oa)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lb, err := link.New(p.ctx, cb, info(4), ob)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { la.Close(); lb.Close() })
+
+	for !p.a.Available() {
+		time.Sleep(time.Millisecond)
+	}
+	if !p.a.Resumable() {
+		t.Fatal("Available() became true before Resumable()")
+	}
+}
+
+func TestTCPBackedIgnoresUnhealthyBackupWhenUDPActive(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	edgeA := link.NewCoordinatedEdge(testutil.ID(3), testutil.ID(4), "")
+	edgeB := link.NewCoordinatedEdge(testutil.ID(4), testutil.ID(3), "")
+	g := &group{ctx: ctx, edge: edgeA, links: map[string]*link.Link{}}
+	g.mux = newMux(g, true, func(s *muxStream) { s.Abort() })
+
+	// Bring up a healthy UDP link as active on the Edge.
+	udpA, udpB := memChannelPair()
+	uOpts := linkOptions
+	luA, err := link.New(ctx, udpA, link.Info{NetworkID: testutil.ID(1), EdgeID: testutil.ID(2), PeerID: testutil.ID(4), CandidateID: "udp", Transport: model.UDP}, uOpts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	luB, err := link.New(ctx, udpB, link.Info{NetworkID: testutil.ID(1), EdgeID: testutil.ID(2), PeerID: testutil.ID(3), CandidateID: "udp", Transport: model.UDP}, uOpts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer luA.Close()
+	defer luB.Close()
+	edgeA.Add(luA)
+	edgeB.Add(luB)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case m := <-luA.Selections():
+				edgeA.HandleSelection(luA, m)
+			case m := <-luB.Selections():
+				edgeB.HandleSelection(luB, m)
+			}
+		}
+	}()
+	waitFor(t, "udp healthy", func() bool { return luA.Healthy() && luB.Healthy() })
+	edgeA.Tick()
+	edgeB.Tick()
+	waitFor(t, "udp active", func() bool { return edgeA.Active() == luA })
+
+	// Add a TCP link whose 2048B size probe never completes.
+	tcpA, tcpB := memChannelPair()
+	tOptsA, tOptsB := linkOptions, linkOptions
+	tOptsA.Streams, tOptsA.SizeProbe = g.mux, true
+	tOptsB.Accepted, tOptsB.Streams, tOptsB.StreamHello, tOptsB.SizeProbe, tOptsB.SizeProbeHello = true, newMux(&group{ctx: ctx}, false, func(s *muxStream) { s.Abort() }), true, true, true
+	ltA, err := link.New(ctx, &mtuDropChannel{memChannel: tcpA, maxSize: 1500}, link.Info{NetworkID: testutil.ID(1), EdgeID: testutil.ID(2), PeerID: testutil.ID(4), CandidateID: "tcp", Transport: model.TCP}, tOptsA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ltB, err := link.New(ctx, &mtuDropChannel{memChannel: tcpB, maxSize: 1500}, link.Info{NetworkID: testutil.ID(1), EdgeID: testutil.ID(2), PeerID: testutil.ID(3), CandidateID: "tcp", Transport: model.TCP}, tOptsB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ltA.Close()
+	defer ltB.Close()
+	g.links[ltA.ID()] = ltA
+	edgeA.Add(ltA)
+
+	if g.mux.Available() {
+		t.Fatal("blackholed TCP link became mux.Available")
+	}
+	if g.tcpBacked() {
+		t.Fatal("unhealthy backup TCP link marked Edge tcpBacked while healthy UDP link is active")
+	}
+}

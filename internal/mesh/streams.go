@@ -60,10 +60,13 @@ func (m *Mesh) StreamCarrier(network, remote model.ID) bool {
 	return g != nil && (g.mux.Available() || g.tcpBacked())
 }
 
-// tcpBacked reports whether the Edge has a TCP-backed Link.
+// tcpBacked reports whether the Edge carries TCP as streams rather than packets.
 func (g *group) tcpBacked() bool {
 	if g.edge.ActiveTCPBacked() {
 		return true
+	}
+	if g.edge.Active() != nil {
+		return false
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()

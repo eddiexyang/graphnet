@@ -114,6 +114,7 @@ func (l *Link) receiveSizeProbeReply(raw []byte, now time.Time) bool {
 	l.mu.Unlock()
 	if recovered {
 		slog.Info("link recovered", l.logAttrs("probe_bytes", sizeProbeBytes)...)
+		l.notifyStreamsHealthy()
 	}
 	if first {
 		l.logUp("rtt_ms", rtt.Milliseconds(), "probe_bytes", sizeProbeBytes)

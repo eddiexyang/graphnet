@@ -284,14 +284,16 @@ func New(parent context.Context, channel Channel, info Info, options Options) (*
 		l.control <- []byte{windowHelloMessage, 1}
 		l.windows.Store(true)
 	}
-	if options.Streams != nil && options.StreamHello && l.tcpBacked() {
-		// The queue is empty here, so the announcement precedes every stream frame.
-		l.control <- []byte{streamHelloMessage, 1}
-		l.streamsReady.Store(true)
-	}
 	if options.Resume && options.Accepted {
+		// Before the streams' announcement: the dialer knows resumable
+		// sessions are supported before StreamsReady exposes the Link.
 		l.control <- []byte{resumeHelloMessage, 1}
 		l.resume.Store(true)
+	}
+	if options.Streams != nil && options.StreamHello && l.tcpBacked() {
+		// Prior capability hellos precede streamHello, which precedes every stream frame.
+		l.control <- []byte{streamHelloMessage, 1}
+		l.streamsReady.Store(true)
 	}
 	if options.LinkState != nil && options.LinkStateHello {
 		l.control <- []byte{linkStateHelloMessage, 1}
@@ -1130,6 +1132,7 @@ func (l *Link) receivePing(nonce, confirmed uint64, now time.Time) bool {
 	}
 	if recovered {
 		slog.Info("link recovered", l.logAttrs()...)
+		l.notifyStreamsHealthy()
 	}
 	return true
 }
@@ -1155,6 +1158,7 @@ func (l *Link) recordPong(nonce uint64, now time.Time) {
 	l.mu.Unlock()
 	if recovered {
 		slog.Info("link recovered", l.logAttrs("rtt_ms", sample.Milliseconds())...)
+		l.notifyStreamsHealthy()
 	}
 	// Log outside the lock so probing and selection are not delayed.
 	if first {
@@ -1169,6 +1173,15 @@ func (l *Link) logUp(attrs ...any) {
 		slog.Info("link up", l.logAttrs(attrs...)...)
 		if up := l.up.Load(); up != nil {
 			(*up)()
+		}
+		l.notifyStreamsHealthy()
+	}
+}
+
+func (l *Link) notifyStreamsHealthy() {
+	if l.streamsReady.Load() {
+		if sh, ok := l.options.Streams.(interface{ LinkHealthy(*Link) }); ok {
+			sh.LinkHealthy(l)
 		}
 	}
 }
