@@ -152,6 +152,9 @@ func serveController(ctx context.Context, listen, data, hosts string, insecure b
 		APIToken:        os.Getenv("GRAPHNET_API_TOKEN"),
 		GeoIPDirectory:  filepath.Join(data, "geoip"),
 		UpdateDirectory: filepath.Join(data, "updates"),
+		// Agent binaries ship beside the web UI, as assets/agent/<version>/
+		// under the working directory (the image's /usr/local/share/graphnet).
+		AgentAssetDirectory: agentAssetDirectory(),
 	})
 	if err != nil {
 		return false, err
@@ -244,4 +247,12 @@ func serveController(ctx context.Context, listen, data, hosts string, insecure b
 		return reload, nil
 	}
 	return false, err
+}
+
+func agentAssetDirectory() string {
+	directory, err := filepath.Abs(filepath.Join("assets", "agent"))
+	if err != nil {
+		return ""
+	}
+	return directory
 }

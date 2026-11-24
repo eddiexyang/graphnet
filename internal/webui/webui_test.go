@@ -33,7 +33,7 @@ func TestStaticFiles(t *testing.T) {
 	}
 	assetPath := "/assets/" + entries[0].Name()
 
-	handler := Handler()
+	handler := Handler(filepath.Join(directory, "assets", "agent"))
 	for _, tc := range []struct {
 		method, path, rangeHeader string
 		status                    int
@@ -64,5 +64,59 @@ func TestStaticFiles(t *testing.T) {
 				t.Fatalf("unexpected root HTML: %q", response.Body.String())
 			}
 		})
+	}
+}
+
+// The controller distributes Agent binaries from its asset directory; nothing
+// else there or around it is reachable through that path.
+func TestAgentBinaries(t *testing.T) {
+	directory := t.TempDir()
+	agents := filepath.Join(directory, "agent")
+	release := filepath.Join(agents, "sha-0123")
+	if err := os.MkdirAll(release, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(release, "linux-amd64"), []byte("0123456789"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "secret"), []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Symlink(filepath.Join(directory, "secret"), filepath.Join(release, "linux-arm64"))
+	_ = os.Symlink(release, filepath.Join(agents, "sha-link"))
+
+	handler := Handler(agents)
+	for _, tc := range []struct {
+		method, path, rangeHeader string
+		status                    int
+		body                      string
+	}{
+		{"GET", "/assets/agent/sha-0123/linux-amd64", "", 200, "0123456789"},
+		{"HEAD", "/assets/agent/sha-0123/linux-amd64", "", 200, ""},
+		{"GET", "/assets/agent/sha-0123/linux-amd64", "bytes=2-4", 206, "234"},
+		{"GET", "/assets/agent/sha-0123/linux-arm64", "", 404, ""},
+		{"GET", "/assets/agent/sha-link/linux-amd64", "", 404, ""},
+		{"GET", "/assets/agent/sha-0123/", "", 404, ""},
+		{"GET", "/assets/agent/sha-0123", "", 404, ""},
+		{"GET", "/assets/agent/../secret", "", 404, ""},
+		{"GET", "/assets/agent/sha-0123/..%2f..%2fsecret", "", 404, ""},
+		{"GET", "/assets/agent/../agent/sha-0123/linux-amd64", "", 404, ""},
+		{"GET", "/assets/agent/missing/linux-amd64", "", 404, ""},
+	} {
+		req := httptest.NewRequest(tc.method, tc.path, nil)
+		if tc.rangeHeader != "" {
+			req.Header.Set("Range", tc.rangeHeader)
+		}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != tc.status || tc.body != "" && rec.Body.String() != tc.body {
+			t.Errorf("%s %s: %d %q, want %d %q", tc.method, tc.path, rec.Code, rec.Body.String(), tc.status, tc.body)
+		}
+	}
+	if rec := httptest.NewRecorder(); true {
+		Handler("").ServeHTTP(rec, httptest.NewRequest("GET", "/assets/agent/sha-0123/linux-amd64", nil))
+		if rec.Code != 404 {
+			t.Errorf("served a binary without an asset directory: %d", rec.Code)
+		}
 	}
 }

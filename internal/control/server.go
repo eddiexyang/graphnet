@@ -63,6 +63,9 @@ type Options struct {
 	APIToken        string
 	Logger          *slog.Logger
 	GeoIPDirectory  string
+	// AgentAssetDirectory holds the Agent binaries served at
+	// /assets/agent/<version>/<os>-<arch>. Empty serves none.
+	AgentAssetDirectory string
 }
 
 func New(db *store.Store, options Options) (*Server, error) {
@@ -126,7 +129,7 @@ func New(db *store.Store, options Options) (*Server, error) {
 	s.mux.HandleFunc("POST "+model.AgentRenewPath, s.renewAgentCertificate)
 	s.mux.HandleFunc("GET /api/v1/telemetry", auth.require(s.getTelemetry))
 	s.mux.HandleFunc("GET /api/v1/events", auth.require(s.events))
-	s.mux.Handle("GET /", webui.Handler())
+	s.mux.Handle("GET /", webui.Handler(options.AgentAssetDirectory))
 	return s, nil
 }
 func (s *Server) Authority() *pki.Authority { return s.ca }
