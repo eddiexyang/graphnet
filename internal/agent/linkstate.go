@@ -13,6 +13,7 @@ import (
 func (r *DataPlane) newLinkState() *linkstate.Engine {
 	r.damper = newEdgeDamper()
 	return linkstate.New(linkstate.Callbacks{
+		Identity: r.identity,
 		Send: func(network, peer model.ID, raw []byte) {
 			if state := r.state.Load(); state != nil {
 				state.mesh.SendLinkState(network, peer, raw)

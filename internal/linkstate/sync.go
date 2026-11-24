@@ -49,8 +49,15 @@ func (n *network) supportsSync() bool {
 }
 
 func componentMembers(config model.NetworkConfig) []model.ID {
+	clients := map[model.ID]bool{}
+	for _, d := range config.Directory {
+		clients[d.NodeID] = d.Client
+	}
 	adjacent := map[model.ID][]model.ID{}
 	for _, edge := range config.Topology {
+		if clients[edge.A] && clients[edge.B] {
+			continue
+		}
 		adjacent[edge.A] = append(adjacent[edge.A], edge.B)
 		adjacent[edge.B] = append(adjacent[edge.B], edge.A)
 	}
@@ -60,6 +67,9 @@ func componentMembers(config model.NetworkConfig) []model.ID {
 	for len(queue) > 0 {
 		node := queue[0]
 		queue = queue[1:]
+		if node != config.Self.ID && clients[node] {
+			continue
+		}
 		for _, peer := range adjacent[node] {
 			if seen[peer] {
 				continue
@@ -165,12 +175,15 @@ func (e *Engine) receiveSync(networkID, peer model.ID, raw []byte) error {
 			return errors.New("oversized link-state inventory")
 		}
 		for id := range m.Sequences {
-			if !n.known(id) || id <= m.After || m.Through != "" && id > m.Through {
+			if !n.known(id) || n.isClient(peer) && id != peer && id != n.config.Self.ID || id <= m.After || m.Through != "" && id > m.Through {
 				e.mu.Unlock()
 				return errors.New("unknown link-state inventory origin")
 			}
 		}
 		for id, record := range n.records(now) {
+			if n.config.Self.Client && id != n.config.Self.ID {
+				continue
+			}
 			if id > m.After && (m.Through == "" || id <= m.Through) && record.Sequence > m.Sequences[id] {
 				encoded, _ := json.Marshal(record)
 				out = append(out, encoded)

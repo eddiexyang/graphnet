@@ -4,8 +4,11 @@ package linkstate
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"math"
 	"slices"
 	"sync"
 	"time"
@@ -44,15 +47,49 @@ type LSA struct {
 	Up       []model.ID `json:"up"`
 	// Fallback lists unhealthy edges: usable only to reach destinations that
 	// no Up edge reaches. Agents without it read them as down.
-	Fallback []model.ID `json:"fallback,omitempty"`
-	Sync     bool       `json:"sync,omitempty"`
-	AgeMS    int64      `json:"age_ms,omitempty"`
+	Fallback  []model.ID `json:"fallback,omitempty"`
+	Signature []byte     `json:"sig,omitempty"`
+	Sync      bool       `json:"sync,omitempty"`
+	AgeMS     int64      `json:"age_ms,omitempty"`
+}
+
+func (l LSA) SignBytes() []byte {
+	var buf []byte
+	buf = append(buf, "graphnet lsa v1\n"...)
+	buf = append(buf, l.Network...)
+	buf = append(buf, '\n')
+	buf = append(buf, l.Origin...)
+	buf = append(buf, '\n')
+	buf = binary.BigEndian.AppendUint64(buf, l.Revision)
+	buf = binary.BigEndian.AppendUint64(buf, l.Sequence)
+	buf = binary.BigEndian.AppendUint32(buf, uint32(len(l.Up)))
+	for _, id := range l.Up {
+		buf = append(buf, id...)
+		buf = append(buf, '\n')
+	}
+	buf = binary.BigEndian.AppendUint32(buf, uint32(len(l.Fallback)))
+	for _, id := range l.Fallback {
+		buf = append(buf, id...)
+		buf = append(buf, '\n')
+	}
+	return buf
+}
+
+func (l *LSA) Sign(key ed25519.PrivateKey) {
+	if len(key) == ed25519.PrivateKeySize {
+		l.Signature = ed25519.Sign(key, l.SignBytes())
+	}
+}
+
+func (l LSA) Verify(pub ed25519.PublicKey) bool {
+	return len(pub) == ed25519.PublicKeySize && len(l.Signature) == ed25519.SignatureSize && ed25519.Verify(pub, l.SignBytes(), l.Signature)
 }
 
 // Callbacks connect the engine to an Agent. Send is best effort: periodic
 // refresh repairs a lost advertisement.
 type Callbacks struct {
-	Send func(network, peer model.ID, raw []byte)
+	Identity ed25519.PrivateKey
+	Send     func(network, peer model.ID, raw []byte)
 	// Local returns up and fallback edges from the same observation.
 	Local func() (up, fallback map[model.ID]map[model.ID]bool) // network -> edge
 	Apply func(model.RouteUpdate) error
@@ -192,7 +229,10 @@ func (e *Engine) PeerReady(networkID, peer model.ID) {
 	n := e.networks[networkID]
 	var out [][]byte
 	if n != nil && n.neighbors[peer] {
-		for _, record := range n.records(e.cb.Now()) {
+		for id, record := range n.records(e.cb.Now()) {
+			if n.config.Self.Client && id != n.config.Self.ID {
+				continue
+			}
 			if raw, err := json.Marshal(record); err == nil {
 				out = append(out, raw)
 			}
@@ -226,18 +266,36 @@ func (e *Engine) Receive(networkID, peer model.ID, raw []byte) error {
 	e.stats.Received.Add(1)
 	e.mu.Lock()
 	n := e.networks[networkID]
-	if n == nil || lsa.Network != networkID || !n.neighbors[peer] || !n.known(lsa.Origin) {
+	if n == nil || lsa.Network != networkID || !n.neighbors[peer] {
 		e.mu.Unlock()
 		e.stats.Rejected.Add(1)
 		return errors.New("link-state advertisement for an unknown network or node")
 	}
+	dest, ok := n.directoryEntry(lsa.Origin)
+	if !ok || n.isClient(peer) && lsa.Origin != peer {
+		e.mu.Unlock()
+		e.stats.Rejected.Add(1)
+		return errors.New("link-state advertisement for an unknown or unauthorized origin")
+	}
 	if lsa.AgeMS < 0 || lsa.AgeMS >= lsa.maxAge().Milliseconds() {
 		e.mu.Unlock()
+		e.stats.Rejected.Add(1)
 		return errors.New("expired link-state advertisement")
 	}
+	now := e.cb.Now()
+	maxSeq := uint64(max(int64(0), now.Add(lsa.maxAge()).UnixNano()))
+	if lsa.Sequence == 0 || lsa.Sequence == math.MaxUint64 || lsa.Sequence > maxSeq {
+		e.mu.Unlock()
+		e.stats.Rejected.Add(1)
+		return errors.New("invalid link-state sequence")
+	}
+	if !lsa.Verify(dest.PublicKey) {
+		e.mu.Unlock()
+		e.stats.Rejected.Add(1)
+		return errors.New("invalid link-state signature")
+	}
 	if lsa.Origin == n.config.Self.ID {
-		// Our own advertisement from before a restart: continue above it.
-		// The current one returns through the flood and is ignored.
+		// Our own signed advertisement from before a restart: continue above it.
 		if lsa.Sequence > n.sequence {
 			n.sequence = lsa.Sequence
 			n.dirty = true
@@ -250,22 +308,28 @@ func (e *Engine) Receive(networkID, peer model.ID, raw []byte) error {
 		e.stats.Duplicate.Add(1)
 		return nil
 	}
+	incident := n.incidentEdges(lsa.Origin)
 	up := map[model.ID]bool{}
 	for _, id := range lsa.Up {
-		up[id] = true
+		if incident[id] {
+			up[id] = true
+		}
 	}
 	fallback := map[model.ID]bool{}
 	for _, id := range lsa.Fallback {
-		if !up[id] {
+		if incident[id] && !up[id] {
 			fallback[id] = true
 		}
 	}
 	if old, ok := n.db[lsa.Origin]; !ok || !slices.Equal(old.lsa.Up, lsa.Up) || !slices.Equal(old.lsa.Fallback, lsa.Fallback) {
 		e.eventLocked("received", networkID, lsa.Origin, "", lsa.Sequence)
 	}
-	n.db[lsa.Origin] = entry{lsa: lsa, up: up, fallback: fallback, arrived: e.cb.Now().Add(-time.Duration(lsa.AgeMS) * time.Millisecond)}
+	n.db[lsa.Origin] = entry{lsa: lsa, up: up, fallback: fallback, arrived: now.Add(-time.Duration(lsa.AgeMS) * time.Millisecond)}
 	e.scheduleSPFLocked()
-	targets := n.floodTargets(peer)
+	var targets []model.ID
+	if !n.config.Self.Client {
+		targets = n.floodTargets(peer)
+	}
 	e.mu.Unlock()
 	for _, t := range targets {
 		e.stats.Sent.Add(1)
@@ -274,16 +338,48 @@ func (e *Engine) Receive(networkID, peer model.ID, raw []byte) error {
 	return nil
 }
 
+func (n *network) directoryEntry(node model.ID) (model.Destination, bool) {
+	for _, d := range n.config.Directory {
+		if d.NodeID == node {
+			return d, true
+		}
+	}
+	return model.Destination{}, false
+}
+
+func (n *network) isClient(node model.ID) bool {
+	if node == n.config.Self.ID {
+		return n.config.Self.Client
+	}
+	d, ok := n.directoryEntry(node)
+	return ok && d.Client
+}
+
+func (n *network) incidentEdges(origin model.ID) map[model.ID]bool {
+	allowed := map[model.ID]bool{}
+	originClient := n.isClient(origin)
+	for _, edge := range n.config.Topology {
+		if edge.A != origin && edge.B != origin {
+			continue
+		}
+		other := edge.B
+		if edge.B == origin {
+			other = edge.A
+		}
+		if originClient && n.isClient(other) {
+			continue
+		}
+		allowed[edge.ID] = true
+	}
+	return allowed
+}
+
 func (n *network) known(node model.ID) bool {
 	if node == n.config.Self.ID {
 		return true
 	}
-	for _, d := range n.config.Directory {
-		if d.NodeID == node {
-			return true
-		}
-	}
-	return false
+	_, ok := n.directoryEntry(node)
+	return ok
 }
 
 func (n *network) floodTargets(except model.ID) []model.ID {
@@ -386,7 +482,7 @@ func (e *Engine) Step() {
 			interval = RefreshInterval
 		}
 		if (n.dirty && now.Sub(n.sent) >= MinOriginateInterval) || now.Sub(n.sent) >= interval {
-			lsa := n.originate(e.snapshot.Revision, now)
+			lsa := n.originate(e.snapshot.Revision, now, e.cb.Identity)
 			if raw, err := json.Marshal(lsa); err == nil {
 				sends = append(sends, send{id, n.floodTargets(""), raw, false})
 			}
@@ -429,24 +525,34 @@ func (e *Engine) Step() {
 	}
 }
 
-func (n *network) originate(revision uint64, now time.Time) LSA {
-	n.sequence = max(n.sequence+1, uint64(now.UnixNano()))
+func (n *network) originate(revision uint64, now time.Time, identity ed25519.PrivateKey) LSA {
+	next := uint64(max(int64(1), now.UnixNano()))
+	if n.sequence >= next {
+		if n.sequence < math.MaxUint64-1 {
+			next = n.sequence + 1
+		} else {
+			next = math.MaxUint64 - 1
+		}
+	}
+	n.sequence = next
 	n.sent, n.dirty = now, false
+	incident := n.incidentEdges(n.config.Self.ID)
 	up := []model.ID{}
 	for id, ok := range n.local {
-		if ok {
+		if ok && incident[id] {
 			up = append(up, id)
 		}
 	}
 	slices.Sort(up)
 	var fallback []model.ID
 	for id, ok := range n.fallback {
-		if ok && !n.local[id] {
+		if ok && !n.local[id] && incident[id] {
 			fallback = append(fallback, id)
 		}
 	}
 	slices.Sort(fallback)
 	lsa := LSA{Network: n.config.ID, Origin: n.config.Self.ID, Revision: revision, Sequence: n.sequence, Up: up, Fallback: fallback, Sync: true}
+	lsa.Sign(identity)
 	n.self = &lsa
 	return lsa
 }
@@ -484,6 +590,9 @@ func (n *network) fallbackUsable(edge model.TopologyEdge) bool {
 // An endpoint that has not advertised defers to the other end. With no
 // report from either end, the edge keeps its configured state.
 func (n *network) edgeUsable(edge model.TopologyEdge, allowFallback bool) bool {
+	if n.isClient(edge.A) && n.isClient(edge.B) {
+		return false
+	}
 	permits := func(node model.ID) bool {
 		if node == n.config.Self.ID {
 			return n.local[edge.ID] || allowFallback && n.fallback[edge.ID]

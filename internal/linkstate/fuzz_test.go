@@ -1,6 +1,8 @@
 package linkstate
 
 import (
+	"crypto/ed25519"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -18,13 +20,21 @@ func FuzzReceive(f *testing.F) {
 	if err != nil {
 		f.Fatal(err)
 	}
+	seed0, seed1 := make([]byte, ed25519.SeedSize), make([]byte, ed25519.SeedSize)
+	seed0[0], seed1[0] = 1, 2
+	key0, key1 := ed25519.NewKeyFromSeed(seed0), ed25519.NewKeyFromSeed(seed1)
 	e := New(Callbacks{
-		Now:   time.Now,
-		Send:  func(model.ID, model.ID, []byte) {},
-		Local: func() (map[model.ID]map[model.ID]bool, map[model.ID]map[model.ID]bool) { return nil, nil },
-		Apply: func(model.RouteUpdate) error { return nil },
+		Identity: key1,
+		Now:      time.Now,
+		Send:     func(model.ID, model.ID, []byte) {},
+		Local:    func() (map[model.ID]map[model.ID]bool, map[model.ID]map[model.ID]bool) { return nil, nil },
+		Apply:    func(model.RouteUpdate) error { return nil },
 	})
 	e.Configure(snapshot)
+	valid := LSA{Network: n.ID, Origin: n.Nodes[0].ID, Revision: snapshot.Revision, Sequence: uint64(time.Now().UnixNano()), Sync: true}
+	valid.Sign(key0)
+	signedRaw, _ := json.Marshal(valid)
+	f.Add(signedRaw)
 	f.Add([]byte(`{"kind":"lsa"}`))
 	f.Add([]byte(`{"kind":"hello","network":"` + string(n.ID) + `"}`))
 	f.Fuzz(func(t *testing.T, raw []byte) {

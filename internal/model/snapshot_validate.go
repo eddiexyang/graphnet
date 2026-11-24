@@ -82,6 +82,7 @@ func (s Snapshot) Validate(agentID ID) error {
 			return fmt.Errorf("compiled topology exceeds limits")
 		}
 		directory := map[ID]netip.Addr{}
+		directoryKeys := map[ID][]byte{}
 		addresses := map[netip.Addr]bool{}
 		advertised := 0
 		subnetDirectory := map[ID][]AdvertisedSubnet{}
@@ -91,6 +92,10 @@ func (s Snapshot) Validate(agentID ID) error {
 				return fmt.Errorf("directory node %s needs a unique nonzero index", d.NodeID)
 			}
 			indexes[d.Index] = true
+			if len(d.PublicKey) != 0 && len(d.PublicKey) != ed25519.PublicKeySize || len(n.Topology) > 0 && len(d.PublicKey) != ed25519.PublicKeySize {
+				return fmt.Errorf("directory node %s has invalid public key", d.NodeID)
+			}
+			directoryKeys[d.NodeID] = d.PublicKey
 			if err := validateAdvertised(n.CIDR, d.AdvertisedSubnets, &advertised); err != nil {
 				return err
 			}
@@ -137,6 +142,9 @@ func (s Snapshot) Validate(agentID ID) error {
 			}
 			if len(p.PublicKey) != ed25519.PublicKeySize {
 				return fmt.Errorf("invalid peer identity")
+			}
+			if dirKey := directoryKeys[p.Node.ID]; len(dirKey) > 0 && !bytes.Equal(dirKey, p.PublicKey) {
+				return fmt.Errorf("peer identity disagrees with directory")
 			}
 			if prior, ok := identities[p.Node.AgentID]; ok && !bytes.Equal(prior, p.PublicKey) {
 				return fmt.Errorf("conflicting peer identities")

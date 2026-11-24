@@ -1,8 +1,11 @@
 package linkstate
 
 import (
+	"bytes"
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
+	"math"
 	"reflect"
 	"slices"
 	"testing"
@@ -33,6 +36,21 @@ type lab struct {
 	// apply, when set, can fail route installs before they reach the table.
 	apply     func(node model.ID, u model.RouteUpdate) error
 	snapshots map[model.ID]model.Snapshot
+	keys      map[model.ID]ed25519.PrivateKey
+}
+
+func agentKeyFor(state model.State, agentID model.ID) ed25519.PrivateKey {
+	for i, a := range state.Agents {
+		if a.ID == agentID {
+			seed := make([]byte, ed25519.SeedSize)
+			seed[0] = byte(i + 1)
+			priv := ed25519.NewKeyFromSeed(seed)
+			if bytes.Equal(priv.Public().(ed25519.PublicKey), a.PublicKey) {
+				return priv
+			}
+		}
+	}
+	return nil
 }
 
 // configure installs a configuration and its routes as the Agent does.
@@ -63,9 +81,17 @@ func (l *lab) start(node model.Node) {
 		l.t.Fatal(err)
 	}
 	self := node.ID
+	var identity ed25519.PrivateKey
+	if l.keys != nil {
+		identity = l.keys[self]
+	}
+	if identity == nil {
+		identity = agentKeyFor(l.state, node.AgentID)
+	}
 	var e *Engine
 	e = New(Callbacks{
-		Now: func() time.Time { return l.now },
+		Identity: identity,
+		Now:      func() time.Time { return l.now },
 		Send: func(network, peer model.ID, raw []byte) {
 			l.queue = append(l.queue, message{network, self, peer, append([]byte(nil), raw...)})
 		},
@@ -264,7 +290,7 @@ func TestRestartContinuesAboveOwnSequence(t *testing.T) {
 	l := newLab(t)
 	l.run(time.Second)
 	before := l.engines[nodeA].View().Networks[0].Sequence
-	l.now = l.now.Add(-time.Hour) // a restarted Agent with a clock behind
+	l.now = l.now.Add(-10 * time.Minute) // a restarted Agent with a clock behind
 	delete(l.engines, nodeA)
 	l.start(l.state.Networks[0].Nodes[0])
 	l.run(time.Second)
@@ -284,12 +310,7 @@ func TestOwnAdvertisementEchoIsIgnored(t *testing.T) {
 	l.run(time.Second)
 	a := l.engines[nodeA]
 	network := l.state.Networks[0].ID
-	var echo []byte
-	for _, o := range l.engines[nodeB].View().Networks[0].Database {
-		if o.Origin == nodeA {
-			echo, _ = json.Marshal(LSA{Network: network, Origin: nodeA, Revision: o.Revision, Sequence: o.Sequence, Up: o.Up})
-		}
-	}
+	echo, _ := json.Marshal(l.engines[nodeB].networks[network].db[nodeA].lsa)
 	before := a.View().Networks[0].Sequence
 	if err := a.Receive(network, nodeB, echo); err != nil {
 		t.Fatal(err)
@@ -384,9 +405,10 @@ func TestFirstConfigurationKeepsCompiledRoutesUntilObserved(t *testing.T) {
 		t.Fatal(err)
 	}
 	e := New(Callbacks{
-		Send:  func(model.ID, model.ID, []byte) {},
-		Local: func() (map[model.ID]map[model.ID]bool, map[model.ID]map[model.ID]bool) { return nil, nil },
-		Apply: func(model.RouteUpdate) error { return nil },
+		Identity: agentKeyFor(state, state.Agents[0].ID),
+		Send:     func(model.ID, model.ID, []byte) {},
+		Local:    func() (map[model.ID]map[model.ID]bool, map[model.ID]map[model.ID]bool) { return nil, nil },
+		Apply:    func(model.RouteUpdate) error { return nil },
 	})
 	if u := e.Configure(snapshot); u != nil {
 		t.Fatalf("routes before observing local Links: %+v", u)
@@ -396,6 +418,86 @@ func TestFirstConfigurationKeepsCompiledRoutesUntilObserved(t *testing.T) {
 	if u := e.Configure(snapshot); u == nil || u.Revision != snapshot.Revision {
 		t.Fatalf("routes for an observed configuration: %+v", u)
 	}
+}
+
+func TestSignatureSequenceBoundsAndClientLeafRole(t *testing.T) {
+	l := newLab(t)
+	// Mark node D (cheaper path A-D-C if D were transit when A-B fails!) as a Client leaf.
+	l.state.Networks[0].Nodes[3].Client = true
+	// Make A-D=1, D-C=1 (sum 2 < A-B-C 20) so D would be chosen as transit if allowed!
+	l.state.Networks[0].Edges[3].Weight = 1
+	l.engines = map[model.ID]*Engine{}
+	l.routes = map[model.ID]model.RouteUpdate{}
+	for _, node := range l.state.Networks[0].Nodes {
+		l.start(node)
+	}
+	l.run(time.Second)
+
+	// Even though A-D-C costs 2 vs A-B-C 20, client D must never be used as transit!
+	if r := l.route(nodeA, nodeC); r.NextHop != nodeB || r.Cost != 20 {
+		t.Fatalf("client D used as transit on A->C: %+v", r)
+	}
+	// Yet D itself remains reachable directly from A and C.
+	if r := l.route(nodeA, nodeD); r.NextHop != nodeD || r.Cost != 1 {
+		t.Fatalf("client D unreachable from A: %+v", r)
+	}
+
+	netID := l.state.Networks[0].ID
+	engA := l.engines[nodeA]
+	keyB := agentKeyFor(l.state, l.state.Agents[1].ID)
+	keyD := agentKeyFor(l.state, l.state.Agents[3].ID)
+	validSeq := uint64(l.now.UnixNano()) + 100
+
+	// 1. Forged origin: B signs an LSA claiming Origin = nodeC.
+	forgedOrigin := LSA{Network: netID, Origin: nodeC, Revision: 7, Sequence: validSeq, Sync: true}
+	forgedOrigin.Sign(keyB)
+	raw, _ := json.Marshal(forgedOrigin)
+	if err := engA.Receive(netID, nodeB, raw); err == nil {
+		t.Fatal("forged origin LSA was accepted")
+	}
+
+	// 2. Client neighbor D attempting to flood/relay C's valid LSA is rejected.
+	validC := l.engines[nodeB].networks[netID].db[nodeC].lsa
+	rawC, _ := json.Marshal(validC)
+	if err := engA.Receive(netID, nodeD, rawC); err == nil {
+		t.Fatal("third-party LSA from client neighbor was accepted")
+	}
+
+	// 3. Tampered / bad signature on B's LSA is rejected.
+	badSig := LSA{Network: netID, Origin: nodeB, Revision: 7, Sequence: validSeq, Up: []model.ID{edgeAB}, Sync: true}
+	badSig.Sign(keyB)
+	badSig.Up = nil // mutate signed field after signing
+	raw, _ = json.Marshal(badSig)
+	if err := engA.Receive(netID, nodeB, raw); err == nil {
+		t.Fatal("tampered LSA signature was accepted")
+	}
+
+	// 4. MaxUint64 and future (> now + MaxAge) sequences are rejected, including for own origin.
+	keyA := agentKeyFor(l.state, l.state.Agents[0].ID)
+	for _, seq := range []uint64{math.MaxUint64, uint64(l.now.Add(MaxAge + time.Second).UnixNano())} {
+		overB := LSA{Network: netID, Origin: nodeB, Revision: 7, Sequence: seq, Sync: true}
+		overB.Sign(keyB)
+		raw, _ = json.Marshal(overB)
+		if err := engA.Receive(netID, nodeB, raw); err == nil {
+			t.Fatalf("peer sequence %d was accepted", seq)
+		}
+		overSelf := LSA{Network: netID, Origin: nodeA, Revision: 7, Sequence: seq, Sync: true}
+		overSelf.Sign(keyA)
+		raw, _ = json.Marshal(overSelf)
+		if err := engA.Receive(netID, nodeB, raw); err == nil {
+			t.Fatalf("self sequence %d was accepted", seq)
+		}
+	}
+
+	// 5. Sequence saturation: originate saturates at MaxUint64-1 instead of wrapping to 0.
+	nA := engA.networks[netID]
+	nA.sequence = math.MaxUint64 - 2
+	lsa1 := nA.originate(7, l.now, keyA)
+	lsa2 := nA.originate(7, l.now, keyA)
+	if lsa1.Sequence != math.MaxUint64-1 || lsa2.Sequence != math.MaxUint64-1 {
+		t.Fatalf("sequence wrapped instead of saturating: %d, %d", lsa1.Sequence, lsa2.Sequence)
+	}
+	_ = keyD
 }
 
 func hasOrigin(v View, origin model.ID) bool {

@@ -46,9 +46,10 @@ type TopologyEdge struct {
 type Destination struct {
 	AdvertisedSubnets []AdvertisedSubnet `json:"advertised_subnets,omitempty"`
 	// Client destinations are never transit hops; see Node.Client.
-	Client  bool       `json:"client,omitempty"`
-	NodeID  ID         `json:"node_id"`
-	Address netip.Addr `json:"address"`
+	Client    bool       `json:"client,omitempty"`
+	NodeID    ID         `json:"node_id"`
+	Address   netip.Addr `json:"address"`
+	PublicKey []byte     `json:"public_key,omitempty"`
 	// Index names the Node on the wire; see Node.Index.
 	Index uint16 `json:"index"`
 }
@@ -82,6 +83,7 @@ func (s Snapshot) Clone() Snapshot {
 		n.Directory = append([]Destination{}, n.Directory...)
 		for j := range n.Directory {
 			n.Directory[j].AdvertisedSubnets = append([]AdvertisedSubnet(nil), n.Directory[j].AdvertisedSubnets...)
+			n.Directory[j].PublicKey = append([]byte(nil), n.Directory[j].PublicKey...)
 		}
 		n.Routes = append([]Route{}, n.Routes...)
 		for j := range n.Routes {
