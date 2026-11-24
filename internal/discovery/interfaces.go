@@ -69,6 +69,9 @@ func interfaceEndpoints(identity []byte, port uint16, interfaces []net.Interface
 			// This is the owner's zone. Mesh translates it into each dialing
 			// node's local zone; duplicate addresses on different NICs stay distinct.
 			if ip.Is6() && ip.IsLinkLocalUnicast() {
+				if !validZoneName(iface.Name) {
+					continue
+				}
 				ip = ip.WithZone(iface.Name)
 			}
 
@@ -94,4 +97,17 @@ func interfaceEndpoints(identity []byte, port uint16, interfaces []net.Interface
 		return 0
 	})
 	return result, nil
+}
+
+func validZoneName(name string) bool {
+	if name == "" || len(name) > 64 {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if c <= 0x20 || c >= 0x7f || strings.IndexByte("#/?[]@%", c) >= 0 {
+			return false
+		}
+	}
+	return true
 }

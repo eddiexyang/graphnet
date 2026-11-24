@@ -68,7 +68,7 @@ gateway forwarding and Linux SNAT. External OS routes remain administrator-manag
 
 ## Known issues
 
-- **Mixed packet and stream transport paths:** TCP from an Agent whose first hop is packet-only `udp` crosses as packets; a later stream-backed hop (`tcp`, `quic`) refuses it rather than run TCP over TCP, and a relay cannot seal it as a session for the Source. Datagrams cross any mix. Keep TCP paths that start on `udp` on `udp`, or start them on `tcp` or `quic`.
+- **Mixed packet and stream transport paths:** TCP from an Agent whose first hop is packet-only `udp` crosses as packets; a later stream-backed hop (`tcp`, `quic`) refuses it rather than run TCP over TCP. Datagrams cross any mix. Keep TCP paths that start on `udp` on `udp`, or start them on `tcp` or `quic`.
 
 ## Development
 

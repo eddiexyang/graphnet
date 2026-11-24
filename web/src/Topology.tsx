@@ -3,6 +3,7 @@ import {
   effectiveEdges,
   internalEdges,
   pruneGroups,
+  topologyError,
   childEdges,
   coveredEdges,
   linkSource,
@@ -398,6 +399,7 @@ export default function Topology({
         const drop = new Set(covered.map((e) => e.id))
         updated = { ...updated, edges: updated.edges.filter((e) => !drop.has(e.id)) }
       }
+      if (topologyError(updated)) return
       change(updated)
       select({ type: 'edge', id: newLink.id })
       return
@@ -418,7 +420,9 @@ export default function Topology({
     if (!updated) return
     const edge = createEdge(updated, source, target)
     if (edge) {
-      change({ ...updated, edges: [...updated.edges, edge] })
+      const nextNet = { ...updated, edges: [...updated.edges, edge] }
+      if (topologyError(nextNet)) return
+      change(nextNet)
       select({ type: 'edge', id: edge.id })
     }
   }
@@ -1276,14 +1280,25 @@ export default function Topology({
                 <input
                   type="checkbox"
                   checked={!!node.client}
-                  onChange={(e) =>
-                    change({
-                      ...network,
-                      nodes: network.nodes.map((n) =>
-                        n.id === node.id ? { ...n, client: e.target.checked || undefined } : n,
-                      ),
-                    })
-                  }
+                  onChange={(e) => {
+                    const checked = e.target.checked
+                    const nodes = network.nodes.map((n) =>
+                      n.id === node.id
+                        ? {
+                            ...n,
+                            client: checked || undefined,
+                            advertised_subnets: checked ? undefined : n.advertised_subnets,
+                          }
+                        : n,
+                    )
+                    const clientSet = new Set(nodes.filter((n) => n.client).map((n) => n.id))
+                    const edges = checked
+                      ? network.edges.filter(
+                          (edge) => !(clientSet.has(edge.a) && clientSet.has(edge.b)),
+                        )
+                      : network.edges
+                    change(pruneGroups({ ...network, nodes, edges }))
+                  }}
                 />
                 Client node (outbound only)
               </label>

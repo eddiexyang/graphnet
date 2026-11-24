@@ -101,4 +101,15 @@ func TestProviderResponseValidation(t *testing.T) {
 			t.Fatalf("response %s: location=%+v, error=%v", tc.body, location, err)
 		}
 	}
+
+	// Huge Retry-After header must be capped to 1 hour.
+	s.client.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+		r := apiResponse(429, "{}")
+		r.Header.Set("Retry-After", "99999999")
+		return r, nil
+	})
+	_, cooldown, err := s.lookup(netip.MustParseAddr("1.1.1.1"))
+	if err == nil || cooldown != time.Hour {
+		t.Fatalf("uncapped Retry-After cooldown = %v, err=%v, want 1h", cooldown, err)
+	}
 }

@@ -1,6 +1,7 @@
 package discovery
 
 import (
+	"net"
 	"testing"
 	"time"
 
@@ -29,5 +30,33 @@ func TestObservedLeasePublication(t *testing.T) {
 	}
 	if len(CoalesceEndpoints([]model.Endpoint{prior}, nil, start)) != 0 {
 		t.Fatal("retained removed endpoint")
+	}
+}
+
+func TestInterfaceEndpointsSkipsUnsafeIPv6ZoneNames(t *testing.T) {
+	ifaces := []net.Interface{
+		{Index: 1, Name: "eth0", Flags: net.FlagUp},
+		{Index: 2, Name: "bad/if#1", Flags: net.FlagUp},
+	}
+	physical := map[int]bool{1: true, 2: true}
+	_, ipnet6, _ := net.ParseCIDR("fe80::1/64")
+	_, ipnet4, _ := net.ParseCIDR("192.0.2.5/24")
+	eps, err := interfaceEndpoints([]byte("agent"), 24752, ifaces, physical, func(iface net.Interface) ([]net.Addr, error) {
+		if iface.Index == 2 {
+			return []net.Addr{ipnet6, ipnet4}, nil
+		}
+		return []net.Addr{ipnet6}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ep := range eps {
+		if err := ep.Validate(); err != nil {
+			t.Fatalf("generated invalid endpoint %+v: %v", ep, err)
+		}
+	}
+	// eth0 gets IPv6 link-local (2 endpoints: udp+tcp) and bad/if#1 gets IPv4 only (2 endpoints), skipping unsafe IPv6 zone.
+	if len(eps) != 4 {
+		t.Fatalf("expected 4 valid endpoints, got %d: %+v", len(eps), eps)
 	}
 }

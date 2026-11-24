@@ -19,13 +19,21 @@ type browserEvent struct {
 }
 
 func (s *Server) events(w http.ResponseWriter, r *http.Request) {
-	session, ok := s.auth.find(r)
-	if !ok {
-		fail(w, 401, "authentication required")
-		return
+	bearerAuth := s.auth.validBearer(r)
+	var session session
+	var key [32]byte
+	if bearerAuth {
+		key = s.auth.apiToken
+	} else {
+		var ok bool
+		session, ok = s.auth.find(r)
+		if !ok {
+			fail(w, 401, "authentication required")
+			return
+		}
+		cookie, _ := r.Cookie(cookieName)
+		key = tokenHash(cookie.Value)
 	}
-	cookie, _ := r.Cookie(cookieName)
-	key := tokenHash(cookie.Value)
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -60,13 +68,19 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 	defer rc.SetWriteDeadline(time.Time{})
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
-	expiry := time.NewTimer(time.Until(session.Expires))
-	defer expiry.Stop()
+	var expiryC <-chan time.Time
+	if !bearerAuth {
+		expiry := time.NewTimer(time.Until(session.Expires))
+		defer expiry.Stop()
+		expiryC = expiry.C
+	}
 	var revision uint64
 	first := true
 	for {
-		if _, ok := s.auth.find(r); !ok {
-			return
+		if !bearerAuth {
+			if _, ok := s.auth.find(r); !ok {
+				return
+			}
 		}
 		state, err := s.db.Read()
 		if err != nil {
@@ -95,7 +109,7 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 			return
 		case <-s.done:
 			return
-		case <-expiry.C:
+		case <-expiryC:
 			return
 		case <-ticker.C:
 		}

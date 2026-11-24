@@ -94,6 +94,9 @@ func newAuth(db *store.Store, password, apiToken string) (*auth, error) {
 		slots:          make(chan struct{}, 4),
 	}
 	if tok := strings.TrimSpace(apiToken); tok != "" {
+		if len(tok) < 32 || len(tok) > 1024 {
+			return nil, errors.New("API token must be 32–1024 bytes")
+		}
 		a.apiTokenSet = true
 		a.apiToken = tokenHash(tok)
 	}

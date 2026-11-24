@@ -122,7 +122,17 @@ func (s *Service) Locations(agents []model.Agent) Result {
 // Stale successful results survive both network failures and Server restarts.
 func (s *Service) refresh(ips []netip.Addr) {
 	defer s.wg.Done()
-	defer func() { s.mu.Lock(); s.loading = false; s.mu.Unlock() }()
+	dirty := false
+	defer func() {
+		if dirty {
+			if err := s.saveCache(); err != nil {
+				s.log.Warn("GeoIP cache save failed", "error", err)
+			}
+		}
+		s.mu.Lock()
+		s.loading = false
+		s.mu.Unlock()
+	}()
 	for _, ip := range ips {
 		timer := time.NewTimer(time.Until(s.nextRequest))
 		select {
@@ -160,12 +170,10 @@ func (s *Service) refresh(ips []netip.Addr) {
 			delete(s.cache, oldest)
 		}
 		s.cache[ip] = entry
+		dirty = true
 		s.mu.Unlock()
 		if err != nil {
 			s.log.Warn("IP.SB GeoIP lookup failed", "ip", ip, "error", err)
-		}
-		if err := s.saveCache(); err != nil {
-			s.log.Warn("GeoIP cache save failed", "error", err)
 		}
 		if cooldown > 0 {
 			return
@@ -198,6 +206,7 @@ func (s *Service) lookup(ip netip.Addr) (*Location, time.Duration, error) {
 				cooldown = max(cooldown, time.Until(date))
 			}
 		}
+		cooldown = min(cooldown, time.Hour)
 		return nil, cooldown, fmt.Errorf("IP.SB HTTP %d", response.StatusCode)
 	}
 	const limit = 64 << 10

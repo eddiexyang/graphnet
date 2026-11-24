@@ -44,7 +44,8 @@ func TestPutNetworkAutoPlacesNewGroupNode(t *testing.T) {
 	if _, err := db.Update(cur.Revision, func(s *model.State) error { *s = state; return nil }); err != nil {
 		t.Fatal(err)
 	}
-	srv, err := control.New(db, control.Options{Password: "admin-password-1234", APIToken: "tok"})
+	apiToken := "0123456789abcdef0123456789abcdef"
+	srv, err := control.New(db, control.Options{Password: "admin-password-1234", APIToken: apiToken})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +66,7 @@ func TestPutNetworkAutoPlacesNewGroupNode(t *testing.T) {
 	upd.Groups[0].Members = append(upd.Groups[0].Members, newID)
 	body, _ := json.Marshal(upd)
 	req := httptest.NewRequest("PUT", "/api/v1/networks/"+string(upd.ID), bytes.NewReader(body))
-	req.Header.Set("Authorization", "Bearer tok")
+	req.Header.Set("Authorization", "Bearer "+apiToken)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("If-Match", `"`+strconv.FormatUint(cur.Revision, 10)+`"`)
 	rec := httptest.NewRecorder()
