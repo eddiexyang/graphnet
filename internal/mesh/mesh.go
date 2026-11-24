@@ -64,9 +64,10 @@ type Mesh struct {
 	punchNotify    chan struct{}
 	webListener    *connIngress
 	webServer      *http.Server
-	tls            *tls.Config
-	wssTLS         *tls.Config
-	wsRoots        *x509.CertPool
+	tls               *tls.Config
+	wssTLS            *tls.Config
+	requireOriginMTLS bool
+	wsRoots           *x509.CertPool
 	sniffSlots     chan struct{}
 	pending        map[net.Conn]bool
 	udp            *transport.UDP
@@ -146,6 +147,7 @@ func NewWithOptions(parent context.Context, identity ed25519.PrivateKey, host st
 	}
 	m.wssTLS.NextProtos = []string{"http/1.1"}
 	if opts.OriginClientCAs != nil {
+		m.requireOriginMTLS = true
 		m.wssTLS.ClientAuth = tls.RequireAndVerifyClientCert
 		m.wssTLS.ClientCAs = opts.OriginClientCAs
 	}

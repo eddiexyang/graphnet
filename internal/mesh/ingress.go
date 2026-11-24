@@ -80,8 +80,14 @@ func (m *Mesh) startHTTP() {
 		IdleTimeout:       10 * time.Second,
 		MaxHeaderBytes:    8192,
 		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
-			if ic, ok := c.(*ingressConn); ok && ic.raw != nil {
-				return context.WithValue(ctx, wsRawConnKey{}, ic.raw)
+			if ic, ok := c.(*ingressConn); ok {
+				if ic.raw != nil {
+					ctx = context.WithValue(ctx, wsRawConnKey{}, ic.raw)
+				}
+				if tc, ok := ic.Conn.(*tls.Conn); ok {
+					state := tc.ConnectionState()
+					ctx = context.WithValue(ctx, wsTLSStateKey{}, &state)
+				}
 			}
 			return ctx
 		},

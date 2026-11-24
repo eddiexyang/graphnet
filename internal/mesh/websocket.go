@@ -1,6 +1,7 @@
 package mesh
 
 import (
+	"crypto/tls"
 	"fmt"
 	"net"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 )
 
 type wsRawConnKey struct{}
+type wsTLSStateKey struct{}
 
 func headerHasToken(h http.Header, key, token string) bool {
 	for _, v := range h.Values(key) {
@@ -41,13 +43,27 @@ func (m *Mesh) acceptWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	path := transport.WebSocketPath(r.URL)
+	tlsState := r.TLS
+	if tlsState == nil {
+		tlsState, _ = r.Context().Value(wsTLSStateKey{}).(*tls.ConnectionState)
+	}
 	var kind model.Transport
-	if r.TLS != nil {
+	if tlsState != nil {
+		if m.requireOriginMTLS && len(tlsState.VerifiedChains) == 0 {
+			http.Error(w, "client certificate required", http.StatusForbidden)
+			return
+		}
 		if !m.allowsEndpoint(model.WSS, path) {
 			http.NotFound(w, r)
 			return
 		}
 		kind = model.WSS
+	} else if m.requireOriginMTLS {
+		if !m.allowsEndpoint(model.WS, path) {
+			http.Error(w, "origin mTLS required", http.StatusForbidden)
+			return
+		}
+		kind = model.WS
 	} else if !m.allowsEndpoint(model.WS, path) && !m.allowsEndpoint(model.WSS, path) {
 		http.NotFound(w, r)
 		return

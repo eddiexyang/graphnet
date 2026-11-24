@@ -286,6 +286,21 @@ func TestWSSThroughCDNMiddleboxWithMTLSOrigin(t *testing.T) {
 		}
 	}
 
+	// Verify plaintext HTTP WebSocket upgrade with the allowed path is rejected while origin mTLS is configured.
+	plainWSConn, plainResp, plainErr := websocket.Dial(ctx, fmt.Sprintf("ws://127.0.0.1:%d/edge", originPort), &websocket.DialOptions{
+		CompressionMode: websocket.CompressionDisabled,
+	})
+	if plainErr == nil {
+		plainWSConn.CloseNow()
+		t.Fatal("origin accepted plaintext WebSocket upgrade while origin mTLS was configured")
+	}
+	if plainResp != nil {
+		plainResp.Body.Close()
+		if plainResp.StatusCode == http.StatusSwitchingProtocols {
+			t.Fatal("origin switched protocols on plaintext upgrade while origin mTLS was configured")
+		}
+	}
+
 	// Start Client Agent (node 0) resolving cdn.graphnet.test -> 127.0.0.1 and trusting cdnRoots.
 	clientCtx := sockets.With(ctx, sockets.Hooks{
 		Lookup: func(_ context.Context, _, host string) ([]netip.Addr, error) {
