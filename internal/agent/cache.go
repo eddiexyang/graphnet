@@ -110,20 +110,34 @@ func (c *Cache) SaveRegistration(reg Registration) error {
 	if err := validateDirectory(reg, reg.Directory); err != nil {
 		return err
 	}
+	raw, err := json.Marshal(reg)
+	if err != nil {
+		return err
+	}
 	c.mu.Lock()
-	if c.reg != nil {
-		if c.reg.AgentID != reg.AgentID || c.reg.Server != reg.Server || (len(c.reg.CA) > 0 && !bytes.Equal(c.reg.CA, reg.CA)) {
-			c.mu.Unlock()
-			return errors.New("registration cannot change agent or controller identity")
-		}
+	if c.reg != nil && !sameIdentity(*c.reg, reg) {
+		// The controller answered with another identity: the state kept for
+		// the previous one is not ours any more.
+		c.desired, c.applied, c.routes, c.fallback = nil, nil, nil, nil
 	}
 	cp := reg.clone()
 	c.reg = &cp
 	c.mu.Unlock()
-	if raw, err := json.Marshal(cp); err == nil {
-		c.disk.put(cp.AgentID, keyRegistration, raw)
-	}
+	c.disk.saveRegistration(cp, raw)
 	return nil
+}
+
+// sameIdentity reports whether two registrations name the same agent in the
+// same cluster under the same CA.
+func sameIdentity(a, b Registration) bool {
+	return a.AgentID == b.AgentID && clusterOf(a) == clusterOf(b) && bytes.Equal(a.CA, b.CA)
+}
+
+func clusterOf(r Registration) model.ID {
+	if r.Directory == nil {
+		return ""
+	}
+	return r.Directory.ClusterID
 }
 
 func verifyRegistrationCert(reg Registration, expectedPub ed25519.PublicKey) (*x509.Certificate, error) {

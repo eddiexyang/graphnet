@@ -74,7 +74,10 @@ type Config struct {
 	// file. It is applied only if no controller can be reached when the node
 	// starts; registration still comes from the controller. Empty keeps no
 	// state on disk. Requires PrivateKey. A file held by another running node
-	// is skipped with a warning.
+	// is skipped with a warning. State is keyed by a hash of PrivateKey,
+	// Server, ServerTransport, CA and GatewayCA: state written under any other
+	// value is not loaded, and is replaced once the controller accepts the
+	// node's registration.
 	StateFile string
 }
 
@@ -167,7 +170,10 @@ func Start(ctx context.Context, cfg Config) (*Client, error) {
 	}
 	c := &Client{stacks: map[netip.Addr]*netstack{}, rawIP: newRawIPRelay(), done: make(chan struct{})}
 	if cfg.StateFile != "" {
-		c.cache, err = agent.OpenDiskCache(cfg.StateFile, cfg.PrivateKey, cfg.Logger)
+		// State is keyed by the whole configuration: a file written under any
+		// other server, carrier, CA or key is a cache miss, never a fallback.
+		hash := agent.ConfigHash(cfg.PrivateKey.Public().(ed25519.PublicKey), serverOrigin, serverTransport, cfg.CA, cfg.GatewayCA)
+		c.cache, err = agent.OpenConfiguredDiskCache(cfg.StateFile, cfg.PrivateKey, hash, cfg.Logger)
 		if errors.Is(err, agent.ErrCacheInUse) {
 			// An embedding application may start a replacement node before it
 			// closes the previous one; that node keeps the file, this one runs
@@ -351,9 +357,11 @@ func (c *Client) ListenUDP(ctx context.Context, destination netip.Addr) (net.Pac
 func (c *Client) Close() error {
 	c.cancel()
 	<-c.done
-	err := c.runtime.Close()
+	// Release the state file first, so a replacement node can open it while
+	// this one is still tearing down its data plane.
+	err := c.cache.Close()
+	err = errors.Join(err, c.runtime.Close())
 	c.control.Close()
-	err = errors.Join(err, c.cache.Close())
 	return err
 }
 

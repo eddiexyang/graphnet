@@ -417,3 +417,116 @@ func bytesContains(haystack, needle []byte) bool {
 	}
 	return false
 }
+
+func (f diskFixture) openConfigured(t *testing.T, hash []byte) *Cache {
+	t.Helper()
+	c, err := OpenConfiguredDiskCache(f.path, f.key, hash, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+func (f diskFixture) hash(server, ca string) []byte {
+	return ConfigHash(f.key.Public().(ed25519.PublicKey), server, "tcp", []byte(ca), nil)
+}
+
+func TestConfiguredDiskCacheServesOnlyItsOwnHash(t *testing.T) {
+	f := newDiskFixture(t)
+	h1 := f.hash("https://a.example", "ca-1")
+	c := f.openConfigured(t, h1)
+	if err := c.SaveRegistration(f.reg); err != nil {
+		t.Fatal(err)
+	}
+	if err := NewReconciler(c, &recordingRuntime{}).Accept(t.Context(), f.rev(500)); err != nil {
+		t.Fatal(err)
+	}
+	c.Close()
+
+	// Same configuration: registration and fallback load.
+	c = f.openConfigured(t, h1)
+	if reg, _ := c.Registration(); reg == nil {
+		t.Fatal("registration not loaded under the same hash")
+	}
+	if got, err := NewReconciler(c, &recordingRuntime{}).RestoreFallback(t.Context()); err != nil || got != 500 {
+		t.Fatalf("restore = %d, %v", got, err)
+	}
+	c.Close()
+
+	// Any other configuration is a miss and leaves the file untouched.
+	h2 := f.hash("https://b.example", "ca-1")
+	c = f.openConfigured(t, h2)
+	if reg, _ := c.Registration(); reg != nil {
+		t.Fatal("registration of another configuration loaded")
+	}
+	if got, _ := NewReconciler(c, &recordingRuntime{}).RestoreFallback(t.Context()); got != 0 {
+		t.Fatalf("fallback of another configuration applied: %d", got)
+	}
+	c.Close()
+	c = f.openConfigured(t, h1)
+	if reg, _ := c.Registration(); reg == nil {
+		t.Fatal("a cache miss cleared the stored state")
+	}
+	c.Close()
+	if c, err := OpenConfiguredDiskCache(f.path, f.key, nil, nil); err == nil {
+		c.Close()
+		t.Fatal("empty configuration hash accepted")
+	}
+}
+
+func TestConfiguredDiskCacheReplacesStateOnAcceptedRegistration(t *testing.T) {
+	f := newDiskFixture(t)
+	h1, h2 := f.hash("https://a.example", "ca-1"), f.hash("https://a.example", "ca-2")
+	c := f.openConfigured(t, h1)
+	if err := c.SaveRegistration(f.reg); err != nil {
+		t.Fatal(err)
+	}
+	if err := NewReconciler(c, &recordingRuntime{}).Accept(t.Context(), f.rev(500)); err != nil {
+		t.Fatal(err)
+	}
+	c.Close()
+
+	// The controller accepts the new configuration: old snapshots go with it.
+	c = f.openConfigured(t, h2)
+	if err := c.SaveRegistration(f.reg); err != nil {
+		t.Fatal(err)
+	}
+	c.Close()
+	c = f.openConfigured(t, h2)
+	if reg, _ := c.Registration(); reg == nil {
+		t.Fatal("new registration not stored")
+	}
+	if got, _ := NewReconciler(c, &recordingRuntime{}).RestoreFallback(t.Context()); got != 0 {
+		t.Fatalf("snapshot of the previous configuration survived: %d", got)
+	}
+	c.Close()
+	c = f.openConfigured(t, h1)
+	if reg, _ := c.Registration(); reg != nil {
+		t.Fatal("previous configuration still served")
+	}
+	c.Close()
+}
+
+func TestSaveRegistrationReplacesStateOfAnotherIdentity(t *testing.T) {
+	f := newDiskFixture(t)
+	f.seed(t, f.rev(500))
+	c := f.open(t)
+	other := f.reg.clone()
+	other.AgentID = model.ID("0123456789abcdef0123456789abcdef")
+	other.Certificate = nil // registered by public key under the new id
+	if err := c.SaveRegistration(other); err != nil {
+		t.Fatalf("new identity from the controller rejected: %v", err)
+	}
+	if d, a, _ := c.Snapshots(); d != nil || a != nil {
+		t.Fatal("snapshots of the previous identity kept in memory")
+	}
+	c.Close()
+	c = f.open(t)
+	defer c.Close()
+	if reg, _ := c.Registration(); reg == nil || reg.AgentID != other.AgentID {
+		t.Fatalf("stored registration = %+v", reg)
+	}
+	if got, _ := NewReconciler(c, &recordingRuntime{}).RestoreFallback(t.Context()); got != 0 {
+		t.Fatalf("snapshot of the previous identity survived: %d", got)
+	}
+}

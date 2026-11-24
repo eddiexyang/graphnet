@@ -3,7 +3,9 @@ package agent
 import (
 	"bytes"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"crypto/x509"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,6 +34,7 @@ var (
 	keyDesired      = []byte("desired")
 	keyApplied      = []byte("applied")
 	keyRoutes       = []byte("routes")
+	keyConfigHash   = []byte("config-hash")
 )
 
 // ErrCacheInUse reports a disk cache held by another process or instance.
@@ -39,6 +42,7 @@ var ErrCacheInUse = errors.New("agent cache is in use by another process")
 
 // fallback is what a previous process left on disk, validated once at open.
 type fallback struct {
+	miss    bool // stored under another configuration hash; nothing loaded
 	agentID model.ID
 	reg     *Registration
 	desired *model.Snapshot // last received; may have failed to apply
@@ -49,15 +53,52 @@ type fallback struct {
 type diskState struct {
 	db     *bolt.DB
 	log    *slog.Logger
+	pub    ed25519.PublicKey
+	hash   []byte // configuration hash this process runs with; nil for a bare start
 	broken atomic.Bool
+	closed atomic.Bool
+	// miss is set while the file holds state of another configuration. Nothing
+	// is written or cleared until the controller accepts this configuration.
+	miss   atomic.Bool
 	routes []byte // last persisted route update, to skip identical writes
+}
+
+// ConfigHash identifies the configuration a node was started with. A disk
+// cache opened with it only serves state written under the same hash.
+func ConfigHash(pub ed25519.PublicKey, server, transport string, ca, gatewayCA []byte) []byte {
+	h := sha256.New()
+	for _, field := range [][]byte{pub, []byte(server), []byte(transport), ca, gatewayCA} {
+		var n [8]byte
+		binary.BigEndian.PutUint64(n[:], uint64(len(field)))
+		h.Write(n[:])
+		h.Write(field)
+	}
+	return h.Sum(nil)
 }
 
 // OpenDiskCache opens an Agent cache for identity whose configuration is also
 // written to path. Unreadable or inconsistent state is discarded, never fatal;
 // if the file cannot be used at all the Agent runs without a fallback. Only a
-// second process holding the same file is an error.
+// second process holding the same file is an error. It serves an Agent that
+// starts without explicit configuration: stored state is validated by its
+// public key and certificate only.
 func OpenDiskCache(path string, identity ed25519.PrivateKey, log *slog.Logger) (*Cache, error) {
+	return openDiskCache(path, identity, nil, log)
+}
+
+// OpenConfiguredDiskCache opens a disk cache for a node started with explicit
+// configuration, identified by configHash (see ConfigHash). State stored under
+// another hash is a cache miss: none of it is loaded, and the file is left
+// untouched until the controller accepts a registration, which then replaces
+// it in one transaction.
+func OpenConfiguredDiskCache(path string, identity ed25519.PrivateKey, configHash []byte, log *slog.Logger) (*Cache, error) {
+	if len(configHash) == 0 {
+		return nil, errors.New("disk cache requires a configuration hash")
+	}
+	return openDiskCache(path, identity, configHash, log)
+}
+
+func openDiskCache(path string, identity ed25519.PrivateKey, configHash []byte, log *slog.Logger) (*Cache, error) {
 	if identity == nil {
 		return nil, errors.New("disk cache requires a configured identity")
 	}
@@ -68,7 +109,7 @@ func OpenDiskCache(path string, identity ed25519.PrivateKey, log *slog.Logger) (
 	if log == nil {
 		log = slog.Default()
 	}
-	db, fb, err := openState(path, cache.PublicKey(), log)
+	db, fb, err := openState(path, cache.PublicKey(), configHash, log)
 	if errors.Is(err, bolt.ErrTimeout) {
 		return nil, fmt.Errorf("%w: %s", ErrCacheInUse, path)
 	}
@@ -76,7 +117,12 @@ func OpenDiskCache(path string, identity ed25519.PrivateKey, log *slog.Logger) (
 		log.Warn("agent disk cache unavailable; starting without offline fallback", "path", path, "error", err)
 		return cache, nil
 	}
-	cache.disk = &diskState{db: db, log: log}
+	cache.disk = &diskState{db: db, log: log, pub: cache.PublicKey(), hash: bytes.Clone(configHash)}
+	if fb.miss {
+		cache.disk.miss.Store(true)
+		log.Info("agent disk cache: stored state belongs to another configuration; not loaded", "path", path)
+		return cache, nil
+	}
 	if fb.reg != nil {
 		cp := fb.reg.clone()
 		cache.reg = &cp
@@ -90,11 +136,11 @@ func OpenDiskCache(path string, identity ed25519.PrivateKey, log *slog.Logger) (
 	return cache, nil
 }
 
-func openState(path string, pub ed25519.PublicKey, log *slog.Logger) (*bolt.DB, *fallback, error) {
+func openState(path string, pub ed25519.PublicKey, configHash []byte, log *slog.Logger) (*bolt.DB, *fallback, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, nil, err
 	}
-	db, fb, err := openStateOnce(path, pub, log)
+	db, fb, err := openStateOnce(path, pub, configHash, log)
 	if err == nil || errors.Is(err, bolt.ErrTimeout) {
 		return db, fb, err
 	}
@@ -103,10 +149,10 @@ func openState(path string, pub ed25519.PublicKey, log *slog.Logger) (*bolt.DB, 
 	if rm := os.Remove(path); rm != nil && !errors.Is(rm, os.ErrNotExist) {
 		return nil, nil, errors.Join(err, rm)
 	}
-	return openStateOnce(path, pub, log)
+	return openStateOnce(path, pub, configHash, log)
 }
 
-func openStateOnce(path string, pub ed25519.PublicKey, log *slog.Logger) (db *bolt.DB, fb *fallback, err error) {
+func openStateOnce(path string, pub ed25519.PublicKey, configHash []byte, log *slog.Logger) (db *bolt.DB, fb *fallback, err error) {
 	if db, err = bolt.Open(path, 0o600, &bolt.Options{Timeout: time.Second}); err != nil {
 		return nil, nil, err
 	}
@@ -119,6 +165,15 @@ func openStateOnce(path string, pub ed25519.PublicKey, log *slog.Logger) (db *bo
 				err = fmt.Errorf("corrupted agent cache: %v", p)
 			}
 		}()
+		if configHash != nil {
+			if err := db.View(func(tx *bolt.Tx) error {
+				b := tx.Bucket(stateBucket)
+				fb.miss = b == nil || !bytes.Equal(b.Get(keyConfigHash), configHash) || !bytes.Equal(b.Get(keyPublic), pub)
+				return nil
+			}); err != nil || fb.miss {
+				return err
+			}
+		}
 		return db.Update(func(tx *bolt.Tx) error {
 			if tx.Bucket(legacyBucket) != nil {
 				if err := tx.DeleteBucket(legacyBucket); err != nil {
@@ -241,7 +296,7 @@ func sameSnapshot(a, b model.Snapshot) bool {
 // put records one value for agentID. Failures only age the fallback, so they
 // are logged and the in-memory state stays authoritative.
 func (d *diskState) put(agentID model.ID, key, raw []byte) {
-	if d == nil || d.broken.Load() {
+	if d == nil || d.broken.Load() || d.closed.Load() || d.miss.Load() {
 		return
 	}
 	if bytes.Equal(key, keyRoutes) && bytes.Equal(raw, d.routes) {
@@ -282,10 +337,80 @@ func (d *diskState) put(agentID model.ID, key, raw []byte) {
 	}
 }
 
+// saveRegistration records a registration the controller just returned. When
+// the file holds another configuration, or the controller assigned another
+// agent, cluster or CA, all older state is replaced in the same transaction.
+func (d *diskState) saveRegistration(reg Registration, raw []byte) {
+	if d == nil || d.broken.Load() || d.closed.Load() {
+		return
+	}
+	reset := false
+	err := func() (err error) {
+		defer func() {
+			if p := recover(); p != nil {
+				d.broken.Store(true)
+				err = fmt.Errorf("corrupted agent cache: %v", p)
+			}
+		}()
+		return d.db.Update(func(tx *bolt.Tx) error {
+			b := tx.Bucket(stateBucket)
+			reset = d.miss.Load() || b == nil || d.hash != nil && !bytes.Equal(b.Get(keyConfigHash), d.hash) || !sameRegistrationIdentity(b, reg)
+			if reset {
+				for _, name := range [][]byte{legacyBucket, stateBucket} {
+					if tx.Bucket(name) != nil {
+						if err := tx.DeleteBucket(name); err != nil {
+							return err
+						}
+					}
+				}
+				var err error
+				if b, err = tx.CreateBucket(stateBucket); err != nil {
+					return err
+				}
+				if err := b.Put(keyPublic, d.pub); err != nil {
+					return err
+				}
+			}
+			if d.hash != nil {
+				if err := b.Put(keyConfigHash, d.hash); err != nil {
+					return err
+				}
+			}
+			if err := b.Put(keyAgentID, []byte(reg.AgentID)); err != nil {
+				return err
+			}
+			return b.Put(keyRegistration, raw)
+		})
+	}()
+	if err != nil {
+		d.log.Warn("agent disk cache write failed; offline fallback may be stale", "key", string(keyRegistration), "error", err)
+		return
+	}
+	d.miss.Store(false)
+	if reset {
+		d.routes = nil
+	}
+}
+
+// sameRegistrationIdentity reports whether the stored state belongs to the
+// agent, cluster and CA of reg.
+func sameRegistrationIdentity(b *bolt.Bucket, reg Registration) bool {
+	if !bytes.Equal(b.Get(keyAgentID), []byte(reg.AgentID)) {
+		return false
+	}
+	raw := b.Get(keyRegistration)
+	if raw == nil {
+		return true
+	}
+	var old Registration
+	return json.Unmarshal(raw, &old) == nil && sameIdentity(old, reg)
+}
+
 func (d *diskState) close() error {
 	if d == nil {
 		return nil
 	}
+	d.closed.Store(true)
 	return d.db.Close()
 }
 
