@@ -508,7 +508,7 @@ func (c *Client) connect(parent context.Context, id model.ID, updates chan model
 		}
 		changed := reportChanged(comparison, report)
 		if conn.Subprotocol() == model.DeltaSubprotocol && previous.Version != "" && !changed && !settling && time.Since(lastReport) < idleReportInterval {
-			if force || previous.AppliedRevision != report.AppliedRevision {
+			if report.ConfigError == "" && (force || previous.AppliedRevision != report.AppliedRevision) {
 				writeCtx, stop := context.WithTimeout(ctx, 10*time.Second)
 				err := wsjson.Write(writeCtx, conn, model.ControlMessage{Type: "ack_revision", Ack: &model.RevisionAck{AppliedRevision: report.AppliedRevision}})
 				stop()

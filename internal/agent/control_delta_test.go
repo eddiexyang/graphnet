@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -156,6 +157,94 @@ func TestRenewalSendsSmallAcknowledgement(t *testing.T) {
 		return
 	case <-ctx.Done():
 		t.Error(ctx.Err())
+	}
+	cancel()
+	<-connectDone
+	<-applyDone
+}
+
+type failingRuntime struct{ failRev uint64 }
+
+func (f failingRuntime) Apply(_ context.Context, s model.Snapshot) error {
+	if s.Revision == f.failRev {
+		return errors.New("synthetic apply failure")
+	}
+	return nil
+}
+func (failingRuntime) Report() []model.LinkStatus { return nil }
+
+func TestPersistentConfigErrorNeverSendsAckRevision(t *testing.T) {
+	cache, ca, identity := registeredController(t)
+	base, _, _ := cache.Snapshots()
+	bad := base.Clone()
+	bad.Revision++
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+
+	ackRevSeen := make(chan model.ControlMessage, 1)
+	fullErrAckSeen := make(chan struct{}, 4)
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{Subprotocols: []string{model.DeltaSubprotocol}})
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		_ = wsjson.Write(ctx, conn, model.ControlMessage{Type: "config", Snapshot: base})
+		_ = wsjson.Write(ctx, conn, model.ControlMessage{Type: "config", Snapshot: &bad})
+		for {
+			var m model.ControlMessage
+			if err := wsjson.Read(ctx, conn, &m); err != nil {
+				return
+			}
+			if m.Type == "ack_revision" {
+				select {
+				case ackRevSeen <- m:
+				default:
+				}
+				return
+			}
+			if m.Type == "ack" && m.Report != nil && m.Report.ConfigError != "" {
+				select {
+				case fullErrAckSeen <- struct{}{}:
+				default:
+				}
+			}
+		}
+	}))
+	var err error
+	server.TLS, err = ca.ServerTLS([]string{identity.TLSName()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.StartTLS()
+	defer server.Close()
+
+	c, err := NewClient(cache, failingRuntime{failRev: bad.Revision}, Options{Server: server.URL, Version: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	updates, acks := make(chan model.Snapshot, 1), make(chan struct{}, 1)
+	applyDone := make(chan struct{})
+	go func() { defer close(applyDone); c.applyLoop(ctx, updates, acks) }()
+	connectDone := make(chan error, 1)
+	go func() { connectDone <- c.connect(ctx, base.AgentID, updates, acks) }()
+
+	// Wait until the initial ConfigError ack is sent, then trigger multiple forced/retry acks
+	// while ConfigError remains non-empty and unchanged.
+	select {
+	case <-fullErrAckSeen:
+	case <-ctx.Done():
+		t.Fatal("never saw initial ConfigError ack")
+	}
+	for range 4 {
+		acks <- struct{}{}
+		time.Sleep(30 * time.Millisecond)
+	}
+	select {
+	case badMsg := <-ackRevSeen:
+		t.Fatalf("emitted ack_revision while ConfigError was non-empty: %+v", badMsg)
+	default:
 	}
 	cancel()
 	<-connectDone
