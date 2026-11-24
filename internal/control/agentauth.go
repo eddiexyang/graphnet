@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/eddiexyang/graphnet/internal/model"
@@ -18,6 +19,10 @@ const (
 )
 
 func (s *Server) agentChallenge(w http.ResponseWriter, r *http.Request) {
+	if r.TLS == nil {
+		fail(w, http.StatusUpgradeRequired, "HTTPS required")
+		return
+	}
 	raw := make([]byte, 32)
 	rand.Read(raw)
 	challenge := base64.RawURLEncoding.EncodeToString(raw)
@@ -50,10 +55,20 @@ func (s *Server) consumeChallenge(challenge string) bool {
 // signedAgent identifies the Agent by ID, or by public key for an Agent that
 // was registered by key and has not learned its ID yet.
 func (s *Server) signedAgent(r *http.Request) (model.ID, ed25519.PublicKey, error) {
+	if r.TLS == nil {
+		return "", nil, errors.New("TLS required for agent challenge")
+	}
 	challenge := r.Header.Get(model.AgentChallengeHeader)
 	signature, err := base64.RawURLEncoding.DecodeString(r.Header.Get(model.AgentSignatureHeader))
 	if err != nil || challenge == "" || len(signature) != ed25519.SignatureSize {
 		return "", nil, errors.New("agent signature required")
+	}
+	wsKey := strings.TrimSpace(r.Header.Get("Sec-WebSocket-Key"))
+	if r.URL.Path == "/api/v1/agent/control" && wsKey == "" {
+		return "", nil, errors.New("WebSocket upgrade key required")
+	}
+	if strings.ContainsAny(challenge+r.Method+r.URL.Path+wsKey, "\r\n") {
+		return "", nil, errors.New("invalid agent challenge fields")
 	}
 	id := model.ID(r.Header.Get(model.AgentIDHeader))
 	var key ed25519.PublicKey
@@ -77,12 +92,12 @@ func (s *Server) signedAgent(r *http.Request) (model.ID, ed25519.PublicKey, erro
 			continue
 		}
 		pub := ed25519.PublicKey(a.PublicKey)
-		message := model.AgentChallengeMessage(a.ID, challenge)
+		message := model.AgentChallengeMessage(a.ID, challenge, r.Method, r.URL.Path, wsKey)
 		if key != nil {
 			if !key.Equal(pub) {
 				continue
 			}
-			message = model.AgentKeyChallengeMessage(key, challenge)
+			message = model.AgentKeyChallengeMessage(key, challenge, r.Method, r.URL.Path, wsKey)
 		} else if a.ID != id {
 			continue
 		}

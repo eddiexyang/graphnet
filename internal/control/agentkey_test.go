@@ -114,20 +114,12 @@ func TestAgentRegisteredByPublicKey(t *testing.T) {
 		json.NewDecoder(resp.Body).Decode(&body)
 		return body.Challenge
 	}
-	byKey := func(signer ed25519.PrivateKey, claimed ed25519.PublicKey) http.Header {
+	byKey := func(signer ed25519.PrivateKey, claimed ed25519.PublicKey, method, path string) http.Header {
 		c := challenge()
 		h := http.Header{}
 		h.Set(model.AgentKeyHeader, model.EncodeAgentKey(claimed))
 		h.Set(model.AgentChallengeHeader, c)
-		h.Set(model.AgentSignatureHeader, base64.RawURLEncoding.EncodeToString(ed25519.Sign(signer, model.AgentKeyChallengeMessage(claimed, c))))
-		return h
-	}
-	byID := func(id model.ID) http.Header {
-		c := challenge()
-		h := http.Header{}
-		h.Set(model.AgentIDHeader, string(id))
-		h.Set(model.AgentChallengeHeader, c)
-		h.Set(model.AgentSignatureHeader, base64.RawURLEncoding.EncodeToString(ed25519.Sign(key, model.AgentChallengeMessage(id, c))))
+		h.Set(model.AgentSignatureHeader, base64.RawURLEncoding.EncodeToString(ed25519.Sign(signer, model.AgentKeyChallengeMessage(claimed, c, method, path, ""))))
 		return h
 	}
 	registration := func(h http.Header) (int, model.ID, []byte) {
@@ -146,19 +138,21 @@ func TestAgentRegisteredByPublicKey(t *testing.T) {
 		json.NewDecoder(resp.Body).Decode(&body)
 		return resp.StatusCode, body.AgentID, body.CA
 	}
-	if status, got, ca := registration(byKey(key, public)); status != 200 || got != id || !bytes.Equal(ca, s.ca.PEM) {
+	if status, got, ca := registration(byKey(key, public, "GET", model.AgentRegistrationPath)); status != 200 || got != id || !bytes.Equal(ca, s.ca.PEM) {
 		t.Fatalf("registration by key: HTTP %d, id %s", status, got)
 	}
 	other := ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize))
 	for name, h := range map[string]http.Header{
-		"signed by another key": byKey(other, public),
-		"unregistered key":      byKey(other, other.Public().(ed25519.PublicKey)),
+		"signed by another key": byKey(other, public, "GET", model.AgentRegistrationPath),
+		"unregistered key":      byKey(other, other.Public().(ed25519.PublicKey), "GET", model.AgentRegistrationPath),
+		"wrong method":          byKey(key, public, "POST", model.AgentRegistrationPath),
+		"wrong path":            byKey(key, public, "GET", "/api/v1/agent/control"),
 	} {
 		if status, _, _ := registration(h); status != 401 {
 			t.Errorf("%s: HTTP %d, want 401", name, status)
 		}
 	}
-	both := byKey(key, public)
+	both := byKey(key, public, "GET", model.AgentRegistrationPath)
 	both.Set(model.AgentIDHeader, string(id))
 	if status, _, _ := registration(both); status != 401 {
 		t.Errorf("key and ID together: HTTP %d, want 401", status)
@@ -167,7 +161,8 @@ func TestAgentRegisteredByPublicKey(t *testing.T) {
 	// After learning its ID, the Agent opens the control stream by ID.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	conn, resp, err := websocket.Dial(ctx, strings.Replace(server.URL, "https://", "wss://", 1)+"/api/v1/agent/control", &websocket.DialOptions{HTTPClient: agent, HTTPHeader: byID(id), Subprotocols: []string{model.DeltaSubprotocol}})
+	wsClient := &http.Client{Transport: &testChallengeRoundTripper{base: agent.Transport, id: id, key: key, challengeValue: challenge()}}
+	conn, resp, err := websocket.Dial(ctx, strings.Replace(server.URL, "https://", "wss://", 1)+"/api/v1/agent/control", &websocket.DialOptions{HTTPClient: wsClient, Subprotocols: []string{model.DeltaSubprotocol}})
 	if err != nil {
 		t.Fatalf("control stream by ID over direct TLS: %v %v", err, resp)
 	}
@@ -184,7 +179,7 @@ func TestAgentRegisteredByPublicKey(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if status, _, _ := registration(byKey(key, public)); status != 401 {
+	if status, _, _ := registration(byKey(key, public, "GET", model.AgentRegistrationPath)); status != 401 {
 		t.Errorf("revoked agent: HTTP %d, want 401", status)
 	}
 }

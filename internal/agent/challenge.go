@@ -8,13 +8,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/eddiexyang/graphnet/internal/model"
 )
 
-// challengeSigner authenticates every Agent request through a TLS-terminating
-// gateway, where no client certificate reaches the controller. Each request
-// fetches a fresh single-use challenge and signs it with the enrolled key.
+// challengeSigner authenticates an Agent registered by public key inside the
+// controller TLS session, where no client certificate was issued.
 type challengeSigner struct {
 	base http.RoundTripper
 	id   model.ID
@@ -32,11 +32,12 @@ func (s *challengeSigner) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 	signed := req.Clone(req.Context())
-	message := model.AgentChallengeMessage(s.id, challenge)
+	wsKey := strings.TrimSpace(signed.Header.Get("Sec-WebSocket-Key"))
+	message := model.AgentChallengeMessage(s.id, challenge, signed.Method, signed.URL.Path, wsKey)
 	if s.byKey {
 		public := s.key.Public().(ed25519.PublicKey)
 		signed.Header.Set(model.AgentKeyHeader, model.EncodeAgentKey(public))
-		message = model.AgentKeyChallengeMessage(public, challenge)
+		message = model.AgentKeyChallengeMessage(public, challenge, signed.Method, signed.URL.Path, wsKey)
 	} else {
 		signed.Header.Set(model.AgentIDHeader, string(s.id))
 	}

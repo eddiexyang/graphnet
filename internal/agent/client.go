@@ -121,11 +121,7 @@ func NewClient(cache *Cache, runtime Runtime, options Options) (*Client, error) 
 	if len(options.Version) > 128 {
 		return nil, errors.New("version too long")
 	}
-	roots := options.Roots
-	if options.ServerTransport == "https" {
-		roots = options.GatewayRoots
-	}
-	tlsConfig := &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS13}
+	tlsConfig := &tls.Config{RootCAs: options.Roots, MinVersion: tls.VersionTLS13}
 	dial := controltransport.DialContext(options.ServerTransport, options.Roots)
 	if tunnelTransport(options.ServerTransport) {
 		// Registration happens before the directory can name the controller's
@@ -152,7 +148,9 @@ func (c *Client) Close() { c.transport.CloseIdleConnections() }
 
 // tunnelTransport reports carriers whose byte stream reaches the controller
 // through a tunnel, so the controller TLS handshake runs above the carrier.
-func tunnelTransport(kind string) bool { return kind == "websocket" || kind == "wss" }
+func tunnelTransport(kind string) bool {
+	return kind == "websocket" || kind == "wss" || kind == "https"
+}
 
 // pinnedTLSConfig verifies the controller certificate chain against the pinned
 // CA without comparing it to the entrance hostname. Behind a gateway the entry
@@ -708,31 +706,24 @@ func (c *Client) selectTarget() (controlTarget, error) {
 	}
 	c.transport.CloseIdleConnections()
 	c.signer = nil
-	if selected.transport == "https" {
-		// The gateway terminates TLS with a public certificate (system roots), so
-		// the Agent proves its identity per request with a signed challenge.
-		c.transport = &http.Transport{TLSClientConfig: &tls.Config{RootCAs: c.options.GatewayRoots, MinVersion: tls.VersionTLS13}, DialContext: controltransport.DialContext(selected.transport, nil), TLSHandshakeTimeout: 3 * time.Second, ResponseHeaderTimeout: 4 * time.Second, MaxIdleConnsPerHost: 2}
+	dial := controltransport.DialContext(selected.transport, roots, selected.tlsName)
+	if selected.transport == "https" || selected.transport == "wss" && selected.origin == c.configuredServer {
+		// The configured entrance is a gateway: the outer TLS is the
+		// gateway's own certificate, and the controller is verified above
+		// the tunnel by its pinned CA below.
+		dial = controltransport.GatewayDialContext(selected.transport, c.options.GatewayRoots)
+	}
+	inner := &tls.Config{RootCAs: roots, Certificates: certificates, ServerName: selected.tlsName, MinVersion: tls.VersionTLS13}
+	if tunnelTransport(selected.transport) {
+		// Behind a tunnel the entrance name is never the controller name;
+		// pin the controller by chain and keep only its TLS name as SNI.
+		inner = pinnedTLSConfig(roots, selected.tlsName)
+		inner.Certificates = certificates
+	}
+	c.transport = &http.Transport{TLSClientConfig: inner, DialContext: dial, TLSHandshakeTimeout: 3 * time.Second, ResponseHeaderTimeout: 4 * time.Second, MaxIdleConnsPerHost: 2}
+	if reg.KeyOnly() {
+		// Without a certificate the Agent proves its key per request.
 		c.signer = &challengeSigner{id: reg.AgentID, key: c.cache.PrivateKey()}
-	} else {
-		dial := controltransport.DialContext(selected.transport, roots, selected.tlsName)
-		if selected.transport == "wss" && selected.origin == c.configuredServer {
-			// The configured entrance is a gateway: the outer TLS is the
-			// gateway's own certificate, and the controller is verified above
-			// the tunnel by its pinned CA below.
-			dial = controltransport.GatewayDialContext(selected.transport, c.options.GatewayRoots)
-		}
-		inner := &tls.Config{RootCAs: roots, Certificates: certificates, ServerName: selected.tlsName, MinVersion: tls.VersionTLS13}
-		if tunnelTransport(selected.transport) {
-			// Behind a tunnel the entrance name is never the controller name;
-			// pin the controller by chain and keep only its TLS name as SNI.
-			inner = pinnedTLSConfig(roots, selected.tlsName)
-			inner.Certificates = certificates
-		}
-		c.transport = &http.Transport{TLSClientConfig: inner, DialContext: dial, TLSHandshakeTimeout: 3 * time.Second, ResponseHeaderTimeout: 4 * time.Second, MaxIdleConnsPerHost: 2}
-		if reg.KeyOnly() {
-			// Without a certificate the Agent proves its key per request.
-			c.signer = &challengeSigner{id: reg.AgentID, key: c.cache.PrivateKey()}
-		}
 	}
 	c.http.Transport = c.roundTripper(c.transport)
 	c.server = selected.origin

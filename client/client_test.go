@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/http/httptest"
 	"net/netip"
 	"path/filepath"
 	"sync/atomic"
@@ -19,6 +18,7 @@ import (
 
 	"github.com/eddiexyang/graphnet/internal/agent"
 	"github.com/eddiexyang/graphnet/internal/control"
+	"github.com/eddiexyang/graphnet/internal/controltransport"
 	"github.com/eddiexyang/graphnet/internal/model"
 	"github.com/eddiexyang/graphnet/internal/pki"
 	"github.com/eddiexyang/graphnet/internal/routing"
@@ -102,13 +102,21 @@ func startClientNetwork(t *testing.T, ctx context.Context, clientKey ed25519.Pri
 	if cn.ca, err = pki.LoadOrCreate(db); err != nil {
 		t.Fatal(err)
 	}
-	listener := httptest.NewUnstartedServer(server)
-	if listener.TLS, err = cn.ca.ServerTLS([]string{"controller.graphnet.test"}); err != nil {
+	tlsConfig, err := cn.ca.ServerTLS([]string{"controller.graphnet.test"})
+	if err != nil {
 		t.Fatal(err)
 	}
-	listener.StartTLS()
-	t.Cleanup(listener.Close)
-	_, cn.port, _ = net.SplitHostPort(listener.Listener.Addr().String())
+	rawListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tunnel := controltransport.NewServer(rawListener, server, tlsConfig)
+	go tunnel.Serve()
+	t.Cleanup(func() {
+		tunnel.Close()
+		tunnel.Wait()
+	})
+	_, cn.port, _ = net.SplitHostPort(rawListener.Addr().String())
 	return cn
 }
 

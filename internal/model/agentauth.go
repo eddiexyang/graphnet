@@ -5,9 +5,9 @@ import (
 	"encoding/base64"
 )
 
-// Agents without a client certificate at the controller (behind a
-// TLS-terminating gateway, or registered by public key) sign a single-use
-// controller challenge with their Ed25519 key, carried in these headers.
+// Agents registered by public key (without a client certificate) sign a
+// single-use controller challenge inside the controller TLS session, carried
+// in these headers.
 const (
 	AgentIDHeader        = "X-GraphNet-Agent"
 	AgentChallengeHeader = "X-GraphNet-Challenge"
@@ -21,16 +21,16 @@ const (
 	AgentRegistrationPath = "/api/v1/agent/registration"
 )
 
-// AgentChallengeMessage is the exact byte string an Agent signs. The prefix
-// keeps these signatures distinct from any other use of the Agent key.
-func AgentChallengeMessage(id ID, challenge string) []byte {
-	return []byte("graphnet agent challenge v1\n" + string(id) + "\n" + challenge)
+// AgentChallengeMessage is the exact byte string an Agent signs. Binding the
+// HTTP method, path and WebSocket upgrade key prevents cross-route replay.
+func AgentChallengeMessage(id ID, challenge, method, path, webSocketKey string) []byte {
+	return []byte("graphnet agent challenge v2\n" + string(id) + "\n" + challenge + "\n" + method + "\n" + path + "\n" + webSocketKey)
 }
 
 // AgentKeyChallengeMessage is signed when the Agent identifies by public key.
 // Its distinct prefix keeps it from being replayed as an ID challenge.
-func AgentKeyChallengeMessage(key ed25519.PublicKey, challenge string) []byte {
-	return []byte("graphnet agent key challenge v1\n" + EncodeAgentKey(key) + "\n" + challenge)
+func AgentKeyChallengeMessage(key ed25519.PublicKey, challenge, method, path, webSocketKey string) []byte {
+	return []byte("graphnet agent key challenge v2\n" + EncodeAgentKey(key) + "\n" + challenge + "\n" + method + "\n" + path + "\n" + webSocketKey)
 }
 
 // EncodeAgentKey is the header and API text form of an Agent public key.

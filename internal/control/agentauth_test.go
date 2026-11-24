@@ -3,6 +3,8 @@ package control
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
@@ -19,7 +21,39 @@ import (
 	"github.com/eddiexyang/graphnet/internal/testutil"
 )
 
-func TestSignedChallengeAuthenticatesPlaintextAgent(t *testing.T) {
+type testChallengeRoundTripper struct {
+	base           http.RoundTripper
+	id             model.ID
+	key            ed25519.PrivateKey
+	challengeValue string
+	overrideMethod string
+	overridePath   string
+	overrideWSKey  *string
+}
+
+func (rt *testChallengeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	cloned := req.Clone(req.Context())
+	if rt.challengeValue != "" {
+		method := cloned.Method
+		if rt.overrideMethod != "" {
+			method = rt.overrideMethod
+		}
+		path := cloned.URL.Path
+		if rt.overridePath != "" {
+			path = rt.overridePath
+		}
+		wsKey := strings.TrimSpace(cloned.Header.Get("Sec-WebSocket-Key"))
+		if rt.overrideWSKey != nil {
+			wsKey = *rt.overrideWSKey
+		}
+		cloned.Header.Set(model.AgentIDHeader, string(rt.id))
+		cloned.Header.Set(model.AgentChallengeHeader, rt.challengeValue)
+		cloned.Header.Set(model.AgentSignatureHeader, base64.RawURLEncoding.EncodeToString(ed25519.Sign(rt.key, model.AgentChallengeMessage(rt.id, rt.challengeValue, method, path, wsKey))))
+	}
+	return rt.base.RoundTrip(cloned)
+}
+
+func TestSignedChallengeRequiresTLSAndBindsRequest(t *testing.T) {
 	db, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -40,14 +74,38 @@ func TestSignedChallengeAuthenticatesPlaintextAgent(t *testing.T) {
 	seed[0] = 1
 	key := ed25519.NewKeyFromSeed(seed)
 	id := state.Agents[0].ID
-	server := httptest.NewServer(s)
+
+	// Plaintext requests are rejected before challenge issuance or verification.
+	plain := httptest.NewServer(s)
+	defer plain.Close()
+	if resp, err := http.Get(plain.URL + model.AgentChallengePath); err != nil {
+		t.Fatal(err)
+	} else {
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUpgradeRequired {
+			t.Fatalf("plaintext challenge status=%d, want %d", resp.StatusCode, http.StatusUpgradeRequired)
+		}
+	}
+
+	server := httptest.NewUnstartedServer(s)
+	server.TLS, err = s.ca.ServerTLS([]string{"127.0.0.1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.StartTLS()
 	defer server.Close()
+	roots := x509.NewCertPool()
+	roots.AppendCertsFromPEM(s.ca.PEM)
+	baseTransport := &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS13}}
+	defer baseTransport.CloseIdleConnections()
+	tlsClient := &http.Client{Transport: baseTransport}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	challenge := func() string {
 		t.Helper()
-		resp, err := http.Get(server.URL + model.AgentChallengePath)
+		resp, err := tlsClient.Get(server.URL + model.AgentChallengePath)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -58,16 +116,26 @@ func TestSignedChallengeAuthenticatesPlaintextAgent(t *testing.T) {
 		}
 		return body.Challenge
 	}
-	headers := func(id model.ID, challenge string, key ed25519.PrivateKey) http.Header {
-		h := http.Header{}
-		h.Set(model.AgentIDHeader, string(id))
-		h.Set(model.AgentChallengeHeader, challenge)
-		h.Set(model.AgentSignatureHeader, base64.RawURLEncoding.EncodeToString(ed25519.Sign(key, model.AgentChallengeMessage(id, challenge))))
-		return h
+
+	// Plaintext request carrying a valid challenge issued over TLS is still rejected.
+	cPlain := challenge()
+	plainReq, _ := http.NewRequest("GET", plain.URL+model.AgentRegistrationPath, nil)
+	plainReq.Header.Set(model.AgentIDHeader, string(id))
+	plainReq.Header.Set(model.AgentChallengeHeader, cPlain)
+	plainReq.Header.Set(model.AgentSignatureHeader, base64.RawURLEncoding.EncodeToString(ed25519.Sign(key, model.AgentChallengeMessage(id, cPlain, "GET", model.AgentRegistrationPath, ""))))
+	if resp, err := http.DefaultClient.Do(plainReq); err != nil {
+		t.Fatal(err)
+	} else {
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("plaintext registration status=%d, want 401", resp.StatusCode)
+		}
 	}
-	dial := func(h http.Header) (*websocket.Conn, int) {
+
+	dial := func(rt http.RoundTripper) (*websocket.Conn, int) {
 		t.Helper()
-		conn, resp, err := websocket.Dial(ctx, strings.Replace(server.URL, "http://", "ws://", 1)+"/api/v1/agent/control", &websocket.DialOptions{HTTPHeader: h, Subprotocols: []string{model.DeltaSubprotocol}})
+		hc := &http.Client{Transport: rt}
+		conn, resp, err := websocket.Dial(ctx, strings.Replace(server.URL, "https://", "wss://", 1)+"/api/v1/agent/control", &websocket.DialOptions{HTTPClient: hc, Subprotocols: []string{model.DeltaSubprotocol}})
 		if err != nil {
 			if resp == nil {
 				t.Fatal(err)
@@ -78,7 +146,7 @@ func TestSignedChallengeAuthenticatesPlaintextAgent(t *testing.T) {
 	}
 
 	used := challenge()
-	conn, status := dial(headers(id, used, key))
+	conn, status := dial(&testChallengeRoundTripper{base: baseTransport, id: id, key: key, challengeValue: used})
 	if conn == nil {
 		t.Fatalf("signed agent rejected: %d", status)
 	}
@@ -93,15 +161,21 @@ func TestSignedChallengeAuthenticatesPlaintextAgent(t *testing.T) {
 	s.challengeMu.Lock()
 	s.challenges[expired] = time.Now().Add(-time.Second)
 	s.challengeMu.Unlock()
-	for name, h := range map[string]http.Header{
-		"replayed challenge": headers(id, used, key),
-		"unknown challenge":  headers(id, "never-issued", key),
-		"expired challenge":  headers(id, expired, key),
-		"wrong key":          headers(id, challenge(), other),
-		"other agent id":     headers(state.Agents[1].ID, challenge(), key),
-		"no signature":       {},
+	wrongWSKey := "dGhlIHNhbXBsZSBub25jZQ=="
+	emptyWSKey := ""
+	for name, rt := range map[string]*testChallengeRoundTripper{
+		"replayed challenge":    {base: baseTransport, id: id, key: key, challengeValue: used},
+		"unknown challenge":     {base: baseTransport, id: id, key: key, challengeValue: "never-issued"},
+		"expired challenge":     {base: baseTransport, id: id, key: key, challengeValue: expired},
+		"wrong key":             {base: baseTransport, id: id, key: other, challengeValue: challenge()},
+		"other agent id":        {base: baseTransport, id: state.Agents[1].ID, key: key, challengeValue: challenge()},
+		"wrong method signed":   {base: baseTransport, id: id, key: key, challengeValue: challenge(), overrideMethod: "POST"},
+		"wrong path signed":     {base: baseTransport, id: id, key: key, challengeValue: challenge(), overridePath: model.AgentRegistrationPath},
+		"wrong ws key signed":   {base: baseTransport, id: id, key: key, challengeValue: challenge(), overrideWSKey: &wrongWSKey},
+		"omitted ws key signed": {base: baseTransport, id: id, key: key, challengeValue: challenge(), overrideWSKey: &emptyWSKey},
+		"no signature":          {base: baseTransport},
 	} {
-		if conn, status := dial(h); conn != nil || status != http.StatusUnauthorized {
+		if conn, status := dial(rt); conn != nil || status != http.StatusUnauthorized {
 			if conn != nil {
 				conn.CloseNow()
 			}
@@ -109,10 +183,25 @@ func TestSignedChallengeAuthenticatesPlaintextAgent(t *testing.T) {
 		}
 	}
 
+	// Cross-route HTTP replay: signature made for /api/v1/agent/update/latest moved to /api/v1/agent/registration.
+	crossChallenge := challenge()
+	crossReq, _ := http.NewRequest("GET", server.URL+model.AgentRegistrationPath, nil)
+	crossReq.Header.Set(model.AgentIDHeader, string(id))
+	crossReq.Header.Set(model.AgentChallengeHeader, crossChallenge)
+	crossReq.Header.Set(model.AgentSignatureHeader, base64.RawURLEncoding.EncodeToString(ed25519.Sign(key, model.AgentChallengeMessage(id, crossChallenge, "GET", "/api/v1/agent/update/latest", ""))))
+	if resp, err := tlsClient.Do(crossReq); err != nil {
+		t.Fatal(err)
+	} else {
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("cross-path replay status=%d, want 401", resp.StatusCode)
+		}
+	}
+
 	if _, err := db.Update(state.Revision, func(s *model.State) error { s.Agents[0].Revoked = true; return nil }); err != nil {
 		t.Fatal(err)
 	}
-	if conn, status := dial(headers(id, challenge(), key)); conn != nil || status != http.StatusUnauthorized {
+	if conn, status := dial(&testChallengeRoundTripper{base: baseTransport, id: id, key: key, challengeValue: challenge()}); conn != nil || status != http.StatusUnauthorized {
 		t.Errorf("revoked agent: status=%d, want 401", status)
 	}
 }

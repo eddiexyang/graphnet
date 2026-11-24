@@ -61,6 +61,7 @@ func runAgentContext(parent context.Context, args []string) error {
 	data := fs.String("data-dir", "./graphnet-agent-data", "private persistent agent directory")
 	name := fs.String("name", "", "agent display name for first enrollment")
 	ca := fs.String("ca", "", "PEM CA certificate to trust for controller HTTPS")
+	gatewayCA := fs.String("gateway-ca", os.Getenv("GRAPHNET_GATEWAY_CA"), "optional PEM CA certificate to trust for an HTTPS or WSS gateway")
 	originMTLSCA := fs.String("origin-mtls-ca", "", "optional PEM CA certificate requiring mTLS client certs on incoming WSS links")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -117,6 +118,17 @@ func runAgentContext(parent context.Context, args []string) error {
 		return err
 	}
 	var client *agent.Client
+	var gatewayRoots *x509.CertPool
+	if *gatewayCA != "" {
+		raw, err := os.ReadFile(*gatewayCA)
+		if err != nil {
+			return err
+		}
+		gatewayRoots = x509.NewCertPool()
+		if !gatewayRoots.AppendCertsFromPEM(raw) {
+			return errors.New("gateway-ca contains no certificates")
+		}
+	}
 	var originClientCAs *x509.CertPool
 	if *originMTLSCA != "" {
 		raw, err := os.ReadFile(*originMTLSCA)
@@ -144,7 +156,7 @@ func runAgentContext(parent context.Context, args []string) error {
 		// An Agent given its key registers by public key alone.
 		token = ""
 	}
-	client, err = agent.NewClient(cache, runtime, agent.Options{Server: *server, ServerTransport: *serverTransport, Name: *name, EnrollmentToken: token, Roots: roots, Version: version})
+	client, err = agent.NewClient(cache, runtime, agent.Options{Server: *server, ServerTransport: *serverTransport, Name: *name, EnrollmentToken: token, Roots: roots, GatewayRoots: gatewayRoots, Version: version})
 	if err != nil {
 		return err
 	}

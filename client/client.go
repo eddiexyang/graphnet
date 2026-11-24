@@ -41,9 +41,11 @@ type Config struct {
 	// ServerTransport is the controller carrier: tcp (default), websocket,
 	// grpc, wss, or https for a TLS-terminating gateway.
 	ServerTransport string
-	// CA is the controller CA in PEM. Empty trusts the system roots, as for a
-	// gateway with a public certificate.
+	// CA is the controller CA in PEM. Empty trusts the system roots.
 	CA []byte
+	// GatewayCA is the optional PEM CA for an HTTPS/WSS gateway entrance.
+	// Empty trusts the system roots (plus CA when set).
+	GatewayCA []byte
 	// PrivateKey is the node identity. The controller knows its public key,
 	// registered by an operator or by enrollment.
 	PrivateKey ed25519.PrivateKey
@@ -140,6 +142,19 @@ func Start(ctx context.Context, cfg Config) (*Client, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
+	var gatewayRoots *x509.CertPool
+	if len(cfg.GatewayCA) > 0 {
+		gatewayRoots = x509.NewCertPool()
+		if !gatewayRoots.AppendCertsFromPEM(cfg.GatewayCA) {
+			return nil, errors.New("graphnet: gateway CA contains no certificates")
+		}
+	} else if len(cfg.CA) > 0 {
+		gatewayRoots, _ = x509.SystemCertPool()
+		if gatewayRoots == nil {
+			gatewayRoots = x509.NewCertPool()
+		}
+		gatewayRoots.AppendCertsFromPEM(cfg.CA)
+	}
 	roots, err := x509.SystemCertPool()
 	if err != nil {
 		roots = x509.NewCertPool()
@@ -189,7 +204,7 @@ func Start(ctx context.Context, cfg Config) (*Client, error) {
 		c.cache.Close()
 		return nil, err
 	}
-	control, err = agent.NewClient(c.cache, c.runtime, agent.Options{Server: serverOrigin, ServerTransport: serverTransport, Roots: roots, GatewayRoots: roots, Version: "client", Logger: cfg.Logger})
+	control, err = agent.NewClient(c.cache, c.runtime, agent.Options{Server: serverOrigin, ServerTransport: serverTransport, Roots: roots, GatewayRoots: gatewayRoots, Version: "client", Logger: cfg.Logger})
 	if err != nil {
 		c.runtime.Close()
 		c.cancel()

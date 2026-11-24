@@ -48,20 +48,24 @@ func TestGatewayDialContextAuthenticatesTheOuterHop(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	conn, err := controltransport.GatewayDialContext("wss", roots)(ctx, "tcp", addr)
-	if err != nil {
-		t.Fatalf("gateway dial: %v", err)
-	}
-	defer conn.Close()
-	if _, err := conn.Write([]byte("x")); err != nil {
-		t.Fatal(err)
-	}
-	buf := make([]byte, 1)
-	if _, err := conn.Read(buf); err != nil {
-		t.Fatal(err)
-	}
-	if buf[0] != 'x' {
-		t.Fatalf("echo %q, want x", buf[0])
+	for _, kind := range []string{"wss", "https"} {
+		conn, err := controltransport.GatewayDialContext(kind, roots)(ctx, "tcp", addr)
+		if err != nil {
+			t.Fatalf("%s gateway dial: %v", kind, err)
+		}
+		if _, err := conn.Write([]byte("x")); err != nil {
+			conn.Close()
+			t.Fatal(err)
+		}
+		buf := make([]byte, 1)
+		if _, err := conn.Read(buf); err != nil {
+			conn.Close()
+			t.Fatal(err)
+		}
+		conn.Close()
+		if buf[0] != 'x' {
+			t.Fatalf("%s echo %q, want x", kind, buf[0])
+		}
 	}
 
 	// A plain dialer verifies the entrance with server roots and fails here.
