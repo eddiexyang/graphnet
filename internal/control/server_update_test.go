@@ -1,10 +1,20 @@
 package control
 
 import (
-	"github.com/eddiexyang/graphnet/internal/cluster"
-	"github.com/eddiexyang/graphnet/internal/model"
+	"bytes"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/eddiexyang/graphnet/internal/cluster"
+	"github.com/eddiexyang/graphnet/internal/model"
+	"github.com/eddiexyang/graphnet/internal/pki"
+	"github.com/eddiexyang/graphnet/internal/store"
 )
 
 func TestServerUpdateSerialization(t *testing.T) {
@@ -38,4 +48,79 @@ func TestServerUpdateSerialization(t *testing.T) {
 	if clone[0].Update.ID == server.Update.ID {
 		t.Fatal("update request was not deeply cloned")
 	}
+}
+
+func TestPatchServerPreservesAutomaticEndpoints(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	apiToken := "0123456789abcdef0123456789abcdef"
+	srv, err := New(db, Options{Password: "strong-admin-password-123", APIToken: apiToken})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	ca, err := pki.LoadOrCreate(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, _, _ := ed25519.GenerateKey(rand.Reader)
+	serverID := model.NewID()
+	ifaceEp := model.ServerEndpoint{ID: model.NewID(), Transport: "tcp", URL: "tcp://192.0.2.10:8443", Source: model.Interface}
+	obsEp := model.ServerEndpoint{ID: model.NewID(), Transport: "tcp", URL: "tcp://198.51.100.20:8443", Source: model.Observed, ExpiresAt: time.Now().UTC().Add(time.Hour)}
+	oldManual := model.ServerEndpoint{ID: model.NewID(), Transport: "tcp", URL: "tcp://203.0.113.1:8443", Source: model.Manual}
+
+	cur, _ := db.Read()
+	updated, err := db.Update(cur.Revision, func(s *model.State) error {
+		s.ClusterID = model.NewID()
+		s.ClusterCA = ca.PEM
+		s.Servers = []model.Server{{
+			ID:        serverID,
+			Name:      "ctrl-1",
+			PublicKey: pub,
+			Endpoints: []model.ServerEndpoint{ifaceEp, obsEp, oldManual},
+		}}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	payload, _ := json.Marshal(map[string]any{
+		"name": "ctrl-renamed",
+		"manual_endpoints": []map[string]any{{
+			"transport": "wss",
+			"url":       "wss://ctrl.example.com:443",
+		}},
+	})
+	req := httptest.NewRequest(http.MethodPatch, "/api/v1/servers/"+string(serverID), bytes.NewReader(payload))
+	req.SetPathValue("id", string(serverID))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiToken)
+	req.Header.Set("If-Match", `"`+jsonRevision(updated.Revision)+`"`)
+	rec := httptest.NewRecorder()
+	srv.auth.require(srv.patchServer)(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("PATCH server = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	after, _ := db.Read()
+	got := after.Servers[0].Endpoints
+	if len(got) != 3 {
+		t.Fatalf("expected 2 automatic + 1 manual endpoints, got %+v", got)
+	}
+	sources := map[model.EndpointSource]int{}
+	for _, ep := range got {
+		sources[ep.Source]++
+	}
+	if sources[model.Interface] != 1 || sources[model.Observed] != 1 || sources[model.Manual] != 1 {
+		t.Fatalf("automatic endpoints lost on PATCH: %+v", got)
+	}
+}
+
+func jsonRevision(rev uint64) string {
+	raw, _ := json.Marshal(rev)
+	return string(raw)
 }

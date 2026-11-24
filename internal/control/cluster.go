@@ -103,7 +103,7 @@ func (s *Server) patchServer(w http.ResponseWriter, r *http.Request) {
 				p.STUNServers = append([]string{}, (*input.STUNServers)...)
 			}
 			if input.ManualEndpoints != nil {
-				endpoints := []model.ServerEndpoint{}
+				manual := []model.ServerEndpoint{}
 				urls := map[string]bool{}
 				for _, e := range *input.ManualEndpoints {
 					e.Source = model.Manual
@@ -115,9 +115,15 @@ func (s *Server) patchServer(w http.ResponseWriter, r *http.Request) {
 						return errors.New("duplicate endpoint URL")
 					}
 					urls[e.URL] = true
-					endpoints = append(endpoints, e)
+					manual = append(manual, e)
 				}
-				p.Endpoints = endpoints
+				endpoints := []model.ServerEndpoint{}
+				for _, e := range p.Endpoints {
+					if e.Source != model.Manual && !urls[e.URL] {
+						endpoints = append(endpoints, e)
+					}
+				}
+				p.Endpoints = append(endpoints, manual...)
 			}
 			return nil
 		}
