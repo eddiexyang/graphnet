@@ -508,3 +508,34 @@ func hasOrigin(v View, origin model.ID) bool {
 	}
 	return false
 }
+
+// A relay that resets AgeMS on a dead origin's last advertisement cannot keep
+// it alive: its signed sequence, the origin's clock when it was made, bounds
+// the age it may claim to one MaxAge of clock skew.
+func TestResetAgeCannotResurrectStaleAdvertisement(t *testing.T) {
+	l := newLab(t)
+	l.run(time.Second)
+	netID := l.state.Networks[0].ID
+	engA := l.engines[nodeA]
+	keyB := agentKeyFor(l.state, l.state.Agents[1].ID)
+	advert := func(born time.Time) []byte {
+		lsa := LSA{Network: netID, Origin: nodeB, Revision: 7, Sequence: uint64(born.UnixNano()), Up: []model.ID{edgeAB}, Sync: true}
+		lsa.Sign(keyB)
+		lsa.AgeMS = 0 // what a replaying relay claims
+		raw, _ := json.Marshal(lsa)
+		return raw
+	}
+	if err := engA.Receive(netID, nodeB, advert(l.now.Add(-2*MaxAge))); err == nil {
+		t.Fatal("advertisement originated two MaxAge ago accepted with AgeMS=0")
+	}
+	// Within the skew allowance it is accepted, but expires on the origin's clock.
+	born := l.now.Add(-MaxAge - time.Minute)
+	delete(engA.networks[netID].db, nodeB)
+	if err := engA.Receive(netID, nodeB, advert(born)); err != nil {
+		t.Fatal(err)
+	}
+	arrived := engA.networks[netID].db[nodeB].arrived
+	if want := born.Add(MaxAge); !arrived.Equal(want) {
+		t.Fatalf("stale advertisement counted from %s, want at most %s", arrived, want)
+	}
+}

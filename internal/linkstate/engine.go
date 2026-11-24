@@ -289,6 +289,16 @@ func (e *Engine) Receive(networkID, peer model.ID, raw []byte) error {
 		e.stats.Rejected.Add(1)
 		return errors.New("invalid link-state sequence")
 	}
+	// The signed sequence is the origin's clock when it originated the
+	// advertisement. AgeMS is not signed, so a relay could reset it on a dead
+	// origin's last advertisement forever; the sequence bounds the age it may
+	// claim, allowing one maxAge of clock skew as the upper bound above does.
+	born := time.Unix(0, int64(min(lsa.Sequence, math.MaxInt64)))
+	if now.Sub(born) >= 2*lsa.maxAge() {
+		e.mu.Unlock()
+		e.stats.Rejected.Add(1)
+		return errors.New("expired link-state advertisement")
+	}
 	if !lsa.Verify(dest.PublicKey) {
 		e.mu.Unlock()
 		e.stats.Rejected.Add(1)
@@ -324,7 +334,11 @@ func (e *Engine) Receive(networkID, peer model.ID, raw []byte) error {
 	if old, ok := n.db[lsa.Origin]; !ok || !slices.Equal(old.lsa.Up, lsa.Up) || !slices.Equal(old.lsa.Fallback, lsa.Fallback) {
 		e.eventLocked("received", networkID, lsa.Origin, "", lsa.Sequence)
 	}
-	n.db[lsa.Origin] = entry{lsa: lsa, up: up, fallback: fallback, arrived: now.Add(-time.Duration(lsa.AgeMS) * time.Millisecond)}
+	arrived := now.Add(-time.Duration(lsa.AgeMS) * time.Millisecond)
+	if latest := born.Add(lsa.maxAge()); arrived.After(latest) {
+		arrived = latest
+	}
+	n.db[lsa.Origin] = entry{lsa: lsa, up: up, fallback: fallback, arrived: arrived}
 	e.scheduleSPFLocked()
 	var targets []model.ID
 	if !n.config.Self.Client {
