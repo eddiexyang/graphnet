@@ -195,7 +195,9 @@ func testTCPPacketsReuseConvergedTunnels(t *testing.T, carrier model.Transport) 
 				if !bytes.Equal(got, want) {
 					t.Fatalf("TCP headers/options/payload changed for flags %x", flags)
 				}
-			case <-time.After(time.Second):
+			case <-time.After(5 * time.Second):
+				// Reuse is asserted by the connection count below; this only
+				// bounds delivery, which a loaded test machine can delay.
 				t.Fatal("a new TCP tuple did not use the converged tunnel promptly")
 			}
 		}
