@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/eddiexyang/graphnet/internal/tunnel"
 	"gvisor.dev/gvisor/pkg/buffer"
@@ -103,8 +104,17 @@ func (n *netstack) protocol() tcpip.NetworkProtocolNumber {
 // Only the packet route connects the endpoint and starts a TCP handshake.
 type boundTCP struct {
 	tcpip.Endpoint
-	queue waiter.Queue
-	port  uint16
+	queue    waiter.Queue
+	port     uint16
+	stackCtx context.Context
+	release  func()
+}
+
+func (b *boundTCP) abortAndRelease() {
+	b.Close()
+	if b.release != nil {
+		b.release()
+	}
 }
 
 func (n *netstack) allocPort() (uint16, func(), error) {
@@ -134,29 +144,25 @@ func (n *netstack) allocPort() (uint16, func(), error) {
 	return 0, nil, errors.New("graphnet: no ephemeral source port available")
 }
 
-func (n *netstack) bindTCP() (*boundTCP, error) {
-	b := &boundTCP{}
+func (n *netstack) bindTCP(port uint16, release func()) (*boundTCP, error) {
+	onceRelease := sync.OnceFunc(release)
+	b := &boundTCP{port: port, stackCtx: n.ctx, release: onceRelease}
 	endpoint, err := n.stack.NewEndpoint(tcp.ProtocolNumber, n.protocol(), &b.queue)
 	if err != nil {
+		onceRelease()
 		return nil, errors.New(err.String())
 	}
 	b.Endpoint = endpoint
-	if err := endpoint.Bind(fullAddress(netip.AddrPortFrom(n.address(), 0))); err != nil {
-		endpoint.Close()
+	if err := endpoint.Bind(fullAddress(netip.AddrPortFrom(n.address(), port))); err != nil {
+		b.abortAndRelease()
 		return nil, errors.New(err.String())
 	}
-	address, err := endpoint.GetLocalAddress()
-	if err != nil {
-		endpoint.Close()
-		return nil, errors.New(err.String())
-	}
-	b.port = address.Port
 	return b, nil
 }
 
 func (b *boundTCP) connect(ctx context.Context, destination netip.AddrPort) (net.Conn, error) {
 	if err := ctx.Err(); err != nil {
-		b.Close()
+		b.abortAndRelease()
 		return nil, err
 	}
 	entry, ready := waiter.NewChannelEntry(waiter.WritableEvents)
@@ -166,17 +172,37 @@ func (b *boundTCP) connect(ctx context.Context, destination netip.AddrPort) (net
 	if _, pending := err.(*tcpip.ErrConnectStarted); pending {
 		select {
 		case <-ctx.Done():
-			b.Close()
+			b.abortAndRelease()
 			return nil, ctx.Err()
 		case <-ready:
 			err = b.LastError()
 		}
 	}
 	if err != nil {
-		b.Close()
+		b.abortAndRelease()
 		return nil, &net.OpError{Op: "connect", Net: "tcp", Addr: net.TCPAddrFromAddrPort(destination), Err: errors.New(err.String())}
 	}
-	return gonet.NewTCPConn(&b.queue, b.Endpoint), nil
+	conn := gonet.NewTCPConn(&b.queue, b.Endpoint)
+	go func() {
+		closeEntry, closed := waiter.NewChannelEntry(waiter.EventHUp)
+		b.queue.EventRegister(&closeEntry)
+		defer b.queue.EventUnregister(&closeEntry)
+		for {
+			state := tcp.EndpointState(b.Endpoint.State())
+			if state == tcp.StateClose || state == tcp.StateTimeWait || state == tcp.StateError {
+				b.release()
+				return
+			}
+			select {
+			case <-b.stackCtx.Done():
+				b.release()
+				return
+			case <-closed:
+			case <-time.After(50 * time.Millisecond):
+			}
+		}
+	}()
+	return conn, nil
 }
 
 // Read returns the next packet the stack sends, for the data plane.

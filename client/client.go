@@ -320,9 +320,8 @@ func (c *Client) DialTCP(ctx context.Context, destination netip.AddrPort) (net.C
 		return nil, &net.OpError{Op: "connect", Net: "tcp", Source: net.TCPAddrFromAddrPort(source), Addr: net.TCPAddrFromAddrPort(destination), Err: err}
 	}
 	if stream == nil {
-		releasePort()
-		endpoint, err := n.bindTCP()
-	if err != nil {
+		endpoint, err := n.bindTCP(port, releasePort)
+		if err != nil {
 			return nil, err
 		}
 		return endpoint.connect(ctx, destination)

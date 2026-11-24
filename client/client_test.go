@@ -385,3 +385,55 @@ func TestClientConnectionFollowsRouteChange(t *testing.T) {
 		}
 	}
 }
+
+func TestUnifiedEphemeralPortAllocationAcrossStreamAndPacketTCP(t *testing.T) {
+	ns, err := newNetstack(tunnel.Config{
+		Name:    "gnport0",
+		Address: netip.MustParsePrefix("10.42.0.9/16"),
+		MTU:     1400,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ns.Close()
+
+	// Simulate an active stream-mode connection holding the first ephemeral port (32768).
+	streamPort, releaseStream, err := ns.allocPort()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer releaseStream()
+
+	// Allocate and bind a packet-mode TCP endpoint; it must reserve a distinct port (32769)
+	// and never collide with streamPort, then return its port to the pool on Close.
+	pktPort, releasePkt, err := ns.allocPort()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pktPort == streamPort {
+		t.Fatalf("packet-mode TCP collided with stream-mode port %d", streamPort)
+	}
+	bound, err := ns.bindTCP(pktPort, releasePkt)
+	if err != nil {
+		t.Fatal("bindTCP failed:", err)
+	}
+	localAddr, tcpErr := bound.GetLocalAddress()
+	if tcpErr != nil {
+		t.Fatal(tcpErr)
+	}
+	if localAddr.Port != pktPort {
+		t.Fatalf("bound port = %d, want reserved %d", localAddr.Port, pktPort)
+	}
+	bound.abortAndRelease()
+
+	ns.portMu.Lock()
+	_, stillUsed := ns.ports[pktPort]
+	_, streamStillUsed := ns.ports[streamPort]
+	ns.portMu.Unlock()
+	if stillUsed {
+		t.Fatal("closed packet-mode TCP endpoint leaked its reserved port")
+	}
+	if !streamStillUsed {
+		t.Fatal("releasing packet-mode port released stream-mode port")
+	}
+}
