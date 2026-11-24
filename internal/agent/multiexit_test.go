@@ -134,13 +134,13 @@ func TestTCPConnectionResetsOnExitChange(t *testing.T) {
 			state.Agents = append(state.Agents, extraAgent)
 			state.Networks[0].Nodes = append(state.Networks[0].Nodes, extraNode)
 			state.Networks[0].LastIndex = 99
-			state.Networks[0].Nodes[0].AdvertisedSubnets = []model.AdvertisedSubnet{{Prefix: netip.MustParsePrefix("172.30.0.0/24"), GatewayMode: model.GatewayOff}}
+			state.Networks[0].Nodes[2].AdvertisedSubnets = []model.AdvertisedSubnet{{Prefix: netip.MustParsePrefix("172.30.0.0/24"), GatewayMode: model.GatewayOff}}
 			applyAll(t, agents, state)
 
 			state.Revision++
 			state.Networks[0].Nodes = state.Networks[0].Nodes[:4]
 			state.Agents = state.Agents[:4]
-			state.Networks[0].Nodes[0].AdvertisedSubnets = nil
+			state.Networks[0].Nodes[2].AdvertisedSubnets = nil
 			applyAll(t, agents, state)
 		case step == 1 && len(received) >= 2<<20:
 			step = 2

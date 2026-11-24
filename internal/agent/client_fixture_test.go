@@ -22,11 +22,15 @@ import (
 // clientFixture forces node 0 of graphAgents/streamAgents to run as an embedded
 // client node (DataPlaneOptions.Embedded = true, Node.Client = true) and routes
 // its TCP dials through OpenEmbeddedTCP + streamproxy.ClientConn, matching
-// package client's data path. Enable via -client-fixture or GRAPHNET_CLIENT_FIXTURE=1.
-var clientFixture = flag.Bool("client-fixture", false, "run node 0 in graphAgents as an embedded client node")
+// package client's data path. Enabled by default; disable via
+// -client-fixture=false or GRAPHNET_CLIENT_FIXTURE=0.
+var clientFixture = flag.Bool("client-fixture", true, "run node 0 in graphAgents as an embedded client node")
 
 func clientFixtureEnabled() bool {
-	return *clientFixture || os.Getenv("GRAPHNET_CLIENT_FIXTURE") == "1"
+	if v := os.Getenv("GRAPHNET_CLIENT_FIXTURE"); v != "" {
+		return v != "0" && v != "false"
+	}
+	return *clientFixture
 }
 
 type tcpTestConn interface {
