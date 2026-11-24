@@ -422,7 +422,7 @@ func (c *Channel) ReceiveOwnedBatch(ctx context.Context) ([]*packetbuf.Buffer, e
 			packetbuf.ReleaseAll(buffers)
 			return nil, err
 		}
-		allEncrypted := len(buffers) > 1
+		allEncrypted := len(buffers) > 1 && len(buffers) <= len(c.opened)
 		for _, b := range buffers {
 			if !encrypted(b.Data) {
 				allEncrypted = false
@@ -436,10 +436,14 @@ func (c *Channel) ReceiveOwnedBatch(ctx context.Context) ([]*packetbuf.Buffer, e
 			}
 			errs := c.session.OpenBatchInPlace(frames)
 			for i, decodeErr := range errs {
-				buffers[i].Data = frames[i]
-				if decodeErr != nil && !errors.Is(decodeErr, secure.ErrReplay) && !(c.unreliable && !errors.Is(decodeErr, secure.ErrRekey)) {
-					err = decodeErr
+				if decodeErr != nil {
+					buffers[i].Data = nil
+					if !errors.Is(decodeErr, secure.ErrReplay) && !(c.unreliable && !errors.Is(decodeErr, secure.ErrRekey)) {
+						err = decodeErr
+					}
+					continue
 				}
+				buffers[i].Data = frames[i]
 			}
 		} else {
 			for _, b := range buffers {

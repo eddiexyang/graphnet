@@ -177,6 +177,7 @@ func (s *Session) open(dst, frame []byte) ([]byte, error) {
 func (s *Session) OpenBatchInPlace(frames [][]byte) []error {
 	errs := make([]error, len(frames))
 	if len(frames) > len(s.batchNonces) {
+		clear(frames)
 		for i := range errs {
 			errs[i] = errors.New("encrypted batch too large")
 		}
@@ -185,6 +186,7 @@ func (s *Session) OpenBatchInPlace(frames [][]byte) []error {
 	s.receiveMu.Lock()
 	defer s.receiveMu.Unlock()
 	if time.Since(s.created) >= MaxSessionAge {
+		clear(frames)
 		for i := range errs {
 			errs[i] = ErrRekey
 		}
@@ -193,12 +195,14 @@ func (s *Session) OpenBatchInPlace(frames [][]byte) []error {
 	bytes := 0
 	for i, frame := range frames {
 		if len(frame) <= Overhead || len(frame) > MaxPlaintext+Overhead {
+			frames[i] = nil
 			errs[i] = errors.New("invalid encrypted frame size")
 			continue
 		}
 		nonce := uint64(binary.BigEndian.Uint32(frame[:NonceSize]))
 		s.batchNonces[i] = nonce
 		if nonce == 0 || s.seen[nonce%ReplayWindow] == nonce || s.highest >= ReplayWindow && nonce <= s.highest-ReplayWindow {
+			frames[i] = nil
 			errs[i] = ErrReplay
 			continue
 		}

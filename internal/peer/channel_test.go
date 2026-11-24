@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/eddiexyang/graphnet/internal/model"
+	"github.com/eddiexyang/graphnet/internal/packetbuf"
 	"github.com/eddiexyang/graphnet/internal/secure"
 	"github.com/eddiexyang/graphnet/internal/testutil"
 	"github.com/eddiexyang/graphnet/internal/transport"
@@ -267,4 +268,116 @@ func TestPacketChannelBatchWithLegacyReceiver(t *testing.T) {
 			})
 		}
 	}
+}
+
+type oversizedBatchTransport struct {
+	transport.Conn
+	batches chan []*packetbuf.Buffer
+}
+
+func (o *oversizedBatchTransport) Unreliable() bool { return true }
+
+func (o *oversizedBatchTransport) SetLocalPublicKey(pub ed25519.PublicKey) {
+	if hp, ok := o.Conn.(interface{ SetLocalPublicKey(ed25519.PublicKey) }); ok {
+		hp.SetLocalPublicKey(pub)
+	}
+}
+
+func (o *oversizedBatchTransport) SetPeerPublicKey(pub ed25519.PublicKey) {
+	if hp, ok := o.Conn.(interface{ SetPeerPublicKey(ed25519.PublicKey) }); ok {
+		hp.SetPeerPublicKey(pub)
+	}
+}
+
+func (o *oversizedBatchTransport) ReceiveOwnedBatch(ctx context.Context) ([]*packetbuf.Buffer, error) {
+	select {
+	case b := <-o.batches:
+		return b, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func TestReceiveOwnedBatchRejectsForgedOversizedBatchOnUDP(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	seedA, seedB := make([]byte, ed25519.SeedSize), make([]byte, ed25519.SeedSize)
+	seedA[0], seedB[0] = 7, 8
+	keyA, keyB := ed25519.NewKeyFromSeed(seedA), ed25519.NewKeyFromSeed(seedB)
+	a := secure.Config{Network: testutil.ID(1), Edge: testutil.ID(2), Local: testutil.ID(3), Peer: testutil.ID(4), Transport: model.UDP, Cipher: model.ChaCha20Poly1305, Identity: keyA, PeerIdentity: keyB.Public().(ed25519.PublicKey)}
+	b := a
+	b.Local, b.Peer, b.Identity, b.PeerIdentity = a.Peer, a.Local, keyB, keyA.Public().(ed25519.PublicKey)
+
+	x, y := net.Pipe()
+	defer x.Close()
+	defer y.Close()
+	batches := make(chan []*packetbuf.Buffer, 2)
+	accepted := make(chan *Channel, 1)
+	go func() {
+		ch, err := Accept(ctx, &oversizedBatchTransport{Conn: transport.NewStream(y), batches: batches}, model.UDP, keyB, nil, func(secure.ClientHello) (secure.Config, error) { return b, nil })
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		accepted <- ch
+	}()
+	sx := transport.NewStream(x)
+	sx.SetLocalPublicKey(keyA.Public().(ed25519.PublicKey))
+	sender, err := Dial(ctx, sx, a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sender.Close()
+	receiver := <-accepted
+	defer receiver.Close()
+
+	// Enqueue 140 (> 128) forged encrypted-kind frames followed by 1 genuine encrypted frame.
+	forged := make([]*packetbuf.Buffer, 140)
+	for i := range forged {
+		buf := packetbuf.Get(48)
+		buf.Data[0] = dataKind
+		for j := 1; j < len(buf.Data); j++ {
+			buf.Data[j] = 0xaa
+		}
+		forged[i] = buf
+	}
+	batches <- forged
+
+	validFrame := make(chan []byte, 1)
+	captureConn := &captureSendTransport{Conn: sender.conn, captured: validFrame}
+	sender.conn = captureConn
+	_ = sender.Send(ctx, []byte("authentic-after-forged"))
+	rawValid := <-validFrame
+	batches <- []*packetbuf.Buffer{packetbuf.Wrap(rawValid)}
+
+	got, err := receiver.ReceiveOwnedBatch(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer packetbuf.ReleaseAll(got)
+	if len(got) != 1 || string(got[0].Data) != "authentic-after-forged" {
+		t.Fatalf("forged oversized batch leaked ciphertext: count=%d first=%q", len(got), got[0].Data)
+	}
+}
+
+type captureSendTransport struct {
+	transport.Conn
+	captured chan []byte
+}
+
+func (c *captureSendTransport) SetLocalPublicKey(pub ed25519.PublicKey) {
+	if hp, ok := c.Conn.(interface{ SetLocalPublicKey(ed25519.PublicKey) }); ok {
+		hp.SetLocalPublicKey(pub)
+	}
+}
+
+func (c *captureSendTransport) SetRemotePublicKey(pub ed25519.PublicKey) {
+	if hp, ok := c.Conn.(interface{ SetRemotePublicKey(ed25519.PublicKey) }); ok {
+		hp.SetRemotePublicKey(pub)
+	}
+}
+
+func (c *captureSendTransport) Send(_ context.Context, raw []byte) error {
+	c.captured <- bytes.Clone(raw)
+	return nil
 }
