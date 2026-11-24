@@ -1,5 +1,7 @@
 import ipaddr from 'ipaddr.js'
+import { equal } from './equal'
 import { effectiveEdges, pruneGroups, type FullMeshGroup, type GroupLink } from './groups'
+export { equal }
 export type Transport = 'udp' | 'tcp' | 'quic' | 'ws' | 'wss'
 export const transports: Transport[] = ['udp', 'tcp', 'quic', 'ws', 'wss']
 export type Endpoint = {
@@ -225,7 +227,6 @@ export const newID = () =>
   Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) =>
     byte.toString(16).padStart(2, '0'),
   ).join('')
-export const equal = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b)
 export const rate = (n: number | undefined) =>
   n === undefined
     ? '—'

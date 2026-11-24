@@ -6,6 +6,7 @@
   "packageManager": "pnpm@10.33.3",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
+    "test": "node --test scripts/*.test.mjs",
     "build": "tsc -b && vite build && node scripts/licenses.mjs",
     "format": "prettier --write src scripts *.ts *.json index.html",
     "format:check": "prettier --check src scripts *.ts *.json index.html"

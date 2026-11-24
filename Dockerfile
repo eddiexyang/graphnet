@@ -12,6 +12,7 @@ COPY go.mod go.sum ./
 COPY internal/boltcompat/ ./internal/boltcompat/
 RUN go mod download
 COPY . .
+COPY --from=frontend /src/internal/webui/dist/ ./internal/webui/dist/
 ARG TARGETOS
 ARG TARGETARCH
 ARG VERSION=dev
