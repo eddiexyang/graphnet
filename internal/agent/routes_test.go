@@ -48,4 +48,35 @@ func TestDiscoveryRevisionKeepsLiveRoutes(t *testing.T) {
 	if !reflect.DeepEqual(snap.Networks[0].Routes, next.Networks[0].Routes) {
 		t.Fatal("mutated input routes")
 	}
+
+	// Deleting one leaf destination preserves live routes to remaining destinations.
+	partial := snap.Clone()
+	partial.Revision++
+	removedDest := partial.Networks[0].Directory[len(partial.Networks[0].Directory)-1].NodeID
+	partial.Networks[0].Directory = partial.Networks[0].Directory[:len(partial.Networks[0].Directory)-1]
+	var keptPeers []int
+	for i, p := range partial.Networks[0].Peers {
+		if p.Node.ID != removedDest {
+			keptPeers = append(keptPeers, i)
+		}
+	}
+	filteredPeers := partial.Networks[0].Peers[:0]
+	for _, idx := range keptPeers {
+		filteredPeers = append(filteredPeers, partial.Networks[0].Peers[idx])
+	}
+	partial.Networks[0].Peers = filteredPeers
+	filteredTop := partial.Networks[0].Topology[:0]
+	for _, e := range partial.Networks[0].Topology {
+		if e.A != removedDest && e.B != removedDest {
+			filteredTop = append(filteredTop, e)
+		}
+	}
+	partial.Networks[0].Topology = filteredTop
+	got = carryLiveRoutes(partial, &live)
+	if err := got.Validate(snap.AgentID); err != nil {
+		t.Fatal("partial deletion produced invalid snapshot:", err)
+	}
+	if len(got.Networks[0].Routes) == 0 {
+		t.Fatal("deleting one destination wiped all unrelated live routes")
+	}
 }

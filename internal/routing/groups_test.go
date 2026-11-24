@@ -102,8 +102,11 @@ func TestGroupedTopologyRouting(t *testing.T) {
 	clone = s.Clone()
 	clone.Networks[0].Nodes = clone.Networks[0].Nodes[2:]
 	clone.Networks[0].PruneGroups()
-	if len(clone.Networks[0].Groups) != 0 || len(clone.Networks[0].GroupLinks) != 0 {
-		t.Fatal("orphaned group or aggregate after deletion")
+	if len(clone.Networks[0].Groups) != 1 || len(clone.Networks[0].Groups[0].Members) != 1 || len(clone.Networks[0].GroupLinks) != 1 {
+		t.Fatalf("1-member group or its group link dropped on node deletion: groups=%+v links=%+v", clone.Networks[0].Groups, clone.Networks[0].GroupLinks)
+	}
+	if err := clone.Validate(); err != nil {
+		t.Fatal("pruned 1-member group invalid:", err)
 	}
 }
 
@@ -203,8 +206,11 @@ func TestGroupToGroupLinkAndOverrides(t *testing.T) {
 	}
 	clone.Networks[0].Nodes = clone.Networks[0].Nodes[:2]
 	clone.Networks[0].PruneGroups()
-	if len(clone.Networks[0].GroupLinks) != 0 {
-		t.Fatal("group-to-group link survived its source group")
+	if len(clone.Networks[0].Groups) != 2 || len(clone.Networks[0].Groups[1].Members) != 0 || len(clone.Networks[0].GroupLinks) != 1 {
+		t.Fatalf("0-member group or group-to-group link dropped: groups=%+v links=%+v", clone.Networks[0].Groups, clone.Networks[0].GroupLinks)
+	}
+	if err := clone.Validate(); err != nil {
+		t.Fatal("pruned 0-member group invalid:", err)
 	}
 }
 

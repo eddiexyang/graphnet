@@ -22,9 +22,41 @@ func carryLiveRoutes(snapshot model.Snapshot, previous *model.RouteUpdate) model
 	}
 	for i := range next.Networks {
 		n := &next.Networks[i]
-		n.Routes = append([]model.Route{}, old[n.ID]...)
-		// Topology edits may invalidate a retained route. Withdraw that network
-		// until its new live table arrives instead of falling back to static paths.
+		directory := make(map[model.ID]bool, len(n.Directory))
+		for _, d := range n.Directory {
+			if d.NodeID != n.Self.ID {
+				directory[d.NodeID] = true
+			}
+		}
+		peers := make(map[model.ID]model.Peer, len(n.Peers))
+		for _, p := range n.Peers {
+			peers[p.Node.ID] = p
+		}
+		maxCost := uint64(model.MaxNodes) * uint64(^uint32(0))
+		seen := make(map[model.ID]bool, len(old[n.ID]))
+		kept := make([]model.Route, 0, len(old[n.ID]))
+		for _, r := range old[n.ID] {
+			if !directory[r.Destination] || seen[r.Destination] || r.Cost > maxCost {
+				continue
+			}
+			peer, ok := peers[r.NextHop]
+			if !ok || r.Cost < uint64(peer.Edge.Weight) || (r.Destination == r.NextHop && r.Cost != uint64(peer.Edge.Weight)) {
+				continue
+			}
+			var alts []model.ID
+			prev := r.NextHop
+			for _, alt := range r.Alternates {
+				altPeer, ok := peers[alt]
+				if ok && alt > prev && r.Cost >= uint64(altPeer.Edge.Weight) {
+					alts = append(alts, alt)
+					prev = alt
+				}
+			}
+			r.Alternates = alts
+			seen[r.Destination] = true
+			kept = append(kept, r)
+		}
+		n.Routes = kept
 		check := next
 		check.Networks = []model.NetworkConfig{*n}
 		if check.Validate(snapshot.AgentID) != nil {

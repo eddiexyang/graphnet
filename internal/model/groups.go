@@ -327,33 +327,43 @@ func validateOverrides(overrides []EdgeOverride, expanded func(a, b ID) bool) er
 	return nil
 }
 
-// PruneGroups removes deleted nodes and groups which no longer have a pair.
+// PruneGroups removes deleted nodes and overrides whose pairs no longer expand,
+// while preserving 0- and 1-member groups and their group links.
 func (n *Network) PruneGroups() {
-	nodes := map[ID]bool{}
+	nodes := map[ID]Node{}
 	for _, node := range n.Nodes {
-		nodes[node.ID] = true
+		nodes[node.ID] = node
 	}
-	stale := func(o EdgeOverride) bool { return !nodes[o.A] || !nodes[o.B] }
-	groups := []FullMeshGroup{}
+	hasNode := func(id ID) bool { _, ok := nodes[id]; return ok }
+	groups := make([]FullMeshGroup, 0, len(n.Groups))
+	groupMap := make(map[ID]FullMeshGroup, len(n.Groups))
 	for _, g := range n.Groups {
-		g.Members = slices.DeleteFunc(slices.Clone(g.Members), func(id ID) bool { return !nodes[id] })
-		g.Overrides = slices.DeleteFunc(slices.Clone(g.Overrides), stale)
-		if len(g.Members) >= 2 {
-			groups = append(groups, g)
-		}
+		g.Members = slices.DeleteFunc(slices.Clone(g.Members), func(id ID) bool { return !hasNode(id) })
+		g.Overrides = slices.DeleteFunc(slices.Clone(g.Overrides), func(o EdgeOverride) bool {
+			return o.A == o.B || !hasNode(o.A) || !hasNode(o.B) || (nodes[o.A].Client && nodes[o.B].Client) || !slices.Contains(g.Members, o.A) || !slices.Contains(g.Members, o.B)
+		})
+		groups = append(groups, g)
+		groupMap[g.ID] = g
 	}
 	n.Groups = groups
-	groupIDs := map[ID]bool{}
-	for _, g := range groups {
-		groupIDs[g.ID] = true
-	}
 	n.GroupLinks = slices.DeleteFunc(slices.Clone(n.GroupLinks), func(l GroupLink) bool {
 		if l.SourceGroup != "" {
-			return !groupIDs[l.SourceGroup] || !groupIDs[l.Group]
+			_, okSrc := groupMap[l.SourceGroup]
+			_, okDst := groupMap[l.Group]
+			return !okSrc || !okDst || l.SourceGroup == l.Group
 		}
-		return !nodes[l.Node] || !groupIDs[l.Group]
+		g, okDst := groupMap[l.Group]
+		return !hasNode(l.Node) || !okDst || slices.Contains(g.Members, l.Node)
 	})
 	for i := range n.GroupLinks {
-		n.GroupLinks[i].Overrides = slices.DeleteFunc(slices.Clone(n.GroupLinks[i].Overrides), stale)
+		l := &n.GroupLinks[i]
+		near := n.sources(*l)
+		target := groupMap[l.Group].Members
+		l.Overrides = slices.DeleteFunc(slices.Clone(l.Overrides), func(o EdgeOverride) bool {
+			if o.A == o.B || !hasNode(o.A) || !hasNode(o.B) || (nodes[o.A].Client && nodes[o.B].Client) {
+				return true
+			}
+			return !(slices.Contains(near, o.A) && slices.Contains(target, o.B) || slices.Contains(near, o.B) && slices.Contains(target, o.A))
+		})
 	}
 }
