@@ -155,7 +155,7 @@ func (r *Router) TCPRoute(request streamproxy.Request, ingress model.ID) (next m
 		return "", false, ErrPeer
 	}
 	source, dest := n.byNode[wireID(request.Source)], n.byNode[wireID(request.Destination)]
-	if !n.admits(source, request.From.Addr()) || ingress != "" && source.id == n.self.ID {
+	if !n.admits(source, request.From.Addr()) || ingress != "" && (source.id == n.self.ID || !n.mayRelay(ingress, source)) {
 		return "", false, ErrSource
 	}
 	if !n.admits(dest, request.To.Addr()) {

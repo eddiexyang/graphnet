@@ -53,6 +53,8 @@ type node struct {
 	address netip.Addr
 	wire    [16]byte
 	index   uint16
+	// client marks a leaf node: it only originates its own traffic.
+	client bool
 }
 
 type network struct {
@@ -233,7 +235,7 @@ func (r *Router) Configure(snapshot model.Snapshot) error {
 		n.subnets = map[netip.Prefix][]exit{}
 		lengths := map[int]bool{}
 		for _, dest := range config.Directory {
-			entry := &node{id: dest.NodeID, address: dest.Address, index: dest.Index}
+			entry := &node{id: dest.NodeID, address: dest.Address, index: dest.Index, client: dest.Client}
 			if _, err := hex.Decode(entry.wire[:], []byte(dest.NodeID)); err != nil {
 				return err
 			}
@@ -528,7 +530,7 @@ func (r *Router) fromPeer(ctx context.Context, peerID model.ID, frame []byte, de
 		return ErrMTU
 	}
 	source, ok := n.byNode[p.Source]
-	if !ok || source.id == n.self.ID {
+	if !ok || source.id == n.self.ID || !n.mayRelay(peerID, source) {
 		return ErrSource
 	}
 	destination, ok := n.byNode[p.Destination]
@@ -778,6 +780,20 @@ func (n *network) admits(candidate *node, ip netip.Addr) bool {
 // sourceOwner names a source Node for a header a compact Link omitted: the
 // overlay host, or an advertiser of the longest matching prefix other than
 // this Node, which never receives its own traffic from a peer.
+// mayRelay reports whether a frame from source may arrive from neighbor peerID.
+// A client neighbor never carries other nodes' traffic, so everything it sends
+// must be its own.
+func (n *network) mayRelay(peerID model.ID, source *node) bool {
+	if source == nil {
+		return false
+	}
+	if source.id == peerID {
+		return true
+	}
+	peer := n.byNode[wireID(peerID)]
+	return peer == nil || !peer.client
+}
+
 func (n *network) sourceOwner(ip netip.Addr) *node {
 	if host := n.byAddress[ip]; host != nil {
 		return host
