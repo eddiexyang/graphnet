@@ -34,15 +34,16 @@ func TestWebSocketFramingBatchAndTLS13X25519(t *testing.T) {
 
 	for _, kind := range []model.Transport{model.WS, model.WSS} {
 		t.Run(string(kind), func(t *testing.T) {
-			proto := WebSocketProtocol(kind)
 			accepted := make(chan *Stream, 1)
 			var negotiatedTLS tls.ConnectionState
 			handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("Sec-WebSocket-Protocol") != "" {
+					t.Errorf("client sent unexpected subprotocol %q", r.Header.Get("Sec-WebSocket-Protocol"))
+				}
 				if r.TLS != nil {
 					negotiatedTLS = *r.TLS
 				}
 				c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-					Subprotocols:    []string{proto},
 					CompressionMode: websocket.CompressionDisabled,
 				})
 				if err != nil {

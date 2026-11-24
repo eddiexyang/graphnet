@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package graphnet.control.v1;
+package stream.v1;
 
 option go_package = "github.com/eddiexyang/graphnet/api/controlv1";
 

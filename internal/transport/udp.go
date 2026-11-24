@@ -275,7 +275,7 @@ func (h *UDP) receivePackets(socket *net.UDPConn, packets []udpPacket) {
 		}
 		remoteAddr := netip.AddrPortFrom(remote.Addr().Unmap(), remote.Port())
 		if h.quic != nil {
-			if raw[0] == quicKnockKind && n == quicKnockSize && h.quic.knock(raw, remoteAddr, now) {
+			if n == quicKnockSize && h.quic.knock(raw, remoteAddr, now) {
 				continue
 			}
 			if h.quic.admit(raw, remoteAddr, now) {

@@ -130,7 +130,11 @@ func Accept(parent context.Context, conn transport.Conn, kind model.Transport, i
 	}
 	var peerIdentity ed25519.PublicKey
 	replyBody, session, err := secure.RespondHandshake(identity, first[1:], replay, func(hello secure.ClientHello) (secure.Config, error) {
-		if hello.Transport != kind {
+		if kind == "" {
+			if hello.Transport != model.WS && hello.Transport != model.WSS {
+				return secure.Config{}, errors.New("hello transport does not match WebSocket listener")
+			}
+		} else if hello.Transport != kind {
 			return secure.Config{}, errors.New("hello transport does not match listener")
 		}
 		cfg, err := resolve(hello)

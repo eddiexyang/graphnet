@@ -13,18 +13,6 @@ import (
 
 type wsRawConnKey struct{}
 
-func requestedWebSocketKind(header string) (model.Transport, bool) {
-	for _, part := range strings.Split(header, ",") {
-		switch strings.TrimSpace(part) {
-		case transport.WebSocketProtocol(model.WS):
-			return model.WS, true
-		case transport.WebSocketProtocol(model.WSS):
-			return model.WSS, true
-		}
-	}
-	return "", false
-}
-
 func headerHasToken(h http.Header, key, token string) bool {
 	for _, v := range h.Values(key) {
 		for _, part := range strings.Split(v, ",") {
@@ -52,13 +40,15 @@ func (m *Mesh) acceptWebSocket(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing Sec-WebSocket-Key", http.StatusBadRequest)
 		return
 	}
-	kind, ok := requestedWebSocketKind(r.Header.Get("Sec-WebSocket-Protocol"))
-	if !ok {
-		http.Error(w, "unsupported peer subprotocol", http.StatusBadRequest)
-		return
-	}
 	path := transport.WebSocketPath(r.URL)
-	if !m.allowsEndpoint(kind, path) {
+	var kind model.Transport
+	if r.TLS != nil {
+		if !m.allowsEndpoint(model.WSS, path) {
+			http.NotFound(w, r)
+			return
+		}
+		kind = model.WSS
+	} else if !m.allowsEndpoint(model.WS, path) && !m.allowsEndpoint(model.WSS, path) {
 		http.NotFound(w, r)
 		return
 	}
@@ -78,11 +68,10 @@ func (m *Mesh) acceptWebSocket(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	proto := transport.WebSocketProtocol(kind)
 	accept := transport.WebSocketAcceptKey(clientKey)
 	resp := fmt.Sprintf(
-		"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\nSec-WebSocket-Protocol: %s\r\n\r\n",
-		accept, proto,
+		"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n",
+		accept,
 	)
 	if _, err := brw.WriteString(resp); err != nil || brw.Flush() != nil {
 		conn.Close()
@@ -90,7 +79,7 @@ func (m *Mesh) acceptWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	rawSock, _ := r.Context().Value(wsRawConnKey{}).(net.Conn)
 	// WSS may terminate at a CDN or reverse proxy (optionally with mTLS origin
-	// pull). The outer hop is never trusted as an Agent identity; the inner
-	// Noise handshake still verifies graph membership.
+	// pull). No subprotocol is negotiated; the encrypted Noise IK Message 1
+	// specifies WS vs WSS and binds it to the configured endpoint policy.
 	m.accept(transport.NewWebSocket(conn, brw.Reader, rawSock, local, remote, path, false), kind)
 }

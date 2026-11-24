@@ -399,7 +399,16 @@ func (m *Mesh) accept(conn transport.Conn, kind model.Transport) {
 		ctx, cancel := context.WithTimeout(m.ctx, 12*time.Second)
 		defer cancel()
 		var selected *group
+		actualKind := kind
 		channel, err := peer.Accept(ctx, conn, kind, m.identity, &m.replay, func(hello secure.ClientHello) (secure.Config, error) {
+			resolvedKind := kind
+			if resolvedKind == "" {
+				ws, ok := conn.(*transport.WebSocket)
+				if !ok || !m.allowsEndpoint(hello.Transport, ws.EndpointPath()) {
+					return secure.Config{}, errors.New("WebSocket endpoint policy denied")
+				}
+				resolvedKind = hello.Transport
+			}
 			m.mu.Lock()
 			g := m.groups[key{hello.Network, hello.Initiator}]
 			m.mu.Unlock()
@@ -407,11 +416,12 @@ func (m *Mesh) accept(conn transport.Conn, kind model.Transport) {
 				return secure.Config{}, errors.New("unconfigured peer")
 			}
 			cfg := g.policy.Load()
-			if cfg.self != hello.Responder || cfg.peer.Edge.ID != hello.Edge || !slices.Contains(cfg.peer.Edge.Transports, kind) {
+			if cfg.self != hello.Responder || cfg.peer.Edge.ID != hello.Edge || !slices.Contains(cfg.peer.Edge.Transports, resolvedKind) {
 				return secure.Config{}, errors.New("edge policy denied")
 			}
 			selected = g
-			return m.secure(cfg, kind), nil
+			actualKind = resolvedKind
+			return m.secure(cfg, resolvedKind), nil
 		})
 		if err != nil {
 			return
@@ -444,7 +454,7 @@ func (m *Mesh) accept(conn transport.Conn, kind model.Transport) {
 			if !scoped {
 				continue
 			}
-			if c.ID == introduction.Candidate && c.Endpoint.Transport == kind && candidateIngress(c, conn) {
+			if c.ID == introduction.Candidate && c.Endpoint.Transport == actualKind && candidateIngress(c, conn) {
 				copy := c
 				candidate = &copy
 				break
@@ -462,11 +472,11 @@ func (m *Mesh) accept(conn transport.Conn, kind model.Transport) {
 			return
 		}
 		// The acceptor confirms each offered capability in band.
-		streams := introduction.TCPStreams && m.streamsEnabled() && streamTransport(kind)
+		streams := introduction.TCPStreams && m.streamsEnabled() && streamTransport(actualKind)
 		resume := introduction.TCPResume && m.resumeEnabled()
 		windows := introduction.Windows && streams && m.resumeEnabled()
 		linkState := introduction.LinkState && m.linkStateEnabled()
-		sizeProbe := introduction.SizeProbe && streamTransport(kind)
+		sizeProbe := introduction.SizeProbe && streamTransport(actualKind)
 		selected.register(channel, *candidate, introduction.PathExchange, linkCaps{streams: streams, resume: resume, windows: windows, streamHello: true, linkState: linkState, linkStateHello: true, sizeProbe: sizeProbe, sizeProbeHello: true, accepted: true, peerHeartbeat: time.Duration(introduction.Heartbeat) * time.Millisecond})
 	}()
 }

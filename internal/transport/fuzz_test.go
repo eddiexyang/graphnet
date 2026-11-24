@@ -26,7 +26,7 @@ func FuzzQUICGate(f *testing.F) {
 	_, identity, _ := ed25519.GenerateKey(nil)
 	q := &QUICHub{knocks: map[netip.AddrPort]time.Time{}}
 	q.ids = quicIDs{key: quicKey(identity.Seed(), "id")}
-	q.knockKey = quicKey(identity.Public().(ed25519.PublicKey), "GraphNet QUIC knock v1")
+	q.knockKey = quicKey(identity.Public().(ed25519.PublicKey), quicKnockLabel)
 	remote := netip.MustParseAddrPort("192.0.2.1:9")
 	f.Add(knockFor(identity.Public().(ed25519.PublicKey)))
 	f.Add(append([]byte{0xc0, 0, 0, 0, 1, 8}, make([]byte, 1200)...))

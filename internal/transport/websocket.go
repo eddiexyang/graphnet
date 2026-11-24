@@ -396,8 +396,6 @@ func (w *WebSocket) ReceiveOwnedBatch(ctx context.Context) ([]*packetbuf.Buffer,
 	return w.stream.ReceiveOwnedBatch(ctx)
 }
 
-func WebSocketProtocol(kind model.Transport) string { return "graphnet." + string(kind) + ".v1" }
-
 func WebSocketPath(u *url.URL) string {
 	if u == nil || u.EscapedPath() == "" {
 		return "/"
@@ -466,12 +464,11 @@ func DialWebSocketAt(ctx context.Context, endpoint model.Endpoint, family int, i
 		return nil, err
 	}
 	wsKey := base64.StdEncoding.EncodeToString(keyRaw[:])
-	protocol := WebSocketProtocol(endpoint.Transport)
 	path := WebSocketPath(parsed)
 
 	reqText := fmt.Sprintf(
-		"GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: %s\r\n\r\n",
-		path, parsed.Host, wsKey, protocol,
+		"GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n",
+		path, parsed.Host, wsKey,
 	)
 	if err := writeFull(conn, []byte(reqText)); err != nil {
 		cleanup()
@@ -497,7 +494,7 @@ func DialWebSocketAt(ctx context.Context, endpoint model.Endpoint, family int, i
 	if !headerContainsToken(resp.Header, "Upgrade", "websocket") ||
 		!headerContainsToken(resp.Header, "Connection", "upgrade") ||
 		resp.Header.Get("Sec-WebSocket-Accept") != WebSocketAcceptKey(wsKey) ||
-		resp.Header.Get("Sec-WebSocket-Protocol") != protocol {
+		resp.Header.Get("Sec-WebSocket-Protocol") != "" {
 		conn.Close()
 		return nil, errors.New("invalid WebSocket upgrade response")
 	}

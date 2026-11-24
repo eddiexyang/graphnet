@@ -25,6 +25,7 @@ import (
 	quic "github.com/eddiexyang/quic-go"
 	"github.com/eddiexyang/quic-go/bbr"
 	"github.com/eddiexyang/quic-go/congestion"
+	"golang.org/x/crypto/chacha20"
 	"golang.org/x/net/ipv4"
 )
 
@@ -36,16 +37,17 @@ const (
 	quicIDPrefix = 'Q'
 	// quicQueue bounds the datagrams waiting for QUIC's reader.
 	quicQueue = 4096
-	// A knock opens QUIC to its sender's address for quicKnockLife: kind,
-	// 8-byte Unix time, 8 random bytes, then quicKnockMAC bytes of
-	// HMAC-SHA256 keyed by the receiver's identity. Without one, a stranger's
-	// Initial gets no answer.
-	quicKnockKind  = 0x47
-	quicKnockSize  = 1 + 8 + 8 + quicKnockMAC
-	quicKnockMAC   = 16
+	// A knock opens QUIC to its sender's address for quicKnockLife: 8-byte
+	// ChaCha20-masked Unix time, 12 random nonce bytes, then quicKnockMAC
+	// bytes of HMAC-SHA256 keyed by the receiver's identity. Without one, a
+	// stranger's Initial gets no answer.
+	quicKnockNonce = 12
+	quicKnockMAC   = 12
+	quicKnockSize  = 8 + quicKnockNonce + quicKnockMAC
 	quicKnockLife  = time.Minute
 	quicKnockSkew  = time.Minute
 	quicKnockLimit = 4096
+	quicKnockLabel = "GraphNet QUIC knock v2"
 )
 
 // QUIC carries a Link as one bidirectional stream of length-framed messages,
@@ -114,13 +116,19 @@ func (q *QUICHub) knock(raw []byte, remote netip.AddrPort, now time.Time) bool {
 	if len(raw) != quicKnockSize {
 		return false
 	}
-	sent := time.Unix(int64(binary.BigEndian.Uint64(raw[1:9])), 0)
-	if sent.Before(now.Add(-quicKnockSkew)) || sent.After(now.Add(quicKnockSkew)) {
-		return false
-	}
 	mac := hmac.New(sha256.New, q.knockKey[:])
 	mac.Write(raw[:quicKnockSize-quicKnockMAC])
 	if subtle.ConstantTimeCompare(mac.Sum(nil)[:quicKnockMAC], raw[quicKnockSize-quicKnockMAC:]) != 1 {
+		return false
+	}
+	stream, err := chacha20.NewUnauthenticatedCipher(q.knockKey[:], raw[8:8+quicKnockNonce])
+	if err != nil {
+		return false
+	}
+	var tsRaw [8]byte
+	stream.XORKeyStream(tsRaw[:], raw[:8])
+	sent := time.Unix(int64(binary.BigEndian.Uint64(tsRaw[:])), 0)
+	if sent.Before(now.Add(-quicKnockSkew)) || sent.After(now.Add(quicKnockSkew)) {
 		return false
 	}
 	if len(q.knocks) >= quicKnockLimit {
@@ -139,14 +147,19 @@ func (q *QUICHub) knock(raw []byte, remote netip.AddrPort, now time.Time) bool {
 
 // knockFor returns a knock toward the Agent of identity.
 func knockFor(identity ed25519.PublicKey) []byte {
-	key := quicKey(identity, "GraphNet QUIC knock v1")
+	key := quicKey(identity, quicKnockLabel)
 	raw := make([]byte, quicKnockSize)
-	raw[0] = quicKnockKind
-	binary.BigEndian.PutUint64(raw[1:9], uint64(time.Now().Unix()))
-	rand.Read(raw[9:17])
+	rand.Read(raw[8 : 8+quicKnockNonce])
+	var tsRaw [8]byte
+	binary.BigEndian.PutUint64(tsRaw[:], uint64(time.Now().Unix()))
+	stream, err := chacha20.NewUnauthenticatedCipher(key[:], raw[8:8+quicKnockNonce])
+	if err != nil {
+		panic(err)
+	}
+	stream.XORKeyStream(raw[:8], tsRaw[:])
 	mac := hmac.New(sha256.New, key[:])
 	mac.Write(raw[:quicKnockSize-quicKnockMAC])
-	copy(raw[quicKnockSize-quicKnockMAC:], mac.Sum(nil))
+	copy(raw[quicKnockSize-quicKnockMAC:], mac.Sum(nil)[:quicKnockMAC])
 	return raw
 }
 
@@ -172,7 +185,7 @@ func (h *UDP) EnableQUIC(identity ed25519.PrivateKey, options ...QUICOptions) (*
 	ctx, cancel := context.WithCancel(context.Background())
 	q := &QUICHub{udp: h, opts: opts, engines: map[*net.UDPConn]*quic.Transport{}, sockets: map[*net.UDPConn]*quicSocket{}, slots: make(chan struct{}, 512), accepted: make(chan *QUIC), cancel: cancel, knocks: map[netip.AddrPort]time.Time{}}
 	q.ids = quicIDs{key: quicKey(identity.Seed(), "GraphNet QUIC connection ID v1")}
-	q.knockKey = quicKey(identity.Public().(ed25519.PublicKey), "GraphNet QUIC knock v1")
+	q.knockKey = quicKey(identity.Public().(ed25519.PublicKey), quicKnockLabel)
 	for _, socket := range h.sockets {
 		_ = socket.SetWriteBuffer(4 << 20)
 		conn := &quicSocket{socket: socket, hub: h, incoming: make(chan udpPacketCopy, quicQueue), done: make(chan struct{})}

@@ -10,9 +10,10 @@ import (
 
 const (
 	WebSocketPath     = "/api/v1/agent/tunnel"
-	WebSocketProtocol = "graphnet.control.v1"
-	GRPCMethod        = "/graphnet.control.v1.Tunnel/Connect"
-	GRPCProtocol      = "graphnet-control-v1"
+	WebSocketProtocol = "v1.stream"
+	GRPCMethod        = "/stream.v1.Tunnel/Connect"
+	GRPCHeader        = "x-stream-protocol"
+	GRPCProtocol      = "v1"
 	maxChunk          = 32 << 10
 )
 

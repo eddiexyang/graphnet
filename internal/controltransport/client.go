@@ -138,7 +138,7 @@ func dialGRPC(ctx context.Context, addr string) (net.Conn, error) {
 		header, headerErr := stream.Header()
 		if headerErr != nil {
 			err = headerErr
-		} else if values := header.Get("graphnet-protocol"); len(values) != 1 || values[0] != GRPCProtocol {
+		} else if values := header.Get(GRPCHeader); len(values) != 1 || values[0] != GRPCProtocol {
 			err = errors.New("controller did not acknowledge gRPC tunnel protocol")
 		}
 	}

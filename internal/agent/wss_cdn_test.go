@@ -26,7 +26,6 @@ import (
 	"github.com/eddiexyang/graphnet/internal/routing"
 	"github.com/eddiexyang/graphnet/internal/sockets"
 	"github.com/eddiexyang/graphnet/internal/testutil"
-	"github.com/eddiexyang/graphnet/internal/transport"
 	"github.com/eddiexyang/graphnet/internal/tunnel"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
@@ -176,9 +175,10 @@ func TestWSSThroughCDNMiddleboxWithMTLSOrigin(t *testing.T) {
 		if r.TLS != nil && r.TLS.Version == tls.VersionTLS13 && r.TLS.CurveID == tls.X25519 {
 			clientTLSOK.Store(true)
 		}
-		proto := r.Header.Get("Sec-WebSocket-Protocol")
+		if r.Header.Get("Sec-WebSocket-Protocol") != "" {
+			t.Errorf("peer WS sent unexpected subprotocol %q", r.Header.Get("Sec-WebSocket-Protocol"))
+		}
 		downstream, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-			Subprotocols:    []string{proto},
 			CompressionMode: websocket.CompressionDisabled,
 		})
 		if err != nil {
@@ -189,7 +189,6 @@ func TestWSSThroughCDNMiddleboxWithMTLSOrigin(t *testing.T) {
 
 		upstream, resp, err := websocket.Dial(r.Context(), originWSURL, &websocket.DialOptions{
 			HTTPClient:      cdnHTTPClient,
-			Subprotocols:    []string{proto},
 			CompressionMode: websocket.CompressionDisabled,
 		})
 		if err != nil {
@@ -390,5 +389,4 @@ func TestWSSThroughCDNMiddleboxWithMTLSOrigin(t *testing.T) {
 	if err := <-srvErr; err != nil {
 		t.Fatal(err)
 	}
-	_ = transport.WebSocketProtocol(model.WSS)
 }
