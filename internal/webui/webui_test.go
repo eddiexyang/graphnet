@@ -1,62 +1,68 @@
 package webui
 
 import (
-	"net/http"
+	"io/fs"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
 func TestStaticFiles(t *testing.T) {
 	directory := t.TempDir()
 	t.Chdir(directory)
-	if err := os.MkdirAll(filepath.Join(directory, "assets", "agent", "revision"), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Join(directory, "assets"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	for path, content := range map[string]string{
-		"index.html":                        "<html>GraphNet</html>",
-		"assets/agent/revision/linux-amd64": "0123456789",
-		"private.txt":                       "private",
-	} {
-		if err := os.WriteFile(filepath.Join(directory, path), []byte(content), 0644); err != nil {
-			t.Fatal(err)
-		}
+	if err := os.WriteFile(filepath.Join(directory, "private.txt"), []byte("private"), 0o600); err != nil {
+		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(directory, "assets", "cwd-secret.js"), []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Symlink(filepath.Join(directory, "private.txt"), filepath.Join(directory, "assets", "link.js"))
+
+	sub, err := fs.Sub(distFS, "dist/assets")
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := fs.ReadDir(sub, ".")
+	if err != nil || len(entries) == 0 {
+		t.Fatalf("embedded dist/assets empty: %v", err)
+	}
+	assetPath := "/assets/" + entries[0].Name()
+
 	handler := Handler()
 	for _, tc := range []struct {
 		method, path, rangeHeader string
 		status                    int
-		body                      string
 	}{
-		{"GET", "/", "", 200, "<html>GraphNet</html>"},
-		{"GET", "/assets/agent/revision/linux-amd64", "", 200, "0123456789"},
-		{"HEAD", "/assets/agent/revision/linux-amd64", "", 200, ""},
-		{"GET", "/assets/agent/revision/linux-amd64", "bytes=2-4", 206, "234"},
-		{"GET", "/assets/agent/revision/", "", 404, ""},
-		{"GET", "/assets/../private.txt", "", 404, ""},
-		{"GET", "/private.txt", "", 404, ""},
-		{"GET", "/api/v1/state", "", 404, ""},
+		{"GET", "/", "", 200},
+		{"GET", "/THIRD_PARTY_LICENSES.txt", "", 200},
+		{"GET", assetPath, "", 200},
+		{"HEAD", assetPath, "", 200},
+		{"GET", assetPath, "bytes=0-3", 206},
+		{"GET", "/assets/", "", 404},
+		{"GET", "/assets/cwd-secret.js", "", 404},
+		{"GET", "/assets/link.js", "", 404},
+		{"GET", "/assets/../private.txt", "", 404},
+		{"GET", "/private.txt", "", 404},
+		{"GET", "/api/v1/state", "", 404},
 	} {
 		t.Run(tc.method+tc.path+tc.rangeHeader, func(t *testing.T) {
 			request := httptest.NewRequest(tc.method, tc.path, nil)
-			request.Header.Set("Range", tc.rangeHeader)
+			if tc.rangeHeader != "" {
+				request.Header.Set("Range", tc.rangeHeader)
+			}
 			response := httptest.NewRecorder()
 			handler.ServeHTTP(response, request)
 			if response.Code != tc.status {
 				t.Fatalf("status=%d, want %d", response.Code, tc.status)
 			}
-			if tc.status < 400 && response.Body.String() != tc.body {
-				t.Fatalf("body=%q, want %q", response.Body.String(), tc.body)
+			if tc.path == "/" && !strings.Contains(response.Body.String(), "<!doctype html>") && !strings.Contains(response.Body.String(), "<html") {
+				t.Fatalf("unexpected root HTML: %q", response.Body.String())
 			}
 		})
-	}
-	if err := os.Remove("index.html"); err != nil {
-		t.Fatal(err)
-	}
-	response := httptest.NewRecorder()
-	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
-	if response.Code != http.StatusNotFound {
-		t.Fatal("missing index exposed a directory listing")
 	}
 }

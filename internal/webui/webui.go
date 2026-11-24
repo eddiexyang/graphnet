@@ -1,16 +1,22 @@
-// Package webui serves production static files from the server working directory.
+// Package webui serves embedded production static files.
 package webui
 
 import (
+	"embed"
 	"io/fs"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 )
 
+//go:embed dist
+var distFS embed.FS
+
 func Handler() http.Handler {
-	root := os.DirFS(".")
+	root, err := fs.Sub(distFS, "dist")
+	if err != nil {
+		panic(err)
+	}
 	files := http.FileServer(http.FS(root))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Static assets do not bypass API authentication, and missing asset/API
