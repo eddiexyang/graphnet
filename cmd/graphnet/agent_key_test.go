@@ -399,3 +399,67 @@ func TestManagedServiceEnvBootstrapAndUpdateDelivery(t *testing.T) {
 		t.Fatal("agent failed to reconnect on second start with residual GRAPHNET_ENROLLMENT_TOKEN")
 	}
 }
+
+func TestPlaceholderPasswordRejectedAndPasswordResetCLI(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(filepath.Join(dir, "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := control.New(db, control.Options{Password: "replace-before-first-start"}); err == nil {
+		db.Close()
+		t.Fatal("accepted placeholder admin password")
+	}
+	srv, err := control.New(db, control.Options{Password: "initial-strong-password-123"})
+	if err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	srv.Close()
+	db.Close()
+
+	t.Setenv("GRAPHNET_ADMIN_PASSWORD", "replace-before-first-start")
+	if err := runServer([]string{"password", "--data-dir", dir}); err == nil {
+		t.Fatal("password reset CLI accepted placeholder password")
+	}
+	t.Setenv("GRAPHNET_ADMIN_PASSWORD", "rotated-strong-password-456")
+	if err := runServer([]string{"password", "--data-dir", dir}); err != nil {
+		t.Fatal("password reset CLI failed:", err)
+	}
+
+	db2, err := store.Open(filepath.Join(dir, "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	srv2, err := control.New(db2, control.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv2.Close()
+	req := httptest.NewRequest(http.MethodPost, "https://localhost/api/v1/login", strings.NewReader(`{"password":"rotated-strong-password-456"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv2.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("login with rotated password = %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestStaleUpdateLockRecovered(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "graphnet")
+	if err := os.WriteFile(exe, []byte("bin"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	lock := exe + ".update-lock"
+	// Write a lock pointing to a non-existent dead PID (max int32-1) or empty corrupt lock.
+	raw, _ := json.Marshal(updater.LockRecord{PID: 1<<30 - 1, StartedAt: time.Now().UTC()})
+	if err := os.WriteFile(lock, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_ = updater.NewManager(t.Context(), updater.Receipt{Name: "graphnet-agent", Executable: exe, Data: dir}, "v1.0.0", nil)
+	if _, err := os.Stat(lock); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale .update-lock with dead PID not cleared: %v", err)
+	}
+}

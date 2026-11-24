@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/url"
@@ -50,6 +51,41 @@ func randomToken() string {
 }
 func tokenHash(token string) [32]byte { return sha256.Sum256([]byte(token)) }
 
+func ValidateAdminPassword(password string) error {
+	if len(password) < 12 || len(password) > 1024 {
+		return errors.New("admin password must be 12–1024 bytes")
+	}
+	switch strings.ToLower(strings.TrimSpace(password)) {
+	case "replace-before-first-start", "replace-with-your-own-password", "changeme", "password123456":
+		return errors.New("admin password cannot be a placeholder example value")
+	}
+	return nil
+}
+
+// ResetPassword replaces the stored admin password hash in db.
+func ResetPassword(db *store.Store, password string) error {
+	if err := ValidateAdminPassword(password); err != nil {
+		return err
+	}
+	var rec passwordRecord
+	rec.Salt = make([]byte, 32)
+	if _, err := rand.Read(rec.Salt); err != nil {
+		return err
+	}
+	hash, err := scrypt.Key([]byte(password), rec.Salt, 32768, 8, 1, 32)
+	if err != nil {
+		return err
+	}
+	rec.Hash = hash
+	raw, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	return db.WriteRecords(func(r *store.Records) error {
+		return r.Put("admin-password", raw)
+	})
+}
+
 func newAuth(db *store.Store, password, apiToken string) (*auth, error) {
 	a := &auth{
 		sessions:       map[[32]byte]session{},
@@ -71,8 +107,8 @@ func newAuth(db *store.Store, password, apiToken string) (*auth, error) {
 			}
 			return nil
 		}
-		if len(password) < 12 || len(password) > 1024 {
-			return errors.New("first startup requires an admin password of 12–1024 bytes")
+		if err := ValidateAdminPassword(password); err != nil {
+			return fmt.Errorf("first startup: %w", err)
 		}
 		a.password.Salt = make([]byte, 32)
 		rand.Read(a.password.Salt)

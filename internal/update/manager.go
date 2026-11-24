@@ -26,6 +26,42 @@ type Journal struct {
 	Seen   map[model.ID]bool  `json:"seen"`
 }
 
+// LockRecord tracks the helper process holding <executable>.update-lock.
+type LockRecord struct {
+	PID       int       `json:"pid,omitempty"`
+	StartedAt time.Time `json:"started_at"`
+}
+
+// ClearStaleLock removes <executable>.update-lock if the helper process has
+// exited, the lock is corrupt/expired (>25m), or no installing job is active.
+func ClearStaleLock(executable string, installing bool) {
+	if executable == "" {
+		return
+	}
+	lock := executable + ".update-lock"
+	raw, err := os.ReadFile(lock)
+	if err != nil {
+		return
+	}
+	var rec LockRecord
+	if json.Unmarshal(raw, &rec) != nil || rec.StartedAt.IsZero() {
+		_ = os.Remove(lock)
+		return
+	}
+	age := time.Since(rec.StartedAt)
+	if age > 25*time.Minute {
+		_ = os.Remove(lock)
+		return
+	}
+	if rec.PID > 0 && !processAlive(rec.PID) {
+		_ = os.Remove(lock)
+		return
+	}
+	if !installing && rec.PID == 0 && age > 30*time.Second {
+		_ = os.Remove(lock)
+	}
+}
+
 func WriteJSON(path string, value any) error {
 	raw, err := json.Marshal(value)
 	if err != nil {
@@ -87,6 +123,7 @@ func NewManager(ctx context.Context, r Receipt, version string, install Installe
 		j.Status.UpdatedAt = time.Now().UTC()
 		_ = SaveJournal(r.Data, j)
 	}
+	ClearStaleLock(r.Executable, j.Status.Phase == "installing")
 	return &Manager{ctx: ctx, receipt: r, version: version, install: install}
 }
 func (m *Manager) Status() *model.UpdateStatus {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -58,9 +59,42 @@ func runServer(args []string) error {
 	if len(args) > 0 && args[0] == "service" {
 		return runManagedService("server", args[1:])
 	}
+	if len(args) > 0 && args[0] == "password" {
+		return runServerPassword(args[1:])
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	return runServerContext(ctx, args)
+}
+
+func runServerPassword(args []string) error {
+	fs := flag.NewFlagSet("server password", flag.ContinueOnError)
+	data := fs.String("data-dir", "./graphnet-data", "private persistent state directory")
+	fromStdin := fs.Bool("password-stdin", false, "read new admin password from stdin (default: GRAPHNET_ADMIN_PASSWORD)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if len(fs.Args()) != 0 {
+		return errors.New("unexpected positional arguments")
+	}
+	password := os.Getenv("GRAPHNET_ADMIN_PASSWORD")
+	if *fromStdin {
+		raw, err := io.ReadAll(io.LimitReader(os.Stdin, 1025))
+		if err != nil {
+			return err
+		}
+		password = strings.TrimRight(string(raw), "\r\n")
+	}
+	db, err := store.Open(filepath.Join(*data, "controller.db"))
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if err := control.ResetPassword(db, password); err != nil {
+		return err
+	}
+	fmt.Println("Admin password updated.")
+	return nil
 }
 
 func runServerContext(parent context.Context, args []string) error {

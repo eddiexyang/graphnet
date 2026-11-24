@@ -160,11 +160,15 @@ func helperConfig(job updateJob) *service.Config {
 	return config
 }
 func launchUpdateHelper(r updater.Receipt, stage string, req model.UpdateRequest) error {
+	j := updater.ReadJournal(r.Data)
+	updater.ClearStaleLock(r.Executable, j.Status.Phase == "installing")
 	lock := r.Executable + ".update-lock"
 	f, err := os.OpenFile(lock, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
 		return fmt.Errorf("another update owns %s: %w", lock, err)
 	}
+	initLock, _ := json.Marshal(updater.LockRecord{StartedAt: time.Now().UTC()})
+	_, _ = f.Write(initLock)
 	f.Close()
 	launched := false
 	defer func() {
@@ -287,6 +291,7 @@ func runUpdateHelper(args []string) error {
 	if j.Status.RequestID != job.Request.ID || j.Status.Phase != "installing" {
 		return errors.New("update job is no longer active")
 	}
+	_ = updater.WriteJSON(job.Receipt.Executable+".update-lock", updater.LockRecord{PID: os.Getpid(), StartedAt: time.Now().UTC()})
 	s, err := service.New(&updateProgram{job: job}, helperConfig(job))
 	if err != nil {
 		return err
