@@ -136,15 +136,7 @@ func (m *Mesh) classify(conn net.Conn) {
 		}
 		var current net.Conn = &bufferedConn{Conn: conn, reader: reader}
 		switch first[0] {
-		case 0: // A length-framed GraphNet message is bounded to 16 KiB.
-			conn.SetReadDeadline(time.Time{})
-			if !stop() {
-				return
-			}
-			transferred = true
-			release()
-			m.accept(transport.NewStream(current), model.TCP)
-		case 22: // TLS 1.3 handshake record for WSS (optionally with mTLS origin pull).
+		case 0x16: // TLS 1.3 handshake record for WSS (optionally with mTLS origin pull).
 			secured := tls.Server(current, m.wssTLS)
 			if err := secured.HandshakeContext(ctx); err != nil {
 				return
@@ -167,23 +159,30 @@ func (m *Mesh) classify(conn net.Conn) {
 			if err != nil {
 				return
 			}
-			if _, ok := transport.MatchPunchPreface(m.identity, preface, m.allowedTCPPunchPeers()); !ok {
+			if _, ok := transport.MatchPunchPreface(m.identity, preface, m.allowedTCPPunchPeers()); ok {
+				session, err := transport.NewPunchMux(ctx, current, m.identity, m.tls, m.allowedTCPPunchPeers, true)
+				if err != nil {
+					return
+				}
+				if !stop() {
+					session.Close()
+					return
+				}
+				transferred = m.installPunch(session)
+				if transferred {
+					release()
+				} else {
+					session.Close()
+				}
 				return
 			}
-			session, err := transport.NewPunchMux(ctx, current, m.identity, m.tls, m.allowedTCPPunchPeers, true)
-			if err != nil {
-				return
-			}
+			conn.SetReadDeadline(time.Time{})
 			if !stop() {
-				session.Close()
 				return
 			}
-			transferred = m.installPunch(session)
-			if transferred {
-				release()
-			} else {
-				session.Close()
-			}
+			transferred = true
+			release()
+			m.accept(transport.NewStream(current), model.TCP)
 		}
 	}()
 }

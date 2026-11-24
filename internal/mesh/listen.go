@@ -23,6 +23,7 @@ func listenTransports(ctx context.Context, identity ed25519.PrivateKey, host str
 		}
 		udp, err := transport.ListenUDP(ctx, tcp.Addr().String())
 		if err == nil {
+			udp.EnableHeaderProtection(identity.Public().(ed25519.PublicKey))
 			quic, err := udp.EnableQUIC(identity, quicOpts...)
 			if err != nil {
 				udp.Close()

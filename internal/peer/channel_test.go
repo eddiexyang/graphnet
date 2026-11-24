@@ -20,6 +20,18 @@ import (
 // The receiver exposes only the original single-message transport API.
 type legacyChannelTransport struct{ transport.Conn }
 
+func (l legacyChannelTransport) SetLocalPublicKey(pub ed25519.PublicKey) {
+	if hp, ok := l.Conn.(interface{ SetLocalPublicKey(ed25519.PublicKey) }); ok {
+		hp.SetLocalPublicKey(pub)
+	}
+}
+
+func (l legacyChannelTransport) SetPeerPublicKey(pub ed25519.PublicKey) {
+	if hp, ok := l.Conn.(interface{ SetPeerPublicKey(ed25519.PublicKey) }); ok {
+		hp.SetPeerPublicKey(pub)
+	}
+}
+
 type framedChannelTransport struct {
 	*transport.Stream
 	framed atomic.Int32

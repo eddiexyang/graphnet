@@ -81,6 +81,10 @@ func Dial(parent context.Context, conn transport.Conn, config secure.Config) (ch
 	ctx, cancel := context.WithTimeout(parent, handshakeTimeout)
 	defer cancel()
 	config.Initiator = true
+	if len(config.Identity) == ed25519.PrivateKeySize {
+		setLocalHP(conn, config.Identity.Public().(ed25519.PublicKey))
+	}
+	setPeerHP(conn, config.PeerIdentity)
 	handshake, err := secure.NewHandshake(config)
 	if err != nil {
 		return nil, err
@@ -114,6 +118,9 @@ func Accept(parent context.Context, conn transport.Conn, kind model.Transport, i
 	}()
 	ctx, cancel := context.WithTimeout(parent, handshakeTimeout)
 	defer cancel()
+	if len(identity) == ed25519.PrivateKeySize {
+		setLocalHP(conn, identity.Public().(ed25519.PublicKey))
+	}
 	first, err := conn.Receive(ctx)
 	if err != nil {
 		return nil, err
@@ -121,15 +128,21 @@ func Accept(parent context.Context, conn transport.Conn, kind model.Transport, i
 	if len(first) <= 1 || len(first) > secure.MaxHandshake+1 || first[0] != helloKind {
 		return nil, errors.New("invalid peer handshake initiation")
 	}
+	var peerIdentity ed25519.PublicKey
 	replyBody, session, err := secure.RespondHandshake(identity, first[1:], replay, func(hello secure.ClientHello) (secure.Config, error) {
 		if hello.Transport != kind {
 			return secure.Config{}, errors.New("hello transport does not match listener")
 		}
-		return resolve(hello)
+		cfg, err := resolve(hello)
+		if err == nil {
+			peerIdentity = cfg.PeerIdentity
+		}
+		return cfg, err
 	})
 	if err != nil {
 		return nil, err
 	}
+	setPeerHP(conn, peerIdentity)
 	reply := append([]byte{replyKind}, replyBody...)
 	if err := conn.Send(ctx, reply); err != nil {
 		return nil, err
@@ -190,6 +203,16 @@ func markAuthenticated(conn transport.Conn) {
 func markAlive(conn transport.Conn) {
 	if d, ok := conn.(interface{ Alive() }); ok {
 		d.Alive()
+	}
+}
+func setLocalHP(conn transport.Conn, pub ed25519.PublicKey) {
+	if hp, ok := conn.(interface{ SetLocalPublicKey(ed25519.PublicKey) }); ok {
+		hp.SetLocalPublicKey(pub)
+	}
+}
+func setPeerHP(conn transport.Conn, pub ed25519.PublicKey) {
+	if hp, ok := conn.(interface{ SetPeerPublicKey(ed25519.PublicKey) }); ok {
+		hp.SetPeerPublicKey(pub)
 	}
 }
 

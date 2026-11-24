@@ -40,26 +40,33 @@ func FuzzQUICGate(f *testing.F) {
 	})
 }
 
-// A stream peer chooses every length prefix and byte.
+// A stream peer chooses every salt, masked length prefix and byte.
 func FuzzStreamReceive(f *testing.F) {
+	pub, _, _ := ed25519.GenerateKey(nil)
 	f.Add([]byte{0, 0, 0, 3, 'a', 'b', 'c'})
+	f.Add(make([]byte, 32))
 	f.Add([]byte{0xff, 0xff, 0xff, 0xff})
 	f.Fuzz(func(t *testing.T, raw []byte) {
-		a, b := net.Pipe()
-		defer a.Close()
-		go func() { a.Write(raw); a.Close() }()
-		s := NewStream(b)
-		defer s.Close()
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		defer cancel()
-		for {
-			message, err := s.Receive(ctx)
-			if err != nil {
-				return
+		for _, masked := range []bool{false, true} {
+			a, b := net.Pipe()
+			go func() { a.Write(raw); a.Close() }()
+			s := NewStream(b)
+			if masked {
+				s.SetLocalPublicKey(pub)
 			}
-			if len(message) == 0 || len(message) > MaxMessage || !bytes.Contains(raw, message) {
-				t.Fatal("stream returned a message it was not sent")
+			ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+			for {
+				message, err := s.Receive(ctx)
+				if err != nil {
+					break
+				}
+				if len(message) == 0 || len(message) > MaxMessage || !masked && !bytes.Contains(raw, message) {
+					t.Fatal("stream returned an invalid message")
+				}
 			}
+			cancel()
+			s.Close()
+			a.Close()
 		}
 	})
 }

@@ -70,7 +70,9 @@ func setUDPReadBuffer(socket *net.UDPConn, size int) error {
 
 type udpBatchSend struct {
 	messages   [128]ipv6.Message
-	buffers    [384][]byte
+	buffers    [512][]byte
+	headers    [128][udpMaskHeaderLen]byte
+	tokens     [128][udpTokenSize]byte
 	controls   [128][128]byte
 	starts     [128]int
 	token      [udpTokenSize]byte
@@ -81,7 +83,7 @@ type udpBatchSend struct {
 // prepare preserves every original datagram and appends its token. Scatter/gather
 // avoids concatenating payloads in userspace. GSO allows only equal-size segments
 // followed by at most one smaller final segment, at most 32 per super-packet.
-func (b *udpBatchSend) prepare(payloads, tails [][]byte, reply []byte, gso bool) []ipv6.Message {
+func (b *udpBatchSend) prepare(payloads, tails [][]byte, reply []byte, gso bool, hpSet bool, hpKey [32]byte) ([]ipv6.Message, error) {
 	length := func(i int) int {
 		if tails == nil {
 			return len(payloads[i])
@@ -108,14 +110,39 @@ func (b *udpBatchSend) prepare(payloads, tails [][]byte, reply []byte, gso bool)
 		}
 		first := used
 		for i := start; i < end; i++ {
-			b.buffers[used] = payloads[i]
-			used++
-			if tails != nil && len(tails[i]) > 0 {
-				b.buffers[used] = tails[i]
+			var tail []byte
+			if tails != nil {
+				tail = tails[i]
+			}
+			if hpSet {
+				hdr, tok, ok := maskUDPParts(hpKey, payloads[i], tail, b.token)
+				if !ok {
+					return nil, errors.New("UDP message too short for header protection")
+				}
+				b.headers[i] = hdr
+				b.tokens[i] = tok
+				b.buffers[used] = b.headers[i][:]
+				used++
+				if len(payloads[i]) > udpMaskHeaderLen {
+					b.buffers[used] = payloads[i][udpMaskHeaderLen:]
+					used++
+				}
+				if len(tail) > 0 {
+					b.buffers[used] = tail
+					used++
+				}
+				b.buffers[used] = b.tokens[i][:]
+				used++
+			} else {
+				b.buffers[used] = payloads[i]
+				used++
+				if len(tail) > 0 {
+					b.buffers[used] = tail
+					used++
+				}
+				b.buffers[used] = b.token[:]
 				used++
 			}
-			b.buffers[used] = b.token[:]
-			used++
 		}
 		control := reply
 		if end-start > 1 {
@@ -127,7 +154,7 @@ func (b *udpBatchSend) prepare(payloads, tails [][]byte, reply []byte, gso bool)
 		count++
 		start = end
 	}
-	return b.messages[:count]
+	return b.messages[:count], nil
 }
 
 func appendUDPSegment(control []byte, size uint16) []byte {
@@ -170,6 +197,7 @@ func (d *Datagram) SendBatchParts(ctx context.Context, payloads, tails [][]byte)
 		return net.ErrClosed
 	default:
 	}
+	hpKey, hpSet := d.peerHP()
 	h := d.hub
 	h.writeMu.Lock()
 	defer h.writeMu.Unlock()
@@ -187,7 +215,10 @@ func (d *Datagram) SendBatchParts(ctx context.Context, payloads, tails [][]byte)
 	defer cleanup()
 	batchSocket := h.batchSockets[socket]
 	gso := batchSocket.gso && !b.disableGSO
-	messages := b.prepare(payloads, tails, d.replyControl, gso)
+	messages, err := b.prepare(payloads, tails, d.replyControl, gso, hpSet, hpKey)
+	if err != nil {
+		return err
+	}
 	sent := 0
 	for sent < len(messages) {
 		n, err := batchSocket.conn.WriteBatch(messages[sent:], 0)
@@ -205,7 +236,10 @@ func (d *Datagram) SendBatchParts(ctx context.Context, payloads, tails [][]byte)
 					rest = tails[b.starts[sent]:]
 				}
 				b.disableGSO, gso = true, false
-				messages = b.prepare(remaining, rest, d.replyControl, false)
+				messages, err = b.prepare(remaining, rest, d.replyControl, false, hpSet, hpKey)
+				if err != nil {
+					return err
+				}
 				sent = 0
 				continue
 			}

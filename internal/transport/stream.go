@@ -3,6 +3,7 @@ package transport
 import (
 	"bufio"
 	"context"
+	"crypto/ed25519"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/eddiexyang/graphnet/internal/packetbuf"
+	"golang.org/x/crypto/chacha20"
 )
 
 // Stream adapts TCP, TLS and other net.Conn streams to complete messages. One
@@ -26,6 +28,16 @@ type Stream struct {
 	prefixes     [128 * 4]byte
 	gather       [256][]byte
 	writeBuffers func(net.Buffers) (int64, error)
+
+	keyMu          sync.Mutex
+	sendHPSet      bool
+	sendHP         [32]byte
+	recvHPSet      bool
+	recvHP         [32]byte
+	sendCipher     *chacha20.Cipher
+	recvCipher     *chacha20.Cipher
+	hasPendingSize bool
+	pendingSize    uint32
 }
 
 func NewStream(conn net.Conn) *Stream {
@@ -35,19 +47,49 @@ func NewStream(conn net.Conn) *Stream {
 	} else if writer, ok := conn.(interface {
 		WriteBuffers(net.Buffers) (int64, error)
 	}); ok {
-		// Transparent read-ahead wrappers retain their read ownership while
-		// forwarding gather writes. TLS and framed carriers keep their own
-		// writes unless they explicitly implement this capability.
 		s.writeBuffers = writer.WriteBuffers
 	}
 	return s
 }
+
+func (s *Stream) SetLocalPublicKey(pub ed25519.PublicKey) {
+	if len(pub) != ed25519.PublicKeySize {
+		return
+	}
+	hp := HeaderProtectionKey(pub)
+	s.keyMu.Lock()
+	s.recvHP = hp
+	s.recvHPSet = true
+	s.keyMu.Unlock()
+}
+
+func (s *Stream) SetPeerPublicKey(pub ed25519.PublicKey) {
+	if len(pub) != ed25519.PublicKeySize {
+		return
+	}
+	hp := HeaderProtectionKey(pub)
+	s.keyMu.Lock()
+	s.sendHP = hp
+	s.sendHPSet = true
+	s.keyMu.Unlock()
+}
+
+func (s *Stream) loadSendHP() ([32]byte, bool) {
+	s.keyMu.Lock()
+	defer s.keyMu.Unlock()
+	return s.sendHP, s.sendHPSet
+}
+
+func (s *Stream) loadRecvHP() ([32]byte, bool) {
+	s.keyMu.Lock()
+	defer s.keyMu.Unlock()
+	return s.recvHP, s.recvHPSet
+}
+
 func (s *Stream) LocalAddr() net.Addr  { return s.conn.LocalAddr() }
 func (s *Stream) RemoteAddr() net.Addr { return s.conn.RemoteAddr() }
 func (s *Stream) Close() error         { return s.conn.Close() }
 
-// SendBatch preserves the existing per-message wire framing while amortizing
-// socket writes and cancellation bookkeeping over immediately available packets.
 func (s *Stream) UseKernelWriteBacklog() error {
 	if wrapper, ok := s.conn.(interface{ UseKernelWriteBacklog() error }); ok {
 		return wrapper.UseKernelWriteBacklog()
@@ -55,7 +97,6 @@ func (s *Stream) UseKernelWriteBacklog() error {
 	return UseKernelTCPBacklog(s.conn)
 }
 
-// ReceiveWindow reports the kernel's receive buffer of the connection.
 func (s *Stream) ReceiveWindow() (int, bool) {
 	if wrapper, ok := s.conn.(interface{ ReceiveWindow() (int, bool) }); ok {
 		return wrapper.ReceiveWindow()
@@ -67,9 +108,28 @@ func (s *Stream) Send(ctx context.Context, data []byte) error {
 	return s.SendBatch(ctx, [][]byte{data})
 }
 
-// SendFramedBatch consumes complete existing length-prefixed records whose
-// framing was reserved by the encrypted-byte producer. Validation precedes I/O;
-// the producer keeps ownership until the single contiguous write completes.
+func (s *Stream) ensureSendCipherLocked(hpKey [32]byte) ([]byte, error) {
+	if s.sendCipher != nil {
+		return nil, nil
+	}
+	salt, err := drawStreamSalt()
+	if err != nil {
+		return nil, err
+	}
+	s.sendCipher = newHPCipher(hpKey, salt[:])
+	return salt[:], nil
+}
+
+// maskFrameInPlace masks the 4-byte big-endian length prefix, the 1-byte kind,
+// and (for data frames with a 4-byte sequence counter) the 4-byte counter.
+func (s *Stream) maskFrameInPlace(frame []byte) {
+	n := 5
+	if len(frame) >= 9 && frame[4] == dataFrameKind {
+		n = 9
+	}
+	s.sendCipher.XORKeyStream(frame[:n], frame[:n])
+}
+
 func (s *Stream) SendFramedBatch(ctx context.Context, frames []byte) (err error) {
 	count := 0
 	for offset := 0; offset < len(frames); {
@@ -89,6 +149,7 @@ func (s *Stream) SendFramedBatch(ctx context.Context, frames []byte) (err error)
 	if count == 0 {
 		return errors.New("empty transport frame batch")
 	}
+	hpKey, hpSet := s.loadSendHP()
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
 	cleanup, err := deadline(ctx, s.conn.SetWriteDeadline)
@@ -96,17 +157,38 @@ func (s *Stream) SendFramedBatch(ctx context.Context, frames []byte) (err error)
 		return err
 	}
 	defer cleanup()
-	err = ctxError(ctx, writeFull(s.conn, frames))
+	if !hpSet {
+		err = ctxError(ctx, writeFull(s.conn, frames))
+		if err != nil {
+			s.conn.Close()
+		}
+		return err
+	}
+	salt, err := s.ensureSendCipherLocked(hpKey)
+	if err != nil {
+		s.conn.Close()
+		return err
+	}
+	total := len(salt) + len(frames)
+	if cap(s.writeBuffer) < total {
+		s.writeBuffer = make([]byte, total)
+	}
+	out := s.writeBuffer[:total]
+	copy(out, salt)
+	body := out[len(salt):]
+	copy(body, frames)
+	for offset := 0; offset < len(body); {
+		size := int(binary.BigEndian.Uint32(body[offset:]))
+		s.maskFrameInPlace(body[offset : offset+4+size])
+		offset += 4 + size
+	}
+	err = ctxError(ctx, writeFull(s.conn, out))
 	if err != nil {
 		s.conn.Close()
 	}
 	return err
 }
 
-// SendFramedParts writes frames whose length prefixes the producer wrote:
-// parts, gathered by the kernel without a copy, hold frames whole frames, the
-// prefix of each counting the parts after it up to the next frame. The
-// producer keeps ownership until the write completes.
 func (s *Stream) SendFramedParts(ctx context.Context, parts [][]byte, frames int) (err error) {
 	if frames == 0 || frames > 128 || len(parts) == 0 {
 		return errors.New("invalid transport batch size")
@@ -115,6 +197,7 @@ func (s *Stream) SendFramedParts(ctx context.Context, parts [][]byte, frames int
 	for _, part := range parts {
 		size += len(part)
 	}
+	hpKey, hpSet := s.loadSendHP()
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
 	cleanup, err := deadline(ctx, s.conn.SetWriteDeadline)
@@ -127,21 +210,44 @@ func (s *Stream) SendFramedParts(ctx context.Context, parts [][]byte, frames int
 			s.conn.Close()
 		}
 	}()
-	if s.writeBuffers != nil {
+	if !hpSet && s.writeBuffers != nil {
 		n, writeErr := s.writeBuffers(net.Buffers(parts))
 		if writeErr == nil && n != int64(size) {
 			writeErr = io.ErrShortWrite
 		}
 		return ctxError(ctx, writeErr)
 	}
-	if cap(s.writeBuffer) < size {
-		s.writeBuffer = make([]byte, size)
+	var salt []byte
+	if hpSet {
+		salt, err = s.ensureSendCipherLocked(hpKey)
+		if err != nil {
+			return err
+		}
 	}
-	frame := s.writeBuffer[:0]
+	total := len(salt) + size
+	if cap(s.writeBuffer) < total {
+		s.writeBuffer = make([]byte, total)
+	}
+	out := s.writeBuffer[:0]
+	out = append(out, salt...)
 	for _, part := range parts {
-		frame = append(frame, part...)
+		out = append(out, part...)
 	}
-	return ctxError(ctx, writeFull(s.conn, frame))
+	if hpSet {
+		body := out[len(salt):]
+		for offset := 0; offset < len(body); {
+			if len(body)-offset < 4 {
+				return errors.New("truncated transport frame prefix")
+			}
+			fSize := int(binary.BigEndian.Uint32(body[offset:]))
+			if fSize == 0 || fSize > MaxMessage || fSize > len(body)-offset-4 {
+				return errors.New("invalid transport frame size")
+			}
+			s.maskFrameInPlace(body[offset : offset+4+fSize])
+			offset += 4 + fSize
+		}
+	}
+	return ctxError(ctx, writeFull(s.conn, out))
 }
 
 func (s *Stream) SendBatch(ctx context.Context, messages [][]byte) (err error) {
@@ -155,6 +261,7 @@ func (s *Stream) SendBatch(ctx context.Context, messages [][]byte) (err error) {
 		}
 		size += 4 + len(data)
 	}
+	hpKey, hpSet := s.loadSendHP()
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
 	cleanup, err := deadline(ctx, s.conn.SetWriteDeadline)
@@ -167,10 +274,7 @@ func (s *Stream) SendBatch(ctx context.Context, messages [][]byte) (err error) {
 			s.conn.Close()
 		}
 	}()
-	if s.writeBuffers != nil {
-		// Keep the existing frames and write them in one gather operation.
-		// Channel consumes its ciphertext synchronously, so another full
-		// ciphertext copy at this framing boundary serves no ownership purpose.
+	if !hpSet && s.writeBuffers != nil {
 		parts := s.gather[:2*len(messages)]
 		for i, data := range messages {
 			prefix := s.prefixes[i*4 : i*4+4]
@@ -185,18 +289,31 @@ func (s *Stream) SendBatch(ctx context.Context, messages [][]byte) (err error) {
 		}
 		return ctxError(ctx, writeErr)
 	}
-	if cap(s.writeBuffer) < size {
-		s.writeBuffer = make([]byte, size)
+	var salt []byte
+	if hpSet {
+		salt, err = s.ensureSendCipherLocked(hpKey)
+		if err != nil {
+			return err
+		}
 	}
-	frame := s.writeBuffer[:size]
-	offset := 0
+	total := len(salt) + size
+	if cap(s.writeBuffer) < total {
+		s.writeBuffer = make([]byte, total)
+	}
+	frame := s.writeBuffer[:total]
+	copy(frame, salt)
+	offset := len(salt)
 	for _, data := range messages {
 		binary.BigEndian.PutUint32(frame[offset:], uint32(len(data)))
 		copy(frame[offset+4:], data)
+		if hpSet {
+			s.maskFrameInPlace(frame[offset : offset+4+len(data)])
+		}
 		offset += 4 + len(data)
 	}
 	return ctxError(ctx, writeFull(s.conn, frame))
 }
+
 func (s *Stream) Receive(ctx context.Context) ([]byte, error) {
 	messages, err := s.receive(ctx, 1)
 	if err != nil {
@@ -205,6 +322,7 @@ func (s *Stream) Receive(ctx context.Context) ([]byte, error) {
 	defer packetbuf.ReleaseAll(messages)
 	return append([]byte(nil), messages[0].Data...), nil
 }
+
 func (s *Stream) ReceiveBatch(ctx context.Context) ([][]byte, error) {
 	messages, err := s.ReceiveOwnedBatch(ctx)
 	if err != nil {
@@ -217,11 +335,13 @@ func (s *Stream) ReceiveBatch(ctx context.Context) ([][]byte, error) {
 	}
 	return out, nil
 }
+
 func (s *Stream) ReceiveOwnedBatch(ctx context.Context) ([]*packetbuf.Buffer, error) {
 	return s.receive(ctx, 32)
 }
 
 func (s *Stream) receive(ctx context.Context, limit int) (out []*packetbuf.Buffer, err error) {
+	hpKey, hpSet := s.loadRecvHP()
 	s.readMu.Lock()
 	defer s.readMu.Unlock()
 	cleanup, err := deadline(ctx, s.conn.SetReadDeadline)
@@ -234,8 +354,14 @@ func (s *Stream) receive(ctx context.Context, limit int) (out []*packetbuf.Buffe
 			s.conn.Close()
 		}
 	}()
+	if hpSet && s.recvCipher == nil {
+		var salt [hpSaltSize]byte
+		if _, err := io.ReadFull(s.reader, salt[:]); err != nil {
+			return nil, ctxError(ctx, err)
+		}
+		s.recvCipher = newHPCipher(hpKey, salt[:])
+	}
 	out = make([]*packetbuf.Buffer, 0, limit)
-	// Use a separate owner list because explicit return nil replaces named out.
 	owned := out
 	defer func() {
 		if err != nil {
@@ -243,35 +369,40 @@ func (s *Stream) receive(ctx context.Context, limit int) (out []*packetbuf.Buffe
 		}
 	}()
 	for len(out) < limit {
-		// After the first frame, consume only complete frames already buffered.
-		// A quiet connection never waits to fill a batch or a partial next frame.
-		if len(out) > 0 {
-			if s.reader.Buffered() < 4 {
+		if !s.hasPendingSize {
+			if len(out) > 0 && s.reader.Buffered() < 4 {
 				break
 			}
-			prefix, _ := s.reader.Peek(4)
-			size := binary.BigEndian.Uint32(prefix)
+			var prefix [4]byte
+			if _, err := io.ReadFull(s.reader, prefix[:]); err != nil {
+				return nil, ctxError(ctx, err)
+			}
+			if s.recvCipher != nil {
+				s.recvCipher.XORKeyStream(prefix[:], prefix[:])
+			}
+			size := binary.BigEndian.Uint32(prefix[:])
 			if size == 0 || size > MaxMessage {
 				return nil, fmt.Errorf("invalid transport frame size %d", size)
 			}
-			if s.reader.Buffered() < 4+int(size) {
-				break
-			}
+			s.pendingSize = size
+			s.hasPendingSize = true
 		}
-		prefix, err := s.reader.Peek(4)
-		if err != nil {
-			return nil, ctxError(ctx, err)
+		if len(out) > 0 && s.reader.Buffered() < int(s.pendingSize) {
+			break
 		}
-		size := binary.BigEndian.Uint32(prefix)
-		s.reader.Discard(4)
-		if size == 0 || size > MaxMessage {
-			return nil, fmt.Errorf("invalid transport frame size %d", size)
-		}
-		data := packetbuf.Get(int(size))
+		size := int(s.pendingSize)
+		s.hasPendingSize = false
+		data := packetbuf.Get(size)
 		out = append(out, data)
 		owned = out
 		if _, err := io.ReadFull(s.reader, data.Data); err != nil {
 			return nil, ctxError(ctx, err)
+		}
+		if s.recvCipher != nil {
+			s.recvCipher.XORKeyStream(data.Data[:1], data.Data[:1])
+			if data.Data[0] == dataFrameKind && len(data.Data) >= 5 {
+				s.recvCipher.XORKeyStream(data.Data[1:5], data.Data[1:5])
+			}
 		}
 	}
 	return out, nil
@@ -294,13 +425,12 @@ func deadline(ctx context.Context, set func(time.Time) error) (func(), error) {
 		set(time.Time{})
 	}, nil
 }
+
 func ctxError(ctx context.Context, err error) error {
 	if err != nil {
 		if cause := ctx.Err(); cause != nil {
 			return cause
 		}
-		// The socket deadline can fire before the context's timer goroutine
-		// runs. Preserve the context error contract in that scheduling window.
 		var timeout net.Error
 		if limit, ok := ctx.Deadline(); ok && !time.Now().Before(limit) && errors.As(err, &timeout) && timeout.Timeout() {
 			return context.DeadlineExceeded
@@ -308,6 +438,7 @@ func ctxError(ctx context.Context, err error) error {
 	}
 	return err
 }
+
 func writeFull(w io.Writer, buf []byte) error {
 	for len(buf) > 0 {
 		n, err := w.Write(buf)

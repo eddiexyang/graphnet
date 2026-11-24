@@ -360,6 +360,14 @@ func (w *WebSocket) ReceiveWindow() (int, bool) {
 	return 0, false
 }
 
+func (w *WebSocket) SetLocalPublicKey(pub ed25519.PublicKey) {
+	w.stream.SetLocalPublicKey(pub)
+}
+
+func (w *WebSocket) SetPeerPublicKey(pub ed25519.PublicKey) {
+	w.stream.SetPeerPublicKey(pub)
+}
+
 func (w *WebSocket) Send(ctx context.Context, raw []byte) error {
 	return w.stream.Send(ctx, raw)
 }

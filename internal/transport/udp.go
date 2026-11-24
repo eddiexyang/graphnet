@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
 	"net"
@@ -50,6 +51,8 @@ type UDP struct {
 	wg           sync.WaitGroup
 	stunMu       sync.Mutex
 	stunPending  map[[12]byte]*stunTransaction
+	hpEnabled    bool
+	recvHP       [32]byte
 }
 
 type Datagram struct {
@@ -62,6 +65,36 @@ type Datagram struct {
 	closeOnce     sync.Once
 	lastSeen      atomic.Int64
 	authenticated atomic.Bool
+	sendMu        sync.Mutex
+	sendHPSet     bool
+	sendHP        [32]byte
+}
+
+// EnableHeaderProtection masks and unmasks UDP tokens, kinds and counters with
+// ChaCha20 keyed from each receiver's public key.
+func (h *UDP) EnableHeaderProtection(localPub ed25519.PublicKey) {
+	h.mu.Lock()
+	h.recvHP = HeaderProtectionKey(localPub)
+	h.hpEnabled = true
+	h.mu.Unlock()
+}
+
+// SetPeerPublicKey configures the peer's header-protection key for outgoing UDP datagrams.
+func (d *Datagram) SetPeerPublicKey(peerPub ed25519.PublicKey) {
+	if len(peerPub) != ed25519.PublicKeySize {
+		return
+	}
+	hp := HeaderProtectionKey(peerPub)
+	d.sendMu.Lock()
+	d.sendHP = hp
+	d.sendHPSet = true
+	d.sendMu.Unlock()
+}
+
+func (d *Datagram) peerHP() ([32]byte, bool) {
+	d.sendMu.Lock()
+	defer d.sendMu.Unlock()
+	return d.sendHP, d.sendHPSet
 }
 
 // ListenUDP shares each address family's data socket between native UDP,
@@ -237,25 +270,42 @@ func (h *UDP) receivePackets(socket *net.UDPConn, packets []udpPacket) {
 	for _, p := range packets {
 		raw, remote := p.raw, p.remote
 		n := len(raw)
-		if n <= udpTokenSize || n > MaxMessage+udpTokenSize || raw[0] < udpFirstKind {
+		if n <= udpTokenSize || n > MaxMessage+udpTokenSize {
 			continue
 		}
-		key := udpKey{remote: netip.AddrPortFrom(remote.Addr().Unmap(), remote.Port()), token: [udpTokenSize]byte(raw[n-udpTokenSize:])}
-		peer := h.peers[key]
-		if peer == nil && h.quic != nil {
-			if raw[0] == quicKnockKind && n == quicKnockSize {
-				h.quic.knock(raw, key.remote, now)
+		remoteAddr := netip.AddrPortFrom(remote.Addr().Unmap(), remote.Port())
+		if h.quic != nil {
+			if raw[0] == quicKnockKind && n == quicKnockSize && h.quic.knock(raw, remoteAddr, now) {
 				continue
 			}
-			if h.quic.admit(raw, key.remote, now) {
+			if h.quic.admit(raw, remoteAddr, now) {
 				h.quic.sockets[socket].pass(raw, remote)
 				continue
 			}
 		}
-		if key.token == [udpTokenSize]byte{} {
+		var unmaskedHdr [udpMaskHeaderLen]byte
+		var token [udpTokenSize]byte
+		if h.hpEnabled {
+			var ok bool
+			unmaskedHdr, token, ok = unmaskUDPDatagram(h.recvHP, raw)
+			if !ok || unmaskedHdr[0] < udpFirstKind {
+				continue
+			}
+		} else {
+			if raw[0] < udpFirstKind {
+				continue
+			}
+			token = [udpTokenSize]byte(raw[n-udpTokenSize:])
+		}
+		if token == [udpTokenSize]byte{} {
 			continue
 		}
+		key := udpKey{remote: remoteAddr, token: token}
+		peer := h.peers[key]
 		if peer == nil {
+			if h.hpEnabled && unmaskedHdr[0] != 0x41 {
+				continue
+			}
 			if h.pending >= maxPendingUDP {
 				continue
 			}
@@ -275,6 +325,9 @@ func (h *UDP) receivePackets(socket *net.UDPConn, packets []udpPacket) {
 		}
 		payload := packetbuf.Get(n - udpTokenSize)
 		copy(payload.Data, raw[:n-udpTokenSize])
+		if h.hpEnabled {
+			copy(payload.Data[:udpMaskHeaderLen], unmaskedHdr[:])
+		}
 		pending[count] = payload
 		count++
 	}
@@ -348,6 +401,14 @@ func (d *Datagram) Send(ctx context.Context, payload []byte) error {
 	}
 	raw := make([]byte, 0, len(payload)+udpTokenSize)
 	raw = append(append(raw, payload...), d.key.token[:]...)
+	if hpKey, ok := d.peerHP(); ok {
+		hdr, tok, masked := maskUDPParts(hpKey, payload, nil, d.key.token)
+		if !masked {
+			return errors.New("UDP message too short for header protection")
+		}
+		copy(raw[:udpMaskHeaderLen], hdr[:])
+		copy(raw[len(payload):], tok[:])
+	}
 	return d.hub.writeDatagramControl(ctx, raw, d.key.remote, d.replyControl)
 }
 

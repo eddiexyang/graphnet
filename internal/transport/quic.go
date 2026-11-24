@@ -29,7 +29,7 @@ import (
 )
 
 const (
-	quicProtocol = "graphnet.quic.v2"
+	quicProtocol = "h3"
 	// quicIDSize is the length of every local connection ID, which starts
 	// with quicIDPrefix; see quicIDs.
 	quicIDSize   = 16
@@ -110,18 +110,18 @@ func (q *QUICHub) admit(raw []byte, remote netip.AddrPort, now time.Time) bool {
 }
 
 // knock records a valid knock from remote. The hub's lock is held.
-func (q *QUICHub) knock(raw []byte, remote netip.AddrPort, now time.Time) {
+func (q *QUICHub) knock(raw []byte, remote netip.AddrPort, now time.Time) bool {
 	if len(raw) != quicKnockSize {
-		return
+		return false
 	}
 	sent := time.Unix(int64(binary.BigEndian.Uint64(raw[1:9])), 0)
 	if sent.Before(now.Add(-quicKnockSkew)) || sent.After(now.Add(quicKnockSkew)) {
-		return
+		return false
 	}
 	mac := hmac.New(sha256.New, q.knockKey[:])
 	mac.Write(raw[:quicKnockSize-quicKnockMAC])
 	if subtle.ConstantTimeCompare(mac.Sum(nil)[:quicKnockMAC], raw[quicKnockSize-quicKnockMAC:]) != 1 {
-		return
+		return false
 	}
 	if len(q.knocks) >= quicKnockLimit {
 		for address, until := range q.knocks {
@@ -130,10 +130,11 @@ func (q *QUICHub) knock(raw []byte, remote netip.AddrPort, now time.Time) {
 			}
 		}
 		if len(q.knocks) >= quicKnockLimit {
-			return
+			return true
 		}
 	}
 	q.knocks[remote] = now.Add(quicKnockLife)
+	return true
 }
 
 // knockFor returns a knock toward the Agent of identity.
@@ -469,7 +470,6 @@ func (s *quicSocket) WriteTo(raw []byte, remote net.Addr) (int, error) {
 	s.hub.writeMu.Unlock()
 	return n, err
 }
-
 
 func (s *quicSocket) SyscallConn() (syscall.RawConn, error) {
 	return s.socket.SyscallConn()
