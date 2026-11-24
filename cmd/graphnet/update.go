@@ -24,6 +24,8 @@ import (
 
 type managedServiceKey struct{}
 
+var testLaunchUpdateHelper = launchUpdateHelper
+
 func managedUpdater(ctx context.Context, data string) (agent.Updater, error) {
 	name, _ := ctx.Value(managedServiceKey{}).(string)
 	if name == "" {
@@ -47,7 +49,7 @@ func managedUpdater(ctx context.Context, data string) (agent.Updater, error) {
 	if err = updater.WriteJSON(filepath.Join(data, "service.json"), receipt); err != nil {
 		return nil, err
 	}
-	return updater.NewManager(ctx, receipt, version, launchUpdateHelper), nil
+	return updater.NewManager(ctx, receipt, version, testLaunchUpdateHelper), nil
 }
 func runAgentUpdate(args []string) error {
 	fs := flag.NewFlagSet("agent update", flag.ContinueOnError)

@@ -42,33 +42,42 @@ func (c *Cache) SaveDirectory(directory *model.ServerDirectory, roots *x509.Cert
 		return nil
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.reg == nil {
+		c.mu.Unlock()
 		return errors.New("missing registration")
 	}
 	reg := c.reg.clone()
 	if err := validateDirectory(reg, directory); err != nil {
+		c.mu.Unlock()
 		return err
 	}
 	if len(reg.CA) == 0 {
 		pool := x509.NewCertPool()
 		if !pool.AppendCertsFromPEM(directory.CA) {
+			c.mu.Unlock()
 			return errors.New("invalid directory CA")
 		}
 		cert, err := c.TLSCertificate(reg)
 		if err != nil {
+			c.mu.Unlock()
 			return err
 		}
 		if _, err = cert.Leaf.Verify(x509.VerifyOptions{Roots: pool, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}}); err != nil {
+			c.mu.Unlock()
 			return err
 		}
 		if _, err = cert.Leaf.Verify(x509.VerifyOptions{Roots: roots, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}}); err != nil {
+			c.mu.Unlock()
 			return err
 		}
 	}
 	reg.CA = bytes.Clone(directory.CA)
 	reg.Directory = directory.Clone()
 	c.reg = &reg
+	c.mu.Unlock()
+	if raw, err := json.Marshal(reg); err == nil {
+		c.disk.put(reg.AgentID, keyRegistration, raw)
+	}
 	return nil
 }
 

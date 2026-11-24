@@ -23,6 +23,10 @@ import (
 // agentGCPercent is the Agent's heap growth target unless GOGC sets one.
 const agentGCPercent = 25
 
+// testAgentDataPlane lets package tests run the CLI DataPlane embedded without
+// creating host TUN interfaces or firewall rules.
+var testAgentDataPlane func(*agent.DataPlaneOptions)
+
 func runAgent(args []string) error {
 	if len(args) > 0 && args[0] == "service" {
 		return runManagedService("agent", args[1:])
@@ -52,16 +56,13 @@ func runAgentContext(parent context.Context, args []string) error {
 		}
 	}
 	fs := flag.NewFlagSet("agent", flag.ContinueOnError)
-	server := fs.String("server", "", "preferred controller HTTPS origin; cached directory provides failover")
-	defaultTransport := os.Getenv("GRAPHNET_SERVER_TRANSPORT")
-	if defaultTransport == "" {
-		defaultTransport = "tcp"
-	}
+	server := fs.String("server", strings.TrimSpace(os.Getenv("GRAPHNET_SERVER")), "preferred controller HTTPS origin; cached directory provides failover")
+	defaultTransport := strings.TrimSpace(os.Getenv("GRAPHNET_SERVER_TRANSPORT"))
 	serverTransport := fs.String("server-transport", defaultTransport, "preferred controller carrier: tcp, websocket, grpc, wss or https (TLS-terminating gateway)")
 	data := fs.String("data-dir", "./graphnet-agent-data", "private persistent agent directory")
-	name := fs.String("name", "", "agent display name for first enrollment")
-	ca := fs.String("ca", "", "PEM CA certificate to trust for controller HTTPS")
-	gatewayCA := fs.String("gateway-ca", os.Getenv("GRAPHNET_GATEWAY_CA"), "optional PEM CA certificate to trust for an HTTPS or WSS gateway")
+	name := fs.String("name", strings.TrimSpace(os.Getenv("GRAPHNET_NAME")), "agent display name for first enrollment")
+	ca := fs.String("ca", strings.TrimSpace(os.Getenv("GRAPHNET_CA")), "PEM CA certificate to trust for controller HTTPS")
+	gatewayCA := fs.String("gateway-ca", strings.TrimSpace(os.Getenv("GRAPHNET_GATEWAY_CA")), "optional PEM CA certificate to trust for an HTTPS or WSS gateway")
 	originMTLSCA := fs.String("origin-mtls-ca", "", "optional PEM CA certificate requiring mTLS client certs on incoming WSS links")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -76,7 +77,7 @@ func runAgentContext(parent context.Context, args []string) error {
 		}
 		*name = hostname
 	}
-	cache, explicit, err := openAgentStateCache(*data)
+	cache, _, err := openAgentStateCache(*data)
 	if err != nil {
 		return err
 	}
@@ -140,23 +141,31 @@ func runAgentContext(parent context.Context, args []string) error {
 			return errors.New("origin-mtls-ca contains no certificates")
 		}
 	}
-	runtime, err := agent.NewDataPlane(ctx, cache.PrivateKey(), agent.DataPlaneOptions{OriginClientCAs: originClientCAs, Endpoints: func(endpoints []model.Endpoint) error {
+	dpOpts := agent.DataPlaneOptions{OriginClientCAs: originClientCAs, Endpoints: func(endpoints []model.Endpoint) error {
 		if client == nil {
 			return nil
 		}
 		return client.SetEndpoints(endpoints)
-	}})
+	}}
+	if testAgentDataPlane != nil {
+		testAgentDataPlane(&dpOpts)
+	}
+	runtime, err := agent.NewDataPlane(ctx, cache.PrivateKey(), dpOpts)
 	if err != nil {
 		return err
 	}
 	defer runtime.Close()
 	go writeLinkState(ctx, *data, runtime.LinkState)
-	token := os.Getenv("GRAPHNET_ENROLLMENT_TOKEN")
-	if explicit {
-		// An Agent given its key registers by public key alone.
+	updater, err := managedUpdater(ctx, *data)
+	if err != nil {
+		return err
+	}
+	token := strings.TrimSpace(os.Getenv("GRAPHNET_ENROLLMENT_TOKEN"))
+	if reg != nil {
+		// Once registered, ignore any residual one-time token left in the environment.
 		token = ""
 	}
-	client, err = agent.NewClient(cache, runtime, agent.Options{Server: *server, ServerTransport: *serverTransport, Name: *name, EnrollmentToken: token, Roots: roots, GatewayRoots: gatewayRoots, Version: version})
+	client, err = agent.NewClient(cache, runtime, agent.Options{Updater: updater, Server: *server, ServerTransport: *serverTransport, Name: *name, EnrollmentToken: token, Roots: roots, GatewayRoots: gatewayRoots, Version: version})
 	if err != nil {
 		return err
 	}
@@ -173,7 +182,7 @@ func runAgentEnroll(args []string) error {
 	fs := flag.NewFlagSet("agent enroll", flag.ContinueOnError)
 	file := fs.String("invitation-file", "", "invitation file, or - for stdin (default: GRAPHNET_AGENT_INVITATION)")
 	data := fs.String("data-dir", "./graphnet-agent-data", "private persistent agent directory")
-	name := fs.String("name", "", "agent name (default: hostname)")
+	name := fs.String("name", strings.TrimSpace(os.Getenv("GRAPHNET_NAME")), "agent name (default: hostname)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -210,7 +219,7 @@ func runAgentEnroll(args []string) error {
 			return err
 		}
 	}
-	cache, _, err := openAgentCache(*data)
+	cache, _, err := openAgentStateCache(*data)
 	if err != nil {
 		return err
 	}
@@ -239,9 +248,8 @@ func openAgentCache(_ string) (cache *agent.Cache, explicit bool, err error) {
 	return cache, true, err
 }
 
-// openAgentStateCache is openAgentCache for a running Agent: its configuration
-// is also kept in the data directory as a fallback for starts without a
-// reachable controller. Registration still comes from the controller each start.
+// openAgentStateCache opens the persistent cache in the data directory so
+// registration metadata and fallback snapshots survive restarts.
 func openAgentStateCache(data string) (*agent.Cache, bool, error) {
 	key, err := agentPrivateKey()
 	if err != nil {

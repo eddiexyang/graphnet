@@ -345,3 +345,75 @@ func TestRunUsesDiskFallbackOnlyWhenControllerUnreachable(t *testing.T) {
 		t.Fatal("without a fallback Run must exit on an unreachable controller:", err)
 	}
 }
+
+func TestDiskCachePersistsRegistrationAndDirectoryWithoutPrivateKey(t *testing.T) {
+	f := newDiskFixture(t)
+	f.seed(t, f.rev(5))
+
+	// Reopening with the same key restores registration, certificate, CA and directory.
+	c := f.open(t)
+	reg, err := c.Registration()
+	if err != nil || reg == nil {
+		t.Fatalf("registration not persisted: %+v, %v", reg, err)
+	}
+	if reg.AgentID != f.reg.AgentID || reg.Server != f.reg.Server || len(reg.Certificate) == 0 || reg.Directory == nil || reg.Directory.Revision != 1 {
+		t.Fatalf("persisted registration incomplete: %+v", reg)
+	}
+	updatedDir := reg.Directory.Clone()
+	updatedDir.Revision = 2
+	if err := c.SaveDirectory(updatedDir, nil); err != nil {
+		t.Fatal("SaveDirectory:", err)
+	}
+	c.Close()
+
+	// Private key seed/bytes must never appear anywhere in agent.db.
+	rawDB, err := os.ReadFile(f.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytesContains(rawDB, f.key.Seed()) {
+		t.Fatal("private key seed written to agent.db")
+	}
+
+	c2 := f.open(t)
+	reg2, err := c2.Registration()
+	if err != nil || reg2 == nil || reg2.Directory == nil || reg2.Directory.Revision != 2 {
+		c2.Close()
+		t.Fatalf("updated directory not persisted: %+v, %v", reg2, err)
+	}
+	// NewClient succeeds with no Server or Roots flags, using persisted registration.
+	cl, err := NewClient(c2, &recordingRuntime{}, Options{})
+	if err != nil {
+		c2.Close()
+		t.Fatal("NewClient from persisted registration failed:", err)
+	}
+	cl.Close()
+	c2.Close()
+
+	// Opening with a different private key wipes the old registration cleanly.
+	_, otherKey, _ := ed25519.GenerateKey(rand.Reader)
+	c3, err := OpenDiskCache(f.path, otherKey, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c3.Close()
+	if got, err := c3.Registration(); err != nil || got != nil {
+		t.Fatalf("registration of another key kept: %+v, %v", got, err)
+	}
+}
+
+func bytesContains(haystack, needle []byte) bool {
+	for i := 0; i+len(needle) <= len(haystack); i++ {
+		match := true
+		for j := range needle {
+			if haystack[i+j] != needle[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}

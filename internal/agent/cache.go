@@ -111,29 +111,41 @@ func (c *Cache) SaveRegistration(reg Registration) error {
 		return err
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.reg != nil {
 		if c.reg.AgentID != reg.AgentID || c.reg.Server != reg.Server || (len(c.reg.CA) > 0 && !bytes.Equal(c.reg.CA, reg.CA)) {
+			c.mu.Unlock()
 			return errors.New("registration cannot change agent or controller identity")
 		}
 	}
 	cp := reg.clone()
 	c.reg = &cp
+	c.mu.Unlock()
+	if raw, err := json.Marshal(cp); err == nil {
+		c.disk.put(cp.AgentID, keyRegistration, raw)
+	}
 	return nil
 }
 
-func (c *Cache) TLSCertificate(reg Registration) (tls.Certificate, error) {
+func verifyRegistrationCert(reg Registration, expectedPub ed25519.PublicKey) (*x509.Certificate, error) {
 	block, rest := pem.Decode(reg.Certificate)
 	if block == nil || block.Type != "CERTIFICATE" || len(bytes.TrimSpace(rest)) != 0 {
-		return tls.Certificate{}, errors.New("invalid agent certificate PEM")
+		return nil, errors.New("invalid agent certificate PEM")
 	}
 	cert, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
-		return tls.Certificate{}, err
+		return nil, err
 	}
 	pub, ok := cert.PublicKey.(ed25519.PublicKey)
-	if !ok || !pub.Equal(c.PublicKey()) || cert.Subject.CommonName != string(reg.AgentID) {
-		return tls.Certificate{}, errors.New("certificate does not match agent identity")
+	if !ok || !pub.Equal(expectedPub) || cert.Subject.CommonName != string(reg.AgentID) {
+		return nil, errors.New("certificate does not match agent identity")
+	}
+	return cert, nil
+}
+
+func (c *Cache) TLSCertificate(reg Registration) (tls.Certificate, error) {
+	cert, err := verifyRegistrationCert(reg, c.PublicKey())
+	if err != nil {
+		return tls.Certificate{}, err
 	}
 	return tls.Certificate{Certificate: [][]byte{cert.Raw}, PrivateKey: c.PrivateKey(), Leaf: cert}, nil
 }

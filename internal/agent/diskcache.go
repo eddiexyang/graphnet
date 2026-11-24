@@ -3,6 +3,7 @@ package agent
 import (
 	"bytes"
 	"crypto/ed25519"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,24 +13,25 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/eddiexyang/graphnet/internal/controltransport"
 	"github.com/eddiexyang/graphnet/internal/model"
 	bolt "go.etcd.io/bbolt"
 )
 
-// The disk cache is an offline fallback only. It keeps the last configuration
-// a previous process received so an Agent that cannot reach any controller at
-// startup still forwards traffic. It never feeds registration, controller
-// selection or revision ordering: the controller stays authoritative, so a
-// rebuilt controller (new CA, reset revisions) cannot be locked out by stale
-// local state.
+// The disk cache keeps an enrolled or registered Agent's controller metadata
+// (never its private key) and the last configuration a previous process
+// received so an Agent that restarts without bootstrap flags or cannot reach
+// any controller at startup still connects and forwards traffic. Snapshot
+// fallback never feeds revision ordering: the controller stays authoritative.
 var (
-	stateBucket  = []byte("agent-v2")
-	legacyBucket = []byte("agent-v1") // pre-stateless layout, held the private key
-	keyPublic    = []byte("public-key")
-	keyAgentID   = []byte("agent-id")
-	keyDesired   = []byte("desired")
-	keyApplied   = []byte("applied")
-	keyRoutes    = []byte("routes")
+	stateBucket     = []byte("agent-v2")
+	legacyBucket    = []byte("agent-v1") // pre-stateless layout, held the private key
+	keyPublic       = []byte("public-key")
+	keyAgentID      = []byte("agent-id")
+	keyRegistration = []byte("registration")
+	keyDesired      = []byte("desired")
+	keyApplied      = []byte("applied")
+	keyRoutes       = []byte("routes")
 )
 
 // ErrCacheInUse reports a disk cache held by another process or instance.
@@ -38,6 +40,7 @@ var ErrCacheInUse = errors.New("agent cache is in use by another process")
 // fallback is what a previous process left on disk, validated once at open.
 type fallback struct {
 	agentID model.ID
+	reg     *Registration
 	desired *model.Snapshot // last received; may have failed to apply
 	applied *model.Snapshot // last applied successfully
 	routes  *model.RouteUpdate
@@ -74,6 +77,10 @@ func OpenDiskCache(path string, identity ed25519.PrivateKey, log *slog.Logger) (
 		return cache, nil
 	}
 	cache.disk = &diskState{db: db, log: log}
+	if fb.reg != nil {
+		cp := fb.reg.clone()
+		cache.reg = &cp
+	}
 	if fb.desired != nil || fb.applied != nil {
 		cache.fallback = fb
 		if fb.routes != nil {
@@ -136,7 +143,7 @@ func openStateOnce(path string, pub ed25519.PublicKey, log *slog.Logger) (db *bo
 			if err := b.Put(keyPublic, pub); err != nil {
 				return err
 			}
-			reasons, err := loadFallback(b, fb)
+			reasons, err := loadFallback(b, pub, fb)
 			dropped = append(dropped, reasons...)
 			return err
 		})
@@ -153,7 +160,7 @@ func openStateOnce(path string, pub ed25519.PublicKey, log *slog.Logger) (db *bo
 
 // loadFallback reads the persisted configuration and deletes every part that
 // is unreadable or contradicts the rest, so what remains is safe to apply.
-func loadFallback(b *bolt.Bucket, fb *fallback) (dropped []string, err error) {
+func loadFallback(b *bolt.Bucket, pub ed25519.PublicKey, fb *fallback) (dropped []string, err error) {
 	drop := func(reason string, keys ...[]byte) {
 		dropped = append(dropped, reason)
 		for _, k := range keys {
@@ -164,12 +171,20 @@ func loadFallback(b *bolt.Bucket, fb *fallback) (dropped []string, err error) {
 	}
 	id := model.ID(b.Get(keyAgentID))
 	if id.Validate() != nil {
-		if b.Get(keyDesired) != nil || b.Get(keyApplied) != nil || b.Get(keyRoutes) != nil {
-			drop("configuration without a valid agent id", keyAgentID, keyDesired, keyApplied, keyRoutes)
+		if b.Get(keyRegistration) != nil || b.Get(keyDesired) != nil || b.Get(keyApplied) != nil || b.Get(keyRoutes) != nil {
+			drop("configuration without a valid agent id", keyAgentID, keyRegistration, keyDesired, keyApplied, keyRoutes)
 		}
 		return dropped, err
 	}
 	fb.agentID = id
+	if raw := b.Get(keyRegistration); raw != nil {
+		var reg Registration
+		if len(raw) > maxSnapshotBytes || json.Unmarshal(raw, &reg) != nil || validateDiskRegistration(reg, id, pub) != nil {
+			drop("unreadable registration", keyRegistration)
+		} else {
+			fb.reg = &reg
+		}
+	}
 	read := func(key []byte) *model.Snapshot {
 		raw := b.Get(key)
 		if raw == nil {
@@ -246,7 +261,7 @@ func (d *diskState) put(agentID model.ID, key, raw []byte) {
 			}
 			if !bytes.Equal(b.Get(keyAgentID), []byte(agentID)) {
 				// The controller assigned a new agent id: older state is not ours.
-				for _, k := range [][]byte{keyDesired, keyApplied, keyRoutes} {
+				for _, k := range [][]byte{keyRegistration, keyDesired, keyApplied, keyRoutes} {
 					if err := b.Delete(k); err != nil {
 						return err
 					}
@@ -299,4 +314,27 @@ func (c *Cache) persistApplied(agentID model.ID, snapshot model.Snapshot) {
 	if raw, err := json.Marshal(snapshot); err == nil {
 		c.disk.put(agentID, keyApplied, raw)
 	}
+}
+
+func validateDiskRegistration(reg Registration, expectedID model.ID, pub ed25519.PublicKey) error {
+	if reg.AgentID != expectedID || reg.AgentID.Validate() != nil {
+		return errors.New("registration agent id mismatch")
+	}
+	if _, err := serverURL(reg.Server); err != nil {
+		return err
+	}
+	if err := controltransport.Validate(reg.Transport); err != nil {
+		return err
+	}
+	if len(reg.CA) > 0 && !x509.NewCertPool().AppendCertsFromPEM(reg.CA) {
+		return errors.New("invalid registration CA")
+	}
+	if reg.KeyOnly() {
+		if len(reg.CA) == 0 {
+			return errors.New("key registration missing CA")
+		}
+	} else if _, err := verifyRegistrationCert(reg, pub); err != nil {
+		return err
+	}
+	return validateDirectory(reg, reg.Directory)
 }
