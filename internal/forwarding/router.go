@@ -88,6 +88,9 @@ type table struct {
 // Router swaps immutable forwarding tables atomically. Send chooses the active
 // Link of the requested Edge; that choice must never alter the graph edge weight.
 // Callbacks must not retain packet buffers unless they copy them.
+// SessionReplayHandler consumes an authenticated KindSessionReplay frame addressed to this Node.
+type SessionReplayHandler func(network, source model.ID, payload []byte)
+
 type Router struct {
 	state          atomic.Pointer[table]
 	send           Send
@@ -97,6 +100,49 @@ type Router struct {
 	sendOwnedBatch func(context.Context, model.ID, model.ID, []*packetbuf.Buffer) error
 	tcpIntercept   atomic.Pointer[TCPIntercept]
 	tcpCarrier     atomic.Pointer[TCPCarrier]
+	sessionReplay  atomic.Pointer[SessionReplayHandler]
+}
+
+// SetSessionReplay installs or removes (nil) the handler for KindSessionReplay control frames.
+func (r *Router) SetSessionReplay(handler SessionReplayHandler) {
+	if handler == nil {
+		r.sessionReplay.Store(nil)
+		return
+	}
+	r.sessionReplay.Store(&handler)
+}
+
+// SendSessionReplay routes an out-of-band session replay request toward destinationID.
+func (r *Router) SendSessionReplay(ctx context.Context, networkID, destinationID model.ID, payload []byte) error {
+	if len(payload) != 20 {
+		return errors.New("invalid session replay payload length")
+	}
+	n := r.state.Load().networks[networkID]
+	if n == nil {
+		return ErrNetwork
+	}
+	dest := n.byNode[wireID(destinationID)]
+	if dest == nil || dest.id == n.self.ID {
+		return ErrDestination
+	}
+	nextHop, ok := n.next(dest.id, func() uint64 { return binary.BigEndian.Uint64(payload[:8]) })
+	if !ok {
+		return ErrUnreachable
+	}
+	frame, err := (packet.Packet{
+		Header: packet.Header{
+			Kind:        packet.KindSessionReplay,
+			Network:     networkID,
+			Source:      n.self.ID,
+			Destination: dest.id,
+			HopLimit:    packet.DefaultHopLimit,
+		},
+		Payload: payload,
+	}).MarshalBinary()
+	if err != nil {
+		return err
+	}
+	return r.send(ctx, n.id, nextHop, frame)
 }
 
 // SetTCPCarrier installs or removes (nil) the check that keeps TCP packets
@@ -488,6 +534,37 @@ func (r *Router) fromPeer(ctx context.Context, peerID model.ID, frame []byte, de
 	destination, ok := n.byNode[p.Destination]
 	if !ok {
 		return ErrDestination
+	}
+	if p.Kind == packet.KindSessionReplay {
+		if len(raw) != 20 {
+			return errors.New("invalid session replay payload")
+		}
+		if destination.id == n.self.ID {
+			if h := r.sessionReplay.Load(); h != nil {
+				(*h)(n.id, source.id, raw)
+			}
+			return nil
+		}
+		if p.HopLimit <= 1 {
+			return packet.ErrHopLimit
+		}
+		nextHop, ok := n.next(destination.id, func() uint64 { return binary.BigEndian.Uint64(raw[:8]) })
+		if !ok {
+			return ErrUnreachable
+		}
+		if nextHop == peerID {
+			return fmt.Errorf("route would return packet to ingress neighbor")
+		}
+		if forward != nil {
+			frame[3]--
+			forward(n.id, nextHop)
+			return nil
+		}
+		buffer := packetbuf.Get(len(frame))
+		defer buffer.Release()
+		copy(buffer.Data, frame)
+		buffer.Data[3]--
+		return r.send(ctx, n.id, nextHop, buffer.Data)
 	}
 	info, err := packet.InspectAddresses(raw)
 	if err != nil {

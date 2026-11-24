@@ -480,7 +480,7 @@ func (l *Link) enqueue(ctx context.Context, frames [][]byte, owners []*packetbuf
 	limit := min(len(frames), len(l.data)-l.dataCount)
 	tcpBacked := l.tcpBacked()
 	for i, frame := range frames[:limit] {
-		if tcpBacked && packet.IsTCP(frame[packet.HeaderSize:]) {
+		if tcpBacked && frame[6] == packet.KindIP && packet.IsTCP(frame[packet.HeaderSize:]) {
 			l.tcpPackets.Add(1)
 			if owners != nil {
 				owners[i].Release()
@@ -492,7 +492,7 @@ func (l *Link) enqueue(ctx context.Context, frames [][]byte, owners []*packetbuf
 			break
 		}
 		var buffer *packetbuf.Buffer
-		if l.options.Compact != nil {
+		if l.options.Compact != nil && frame[6] == packet.KindIP {
 			buffer = compactFrame(frame, owners, i)
 		} else if owners != nil && owners[i].PrependByte(dataMessage) {
 			buffer = owners[i]

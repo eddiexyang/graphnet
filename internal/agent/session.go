@@ -6,22 +6,17 @@ import (
 	"errors"
 	"io"
 	"net"
-	"net/netip"
 	"sync"
 	"time"
 
 	"github.com/eddiexyang/graphnet/internal/forwarding"
 	"github.com/eddiexyang/graphnet/internal/model"
-	"github.com/eddiexyang/graphnet/internal/packet"
 	"github.com/eddiexyang/graphnet/internal/streamproxy"
 )
 
 const (
 	// Ended sessions are remembered so a late chain cannot start one again.
-	sessionTombstone = 10 * time.Minute
-	// replayPort carries the egress's replay requests between the Agents'
-	// overlay addresses; the ingress takes them before its TUN.
-	replayPort        = 0x4757
+	sessionTombstone  = 10 * time.Minute
 	replayRequestSize = 16 + 4 // session ID, failed generation
 )
 
@@ -483,78 +478,39 @@ func (s *runtimeState) selfID(network model.ID) model.ID {
 	return ""
 }
 
-// overlayAddress returns a node's address in a network.
-func (s *runtimeState) overlayAddress(network, node model.ID) (netip.Addr, bool) {
-	for _, n := range s.snapshot.Networks {
-		if n.ID != network {
-			continue
-		}
-		if n.Self.ID == node {
-			return n.Self.Address, true
-		}
-		for _, d := range n.Directory {
-			if d.NodeID == node {
-				return d.Address, true
-			}
-		}
-	}
-	return netip.Addr{}, false
-}
-
-// askReplay sends the egress's replay request to the ingress along the
-// current routes.
+// askReplay sends the egress's out-of-band replay request to the ingress
+// along the current overlay routes using KindSessionReplay.
 func (r *DataPlane) askReplay(key sessionKey, gen uint32) {
 	state := r.state.Load()
 	if state == nil {
 		return
 	}
-	var self model.ID
-	for _, n := range state.snapshot.Networks {
-		if n.ID == key.network {
-			self = n.Self.ID
-		}
-	}
-	from, ok := state.overlayAddress(key.network, self)
-	to, found := state.overlayAddress(key.network, key.source)
-	if !ok || !found {
-		return
-	}
 	payload := make([]byte, replayRequestSize)
 	copy(payload, key.conn[:])
 	binary.BigEndian.PutUint32(payload[16:], gen)
-	if raw := packet.UDP(netip.AddrPortFrom(from, replayPort), netip.AddrPortFrom(to, replayPort), payload); raw != nil {
-		state.router.FromTunnel(r.ctx, key.network, raw)
-	}
+	_ = state.router.SendSessionReplay(r.ctx, key.network, key.source, payload)
 }
 
-// replayRequest takes a replay request for one of this Agent's own sessions.
-// It reports whether the packet was one.
-func (r *DataPlane) replayRequest(state *runtimeState, network model.ID, raw []byte) bool {
-	source, destination, payload, ok := packet.UDPDatagram(raw)
-	if !ok || destination.Port() != replayPort || source.Port() != replayPort {
-		return false
+func (r *DataPlane) handleReplayRequest(network, remoteSource model.ID, payload []byte) {
+	if len(payload) != replayRequestSize {
+		return
 	}
-	self := state.selfAddress[network]
-	if destination.Addr() != self {
-		return false
+	state := r.state.Load()
+	if state == nil {
+		return
 	}
-	if len(payload) == replayRequestSize {
-		var conn streamproxy.SessionID
-		copy(conn[:], payload)
-		var source model.ID
-		for _, n := range state.snapshot.Networks {
-			if n.ID == network {
-				source = n.Self.ID
-			}
-		}
-		r.sessions.mu.Lock()
-		entry := r.sessions.ingress[sessionKey{network, source, conn}]
-		r.sessions.mu.Unlock()
-		if entry != nil && entry.end != nil {
-			entry.end.RequestReplay(binary.BigEndian.Uint32(payload[16:]))
-		}
+	self := state.selfID(network)
+	if self == "" {
+		return
 	}
-	return true
+	var conn streamproxy.SessionID
+	copy(conn[:], payload)
+	r.sessions.mu.Lock()
+	entry := r.sessions.ingress[sessionKey{network, self, conn}]
+	r.sessions.mu.Unlock()
+	if entry != nil && entry.request.Destination == remoteSource && entry.end != nil {
+		entry.end.RequestReplay(binary.BigEndian.Uint32(payload[16:]))
+	}
 }
 
 // sessionCounters reports session event totals.

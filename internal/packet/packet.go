@@ -18,6 +18,9 @@ const (
 	MaxPayload      = model.MaxMTU
 	MaxFrame        = HeaderSize + MaxPayload
 	DefaultHopLimit = 32
+
+	KindIP            uint8 = 0
+	KindSessionReplay uint8 = 1
 )
 
 var ErrHopLimit = errors.New("overlay hop limit exceeded")
@@ -25,6 +28,7 @@ var ErrHopLimit = errors.New("overlay hop limit exceeded")
 // Header is authenticated together with the payload by the peer crypto layer.
 // Sequence belongs to an encrypted session, not a virtual IP flow.
 type Header struct {
+	Kind        uint8
 	Network     model.ID
 	Source      model.ID
 	Destination model.ID
@@ -49,6 +53,9 @@ func (p Packet) AppendBinary(dst []byte) ([]byte, error) {
 	if p.Header.HopLimit == 0 {
 		return nil, ErrHopLimit
 	}
+	if p.Header.Kind > KindSessionReplay {
+		return nil, errors.New("unsupported packet kind")
+	}
 	offset := len(dst)
 	dst = append(dst, make([]byte, HeaderSize+len(p.Payload))...)
 	out := dst[offset:]
@@ -56,7 +63,8 @@ func (p Packet) AppendBinary(dst []byte) ([]byte, error) {
 	out[2] = Version
 	out[3] = p.Header.HopLimit
 	binary.BigEndian.PutUint16(out[4:6], uint16(len(p.Payload)))
-	// Bytes 6 and 7 are reserved and must remain zero.
+	out[6] = p.Header.Kind
+	// Byte 7 is reserved and must remain zero.
 	for i, id := range []model.ID{p.Header.Network, p.Header.Source, p.Header.Destination} {
 		if err := id.Validate(); err != nil {
 			return nil, err
@@ -91,6 +99,7 @@ func PutHeader(out []byte, network, source, destination [16]byte, hopLimit uint8
 // forwarding tables can look them up without allocating hexadecimal strings.
 // Payload references the caller's frame and must not outlive its ownership.
 type View struct {
+	Kind                         uint8
 	Network, Source, Destination [16]byte
 	HopLimit                     uint8
 	Epoch, Flow, Sequence        uint64
@@ -102,7 +111,7 @@ func ParseView(frame []byte) (View, error) {
 	if len(frame) < HeaderSize || len(frame) > MaxFrame {
 		return p, errors.New("invalid frame length")
 	}
-	if frame[0] != 'G' || frame[1] != 'W' || frame[2] != Version || frame[6] != 0 || frame[7] != 0 {
+	if frame[0] != 'G' || frame[1] != 'W' || frame[2] != Version || frame[6] > KindSessionReplay || frame[7] != 0 {
 		return p, errors.New("unsupported packet header")
 	}
 	if frame[3] == 0 {
@@ -122,6 +131,7 @@ func ParseView(frame []byte) (View, error) {
 		}
 		*dest = [16]byte(raw)
 	}
+	p.Kind = frame[6]
 	p.HopLimit = frame[3]
 	p.Epoch = binary.BigEndian.Uint64(frame[56:64])
 	p.Flow = binary.BigEndian.Uint64(frame[64:72])
@@ -137,6 +147,7 @@ func Parse(frame []byte) (Packet, error) {
 		return Packet{}, err
 	}
 	return Packet{Header: Header{
+		Kind:        v.Kind,
 		Network:     model.ID(hex.EncodeToString(v.Network[:])),
 		Source:      model.ID(hex.EncodeToString(v.Source[:])),
 		Destination: model.ID(hex.EncodeToString(v.Destination[:])),

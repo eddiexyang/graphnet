@@ -237,6 +237,7 @@ func (r *DataPlane) Apply(ctx context.Context, snapshot model.Snapshot) error {
 	}
 	router.SetTCPIntercept(r.interceptTCP)
 	router.SetTCPCarrier(next.mesh.TCPCarrier)
+	router.SetSessionReplay(r.handleReplayRequest)
 	next.router = router
 	for _, network := range snapshot.Networks {
 		fingerprint := tcpFingerprint(network)
@@ -476,9 +477,6 @@ func (r *DataPlane) deliver(ctx context.Context, network model.ID, raw []byte) e
 	if state == nil {
 		return errors.New("agent runtime is not configured")
 	}
-	if r.replayRequest(state, network, raw) {
-		return nil
-	}
 	if crossNetwork(state, network, raw) {
 		return forwarding.ErrDestination
 	}
@@ -616,11 +614,10 @@ func (r *DataPlane) deliverBatch(ctx context.Context, network model.ID, packets 
 	if state == nil {
 		return errors.New("agent runtime is not configured")
 	}
-	// Replay requests of this Agent's TCP sessions never reach the TUN, nor do
-	// packets addressed to another network.
+	// Packets addressed to another network never reach the TUN.
 	var kept [][]byte
 	for i, raw := range packets {
-		if r.replayRequest(state, network, raw) || crossNetwork(state, network, raw) {
+		if crossNetwork(state, network, raw) {
 			if kept == nil {
 				kept = append(make([][]byte, 0, len(packets)), packets[:i]...)
 			}

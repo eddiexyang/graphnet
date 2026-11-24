@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net/netip"
@@ -8,6 +9,7 @@ import (
 
 	"github.com/eddiexyang/graphnet/internal/forwarding"
 	"github.com/eddiexyang/graphnet/internal/model"
+	"github.com/eddiexyang/graphnet/internal/packet"
 )
 
 func icmpTo(src, dst netip.Addr) []byte {
@@ -99,5 +101,33 @@ func TestDeliverAllowsExplicitCrossNetworkAdvertisement(t *testing.T) {
 		if got.String() != dst {
 			t.Fatalf("TUN received %s, want %s", got, dst)
 		}
+	}
+}
+
+func TestDeliverPreservesUserUDP18263ToSelfOverlay(t *testing.T) {
+	a := model.ID("00000000000000000000000000000001")
+	d := &packetTestTUN{out: make(chan []byte, 4), done: make(chan struct{})}
+	defer d.Close()
+	r := &DataPlane{}
+	selfAddr := netip.MustParseAddr("6.6.6.4")
+	peerAddr := netip.MustParseAddr("6.6.6.11")
+	r.state.Store(&runtimeState{
+		snapshot:    model.Snapshot{Networks: []model.NetworkConfig{{ID: a, CIDR: netip.MustParsePrefix("6.6.6.0/24")}}},
+		devices:     map[model.ID]*runtimeTunnel{a: newRuntimeTunnel(d)},
+		selfAddress: map[model.ID]netip.Addr{a: selfAddr},
+	})
+	// 20-byte UDP datagram on 18263 -> 18263 (formerly intercepted as replayPort).
+	userPayload := []byte("0123456789abcdefghij")
+	raw := packet.UDP(netip.AddrPortFrom(peerAddr, 18263), netip.AddrPortFrom(selfAddr, 18263), userPayload)
+	if err := r.deliver(context.Background(), a, raw); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-d.out:
+		if !bytes.Equal(got, raw) {
+			t.Fatal("user UDP 18263 datagram altered")
+		}
+	default:
+		t.Fatal("user UDP 18263 datagram swallowed instead of delivered to TUN")
 	}
 }
