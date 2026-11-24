@@ -21,20 +21,22 @@ func TestSyncRepairsLostChangeBeforeFullRefresh(t *testing.T) {
 	for _, id := range []model.ID{nodeA, nodeB} {
 		e := l.engines[id]
 		send := e.cb.Send
-		e.cb.Send = func(network, peer model.ID, raw []byte) {
+		e.cb.Send = func(network, peer model.ID, raw []byte) bool {
 			var msg syncMessage
 			json.Unmarshal(raw, &msg)
 			if msg.Kind != "" {
-				send(network, peer, raw)
+				return send(network, peer, raw)
 			}
+			return true // queued, then lost in transit
 		}
 	}
 	l.down[edgeAB] = true
 	l.run(time.Second)
 	for _, id := range []model.ID{nodeA, nodeB} {
 		self := id
-		l.engines[id].cb.Send = func(network, peer model.ID, raw []byte) {
+		l.engines[id].cb.Send = func(network, peer model.ID, raw []byte) bool {
 			l.queue = append(l.queue, message{network, self, peer, append([]byte(nil), raw...)})
+			return true
 		}
 	}
 	l.run(SyncInterval + time.Second)
@@ -151,11 +153,11 @@ func TestStableThirteenNodeTrafficBudget(t *testing.T) {
 	bytes := map[model.ID]int{}
 	for id, engine := range l.engines {
 		self, send := id, engine.cb.Send
-		engine.cb.Send = func(network, peer model.ID, raw []byte) {
+		engine.cb.Send = func(network, peer model.ID, raw []byte) bool {
 			cost := len(raw) + 30 + 66 + 66
 			bytes[self] += cost
 			bytes[peer] += cost
-			send(network, peer, raw)
+			return send(network, peer, raw)
 		}
 	}
 	window := 10 * time.Minute

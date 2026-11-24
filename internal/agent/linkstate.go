@@ -14,10 +14,9 @@ func (r *DataPlane) newLinkState() *linkstate.Engine {
 	r.damper = newEdgeDamper()
 	return linkstate.New(linkstate.Callbacks{
 		Identity: r.identity,
-		Send: func(network, peer model.ID, raw []byte) {
-			if state := r.state.Load(); state != nil {
-				state.mesh.SendLinkState(network, peer, raw)
-			}
+		Send: func(network, peer model.ID, raw []byte) bool {
+			state := r.state.Load()
+			return state != nil && state.mesh.SendLinkState(network, peer, raw)
 		},
 		// An edge is usable here while it has a healthy Link, the condition
 		// the Agent also reports to the controller, unless damping holds it.

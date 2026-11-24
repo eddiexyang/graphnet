@@ -37,6 +37,9 @@ type lab struct {
 	apply     func(node model.ID, u model.RouteUpdate) error
 	snapshots map[model.ID]model.Snapshot
 	keys      map[model.ID]ed25519.PrivateKey
+	// refuse, when set, makes sends to a node fail as if no Link could
+	// carry advertisements yet.
+	refuse func(to model.ID) bool
 }
 
 func agentKeyFor(state model.State, agentID model.ID) ed25519.PrivateKey {
@@ -92,8 +95,12 @@ func (l *lab) start(node model.Node) {
 	e = New(Callbacks{
 		Identity: identity,
 		Now:      func() time.Time { return l.now },
-		Send: func(network, peer model.ID, raw []byte) {
+		Send: func(network, peer model.ID, raw []byte) bool {
+			if l.refuse != nil && l.refuse(peer) {
+				return false
+			}
 			l.queue = append(l.queue, message{network, self, peer, append([]byte(nil), raw...)})
+			return true
 		},
 		Local: func() (map[model.ID]map[model.ID]bool, map[model.ID]map[model.ID]bool) {
 			up := map[model.ID]bool{}
@@ -406,7 +413,7 @@ func TestFirstConfigurationKeepsCompiledRoutesUntilObserved(t *testing.T) {
 	}
 	e := New(Callbacks{
 		Identity: agentKeyFor(state, state.Agents[0].ID),
-		Send:     func(model.ID, model.ID, []byte) {},
+		Send:     func(model.ID, model.ID, []byte) bool { return true },
 		Local:    func() (map[model.ID]map[model.ID]bool, map[model.ID]map[model.ID]bool) { return nil, nil },
 		Apply:    func(model.RouteUpdate) error { return nil },
 	})
@@ -537,5 +544,31 @@ func TestResetAgeCannotResurrectStaleAdvertisement(t *testing.T) {
 	arrived := engA.networks[netID].db[nodeB].arrived
 	if want := born.Add(MaxAge); !arrived.Equal(want) {
 		t.Fatalf("stale advertisement counted from %s, want at most %s", arrived, want)
+	}
+}
+
+// A neighbour is reported ready before any Link can carry advertisements; the
+// database it is owed is resent once one can, not left to the next sync. C's
+// advertisement does not change when A joins, so no flood would carry it.
+func TestOwedDatabaseReachesANeighbourOnceItsLinkCarriesAdvertisements(t *testing.T) {
+	l := newLab(t, nodeA)
+	l.run(time.Second)
+	refusing := true
+	l.refuse = func(to model.ID) bool { return refusing && to == nodeA }
+	l.start(l.state.Networks[0].Nodes[0])
+	l.run(500 * time.Millisecond)
+	netID := l.state.Networks[0].ID
+	if _, ok := l.engines[nodeA].networks[netID].db[nodeC]; ok {
+		t.Fatal("A received C's advertisement while sends to it were refused")
+	}
+	refusing = false
+	l.run(500 * time.Millisecond)
+	if _, ok := l.engines[nodeA].networks[netID].db[nodeC]; !ok {
+		t.Fatal("A did not receive C's advertisement once its Links carried advertisements")
+	}
+	for _, id := range []model.ID{nodeB, nodeD} {
+		if owed := l.engines[id].networks[netID].owed; len(owed) != 0 {
+			t.Fatalf("%s still owes a database: %v", id, owed)
+		}
 	}
 }

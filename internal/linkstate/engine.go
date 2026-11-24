@@ -85,11 +85,12 @@ func (l LSA) Verify(pub ed25519.PublicKey) bool {
 	return len(pub) == ed25519.PublicKeySize && len(l.Signature) == ed25519.SignatureSize && ed25519.Verify(pub, l.SignBytes(), l.Signature)
 }
 
-// Callbacks connect the engine to an Agent. Send is best effort: periodic
-// refresh repairs a lost advertisement.
+// Callbacks connect the engine to an Agent. Send is best effort and reports
+// whether the message was queued: a database owed to a new neighbour is resent
+// until it is, and periodic refresh repairs other lost advertisements.
 type Callbacks struct {
 	Identity ed25519.PrivateKey
-	Send     func(network, peer model.ID, raw []byte)
+	Send     func(network, peer model.ID, raw []byte) bool
 	// Local returns up and fallback edges from the same observation.
 	Local func() (up, fallback map[model.ID]map[model.ID]bool) // network -> edge
 	Apply func(model.RouteUpdate) error
@@ -118,6 +119,9 @@ type network struct {
 	syncReady   bool
 	syncSent    time.Time
 	syncMembers []model.ID
+	// owed holds neighbours whose database dump could not be queued yet,
+	// with the time it was first owed.
+	owed map[model.ID]time.Time
 }
 
 type Engine struct {
@@ -178,7 +182,7 @@ func (e *Engine) Configure(s model.Snapshot) *model.RouteUpdate {
 	for _, c := range clone.Networks {
 		n := e.networks[c.ID]
 		if n == nil {
-			n = &network{db: map[model.ID]entry{}, local: map[model.ID]bool{}, fallback: map[model.ID]bool{}, dirty: true}
+			n = &network{db: map[model.ID]entry{}, local: map[model.ID]bool{}, fallback: map[model.ID]bool{}, owed: map[model.ID]time.Time{}, dirty: true}
 		}
 		neighbors := map[model.ID]bool{}
 		for _, p := range c.Peers {
@@ -188,6 +192,11 @@ func (e *Engine) Configure(s model.Snapshot) *model.RouteUpdate {
 			n.dirty = true
 		}
 		n.config, n.neighbors = c, neighbors
+		for peer := range n.owed {
+			if !neighbors[peer] {
+				delete(n.owed, peer)
+			}
+		}
 		n.syncMembers = componentMembers(c)
 		for origin := range n.db {
 			if !n.known(origin) {
@@ -223,26 +232,59 @@ func (e *Engine) Applied(update model.RouteUpdate, err error, took time.Duration
 }
 
 // PeerReady sends the whole database to a neighbour that can now exchange
-// advertisements, as a new adjacency does in OSPF.
+// advertisements. A neighbour is often reported ready before any of its Links
+// can carry them; what cannot be queued is owed and resent on every Step until
+// it is, or until periodic synchronization takes over.
 func (e *Engine) PeerReady(networkID, peer model.ID) {
 	e.mu.Lock()
-	n := e.networks[networkID]
-	var out [][]byte
-	if n != nil && n.neighbors[peer] {
-		for id, record := range n.records(e.cb.Now()) {
-			if n.config.Self.Client && id != n.config.Self.ID {
-				continue
-			}
-			if raw, err := json.Marshal(record); err == nil {
-				out = append(out, raw)
-			}
+	if n := e.networks[networkID]; n != nil && n.neighbors[peer] {
+		if _, ok := n.owed[peer]; !ok {
+			n.owed[peer] = e.cb.Now()
 		}
 	}
 	e.mu.Unlock()
+	e.sendDatabase(networkID, peer)
+}
+
+// sendDatabase sends the database owed to peer and clears the debt once every
+// advertisement is queued.
+func (e *Engine) sendDatabase(networkID, peer model.ID) {
+	e.mu.Lock()
+	n := e.networks[networkID]
+	if n == nil || !n.neighbors[peer] {
+		e.mu.Unlock()
+		return
+	}
+	if _, ok := n.owed[peer]; !ok {
+		e.mu.Unlock()
+		return
+	}
+	var out [][]byte
+	for id, record := range n.records(e.cb.Now()) {
+		if n.config.Self.Client && id != n.config.Self.ID {
+			continue
+		}
+		if raw, err := json.Marshal(record); err == nil {
+			out = append(out, raw)
+		}
+	}
+	e.mu.Unlock()
+	queued := true
 	for _, raw := range out {
 		e.stats.Sent.Add(1)
-		e.cb.Send(networkID, peer, raw)
+		if !e.cb.Send(networkID, peer, raw) {
+			queued = false
+			break
+		}
 	}
+	if !queued {
+		return
+	}
+	e.mu.Lock()
+	if n := e.networks[networkID]; n != nil {
+		delete(n.owed, peer)
+	}
+	e.mu.Unlock()
 }
 
 // Receive handles an advertisement from an authenticated neighbour.
@@ -519,11 +561,26 @@ func (e *Engine) Step() {
 			sends = append(sends, send{id, peers, raw, true})
 		}
 	}
+	type debt struct{ network, peer model.ID }
+	var owed []debt
+	for id, n := range e.networks {
+		for peer, since := range n.owed {
+			// After a full sync interval the digest exchange repairs it.
+			if now.Sub(since) >= SyncInterval {
+				delete(n.owed, peer)
+				continue
+			}
+			owed = append(owed, debt{id, peer})
+		}
+	}
 	if !e.spfAt.IsZero() && !now.Before(e.spfAt) {
 		e.spfAt = time.Time{}
 		update = e.spfLocked()
 	}
 	e.mu.Unlock()
+	for _, d := range owed {
+		e.sendDatabase(d.network, d.peer)
+	}
 	for _, s := range sends {
 		for _, p := range s.peers {
 			if !s.sync {

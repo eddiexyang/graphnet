@@ -26,7 +26,7 @@ func FuzzReceive(f *testing.F) {
 	e := New(Callbacks{
 		Identity: key1,
 		Now:      time.Now,
-		Send:     func(model.ID, model.ID, []byte) {},
+		Send:     func(model.ID, model.ID, []byte) bool { return true },
 		Local:    func() (map[model.ID]map[model.ID]bool, map[model.ID]map[model.ID]bool) { return nil, nil },
 		Apply:    func(model.RouteUpdate) error { return nil },
 	})
