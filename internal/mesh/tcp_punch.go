@@ -73,6 +73,29 @@ func (m *Mesh) allowsTCPPunch(identity ed25519.PublicKey) bool {
 	return m.allowsTCPPunchLocked(identity)
 }
 
+func (m *Mesh) allowedTCPPunchPeers() []ed25519.PublicKey {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return nil
+	}
+	seen := map[[32]byte]bool{}
+	var peers []ed25519.PublicKey
+	for _, g := range m.groups {
+		cfg := g.policy.Load()
+		if !cfg.peer.Edge.Enabled || !cfg.peer.Edge.Methods.HolePunch || !slices.Contains(cfg.peer.Edge.Transports, model.TCP) || len(cfg.peer.PublicKey) != ed25519.PublicKeySize {
+			continue
+		}
+		var k [32]byte
+		copy(k[:], cfg.peer.PublicKey)
+		if !seen[k] {
+			seen[k] = true
+			peers = append(peers, bytes.Clone(cfg.peer.PublicKey))
+		}
+	}
+	return peers
+}
+
 // Budget one peer's multiplexed streams from locally authorized configuration,
 // never from remote stream requests or observed live stream counts. Endpoint
 // aliases and IPv6 egress scopes can produce distinct candidates on one socket.
@@ -317,7 +340,12 @@ func (m *Mesh) punchStream(ctx context.Context, remote netip.AddrPort, identity 
 		err = nil
 	} else if err == nil {
 		var session *transport.PunchMux
-		session, err = transport.NewPunchMux(ctx, conn, m.identity.Public().(ed25519.PublicKey), m.tls, func(pub ed25519.PublicKey) bool { return pub.Equal(identity) && m.allowsTCPPunch(pub) }, false)
+		session, err = transport.NewPunchMux(ctx, conn, m.identity, m.tls, func() []ed25519.PublicKey {
+			if !m.allowsTCPPunch(identity) {
+				return nil
+			}
+			return []ed25519.PublicKey{identity}
+		}, false)
 		if err == nil {
 			if !m.installPunch(session) {
 				session.Close()

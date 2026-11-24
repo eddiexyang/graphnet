@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -8,6 +9,7 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"sync"
 	"testing"
 	"time"
 
@@ -111,11 +113,16 @@ func TestUDPPortAnswersNoProbe(t *testing.T) {
 	}
 }
 
-// A TCP punch session's accepting end says nothing to a stranger: a probe
-// learns neither the protocol nor the identity.
+// A TCP punch session's accepting end says nothing to a stranger, and an
+// authorized handshake exposes no magic prefix or static public key in clear.
 func TestPassivePunchAnswersNoProbe(t *testing.T) {
-	_, identity, _ := ed25519.GenerateKey(nil)
-	certificate, err := PeerServerTLS(identity)
+	pubA, keyA, _ := ed25519.GenerateKey(nil)
+	pubB, keyB, _ := ed25519.GenerateKey(nil)
+	certA, err := PeerServerTLS(keyA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certB, err := PeerServerTLS(keyB)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,15 +132,77 @@ func TestPassivePunchAnswersNoProbe(t *testing.T) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		_, err := NewPunchMux(ctx, agent, identity.Public().(ed25519.PublicKey), certificate, func(ed25519.PublicKey) bool { return false }, true)
+		_, err := NewPunchMux(ctx, agent, keyA, certA, func() []ed25519.PublicKey { return []ed25519.PublicKey{pubB} }, true)
 		done <- err
 	}()
-	hello := make([]byte, 36)
-	copy(hello, punchMagic[:])
-	rand.Read(hello[4:])
+	hello := make([]byte, PunchPrefaceSize)
+	rand.Read(hello)
 	go probe.Write(hello)
 	silent(t, probe, "a punch probe")
 	if err := <-done; err == nil {
 		t.Fatal("a stranger's punch was accepted")
 	}
+
+	// Authorized active/passive punch hides both identities and emits no HGW magic.
+	left, right := net.Pipe()
+	defer left.Close()
+	defer right.Close()
+	var wire bytes.Buffer
+	var wireMu sync.Mutex
+	tap := func(c net.Conn) net.Conn {
+		return &recordingNetConn{Conn: c, record: func(b []byte) {
+			wireMu.Lock()
+			wire.Write(b)
+			wireMu.Unlock()
+		}}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	passiveCh := make(chan *PunchMux, 1)
+	passiveErr := make(chan error, 1)
+	go func() {
+		mux, err := NewPunchMux(ctx, tap(right), keyB, certB, func() []ed25519.PublicKey { return []ed25519.PublicKey{pubA} }, true)
+		if err != nil {
+			passiveErr <- err
+			return
+		}
+		passiveCh <- mux
+	}()
+	activeMux, err := NewPunchMux(ctx, tap(left), keyA, certA, func() []ed25519.PublicKey { return []ed25519.PublicKey{pubB} }, false)
+	if err != nil {
+		t.Fatalf("active punch: %v", err)
+	}
+	defer activeMux.Close()
+	select {
+	case err := <-passiveErr:
+		t.Fatalf("passive punch: %v", err)
+	case pm := <-passiveCh:
+		defer pm.Close()
+	}
+	wireMu.Lock()
+	recorded := bytes.Clone(wire.Bytes())
+	wireMu.Unlock()
+	pubAX, _ := ed25519PubToX25519(pubA)
+	pubBX, _ := ed25519PubToX25519(pubB)
+	for _, forbidden := range [][]byte{
+		{'H', 'G', 'W', 1},
+		pubA,
+		pubB,
+		pubAX[:],
+		pubBX[:],
+	} {
+		if bytes.Contains(recorded[:2*PunchPrefaceSize], forbidden) {
+			t.Fatal("punch preface leaked magic or public key")
+		}
+	}
+}
+
+type recordingNetConn struct {
+	net.Conn
+	record func([]byte)
+}
+
+func (r *recordingNetConn) Write(p []byte) (int, error) {
+	r.record(p)
+	return r.Conn.Write(p)
 }

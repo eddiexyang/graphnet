@@ -440,12 +440,12 @@ func TestWaitForInstalledPunchWakesImmediately(t *testing.T) {
 
 	errCh := make(chan error, 2)
 	go func() {
-		_, err := transport.NewPunchMux(ctx, c2, keyB.Public().(ed25519.PublicKey), mB.tls, func(ed25519.PublicKey) bool { return true }, false)
+		_, err := transport.NewPunchMux(ctx, c2, keyB, mB.tls, func() []ed25519.PublicKey { return []ed25519.PublicKey{keyA.Public().(ed25519.PublicKey)} }, false)
 		errCh <- err
 	}()
 
 	time.AfterFunc(100*time.Millisecond, func() {
-		session, err := transport.NewPunchMux(ctx, c1, keyA.Public().(ed25519.PublicKey), mA.tls, func(ed25519.PublicKey) bool { return true }, false)
+		session, err := transport.NewPunchMux(ctx, c1, keyA, mA.tls, func() []ed25519.PublicKey { return []ed25519.PublicKey{keyB.Public().(ed25519.PublicKey)} }, false)
 		errCh <- err
 		if err != nil {
 			return
