@@ -7,6 +7,7 @@ go 1.26.3
 replace github.com/boltdb/bolt => ./internal/boltcompat
 
 require (
+	filippo.io/edwards25519 v1.2.0
 	github.com/coder/websocket v1.8.15
 	github.com/eddiexyang/quic-go v0.63.0-bbr.1
 	github.com/flynn/noise v1.1.0
@@ -18,7 +19,7 @@ require (
 	github.com/vishvananda/netns v0.0.5
 	go.etcd.io/bbolt v1.5.0
 	golang.org/x/crypto v0.57.0
-	golang.org/x/net v0.58.0
+	golang.org/x/net v0.60.0
 	golang.org/x/sys v0.48.0
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2
 	golang.zx2c4.com/wireguard v0.0.0-20260522210424-ecfc5a8d5446
@@ -29,7 +30,6 @@ require (
 )
 
 require (
-	filippo.io/edwards25519 v1.2.0 // indirect
 	github.com/boltdb/bolt v1.3.1 // indirect
 	github.com/fatih/color v1.19.0 // indirect
 	github.com/google/btree v1.1.2 // indirect

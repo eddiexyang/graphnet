@@ -6,7 +6,7 @@ RUN pnpm install --frozen-lockfile
 COPY web/ ./
 RUN pnpm build
 
-FROM --platform=$BUILDPLATFORM golang:1.26.8-bookworm AS build
+FROM --platform=$BUILDPLATFORM golang:1.26.11-bookworm AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 COPY internal/boltcompat/ ./internal/boltcompat/
