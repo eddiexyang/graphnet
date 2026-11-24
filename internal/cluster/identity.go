@@ -12,6 +12,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"os"
+	"time"
 
 	"github.com/eddiexyang/graphnet/internal/model"
 	"github.com/eddiexyang/graphnet/internal/pki"
@@ -121,17 +122,33 @@ func Initialize(db *store.Store, ca *pki.Authority, identity *Identity, endpoint
 	if !found {
 		return errors.New("local server identity absent from cluster")
 	}
-	if len(identity.Certificate) == 0 {
-		csr, err := identity.CSR()
-		if err != nil {
-			return err
-		}
-		identity.Certificate, _, err = ca.IssueAgent(identity.ID, csr)
-		if err != nil {
-			return err
-		}
-		return identity.Save(db)
+	if cert, err := identity.TLSCertificate(); len(identity.Certificate) > 0 && err != nil {
+		return err
+	} else if err == nil && !pki.NeedsRenewal(cert.Leaf, time.Now()) {
+		return nil
 	}
-	_, err = identity.TLSCertificate()
-	return err
+	return identity.Renew(db, ca)
+}
+
+// Renew issues a new server client certificate from the local cluster CA and
+// saves it with the identity.
+func (i *Identity) Renew(db *store.Store, ca *pki.Authority) error {
+	csr, err := i.CSR()
+	if err != nil {
+		return err
+	}
+	certificate, _, err := ca.IssueAgent(i.ID, csr)
+	if err != nil {
+		return err
+	}
+	next := *i
+	next.Certificate = certificate
+	if _, err := next.TLSCertificate(); err != nil {
+		return err
+	}
+	if err := next.Save(db); err != nil {
+		return err
+	}
+	*i = next
+	return nil
 }

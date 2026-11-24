@@ -19,6 +19,9 @@ const (
 	// AgentRegistrationPath returns the Agent ID, CA and controller directory
 	// to an authenticated Agent.
 	AgentRegistrationPath = "/api/v1/agent/registration"
+	// AgentRenewPath issues a new client certificate to an authenticated
+	// Agent for a certificate request signed by its registered key.
+	AgentRenewPath = "/api/v1/agent/renew"
 )
 
 // AgentChallengeMessage is the exact byte string an Agent signs. Binding the

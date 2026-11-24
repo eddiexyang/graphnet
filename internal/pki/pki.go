@@ -15,6 +15,7 @@ import (
 	"errors"
 	"math/big"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/eddiexyang/graphnet/internal/model"
@@ -106,7 +107,51 @@ func (a *Authority) IssueAgent(id model.ID, csrDER []byte) ([]byte, ed25519.Publ
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), pub, nil
 }
 
+// RenewBefore is how long before expiry an issued certificate is renewed.
+const RenewBefore = 30 * 24 * time.Hour
+
+// NeedsRenewal reports whether cert expires within RenewBefore of now, or
+// already has.
+func NeedsRenewal(cert *x509.Certificate, now time.Time) bool {
+	return cert == nil || !now.Add(RenewBefore).Before(cert.NotAfter)
+}
+
+// ServerTLS serves a controller certificate for hosts that is re-signed in
+// memory once it is within RenewBefore of expiry, so a controller that runs
+// for longer than its certificate lifetime never serves an expired one.
 func (a *Authority) ServerTLS(hosts []string) (*tls.Config, error) {
+	first, err := a.issueServer(hosts)
+	if err != nil {
+		return nil, err
+	}
+	current := &renewingCertificate{issue: func() (*tls.Certificate, error) { return a.issueServer(hosts) }, cert: first}
+	pool := x509.NewCertPool()
+	pool.AddCert(a.cert)
+	return &tls.Config{MinVersion: tls.VersionTLS13, GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return current.get(time.Now()) }, ClientCAs: pool, ClientAuth: tls.VerifyClientCertIfGiven}, nil
+}
+
+type renewingCertificate struct {
+	issue func() (*tls.Certificate, error)
+	mu    sync.Mutex
+	cert  *tls.Certificate
+}
+
+func (r *renewingCertificate) get(now time.Time) (*tls.Certificate, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if NeedsRenewal(r.cert.Leaf, now) {
+		next, err := r.issue()
+		if err != nil && !now.Before(r.cert.Leaf.NotAfter) {
+			return nil, err
+		}
+		if err == nil {
+			r.cert = next
+		}
+	}
+	return r.cert, nil
+}
+
+func (a *Authority) issueServer(hosts []string) (*tls.Certificate, error) {
 	// Browsers do not universally offer Ed25519 for TLS CertificateVerify.
 	// Keep the durable CA and Agent identities, but use P-256 for HTTPS.
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -133,7 +178,9 @@ func (a *Authority) ServerTLS(hosts []string) (*tls.Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	pool := x509.NewCertPool()
-	pool.AddCert(a.cert)
-	return &tls.Config{MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{{Certificate: [][]byte{der, a.cert.Raw}, PrivateKey: key}}, ClientCAs: pool, ClientAuth: tls.VerifyClientCertIfGiven}, nil
+	leaf, err := x509.ParseCertificate(der)
+	if err != nil {
+		return nil, err
+	}
+	return &tls.Certificate{Certificate: [][]byte{der, a.cert.Raw}, PrivateKey: key, Leaf: leaf}, nil
 }

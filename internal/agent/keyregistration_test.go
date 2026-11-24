@@ -61,6 +61,7 @@ func TestAgentStartsFromRegisteredPublicKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	listener.StartTLS()
+	listener.TLS.Certificates = nil // serve the controller certificate, not httptest's
 	defer listener.Close()
 	roots := x509.NewCertPool()
 	roots.AppendCertsFromPEM(ca.PEM)

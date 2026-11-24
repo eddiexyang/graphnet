@@ -63,7 +63,7 @@ func TestOneWayClusterChannel(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := range nodes {
-		nodes[i], err = Start(dbs[i], identities[i], t.TempDir(), nil)
+		nodes[i], err = Start(dbs[i], identities[i], t.TempDir(), nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/eddiexyang/graphnet/internal/model"
+	"github.com/eddiexyang/graphnet/internal/pki"
 	"github.com/eddiexyang/graphnet/internal/store"
 	"github.com/hashicorp/raft"
 	boltdb "github.com/hashicorp/raft-boltdb/v2"
@@ -120,7 +121,9 @@ type Runtime struct {
 	changed   func()
 }
 
-func Start(db *store.Store, identity Identity, directory string, changed func()) (*Runtime, error) {
+// Start runs the cluster member identity. With ca, its client certificate is
+// renewed from the local cluster CA before it expires.
+func Start(db *store.Store, identity Identity, directory string, changed func(), ca *pki.Authority) (*Runtime, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &Runtime{status: statusCache{peers: map[model.ID]remoteStatus{}}, admission: make(chan struct{}, 64), DB: db, Identity: identity, ctx: ctx, cancel: cancel, ready: make(chan struct{}), changed: changed}
 	path := filepath.Join(directory, "raft", string(identity.Epoch))
@@ -129,7 +132,7 @@ func Start(db *store.Store, identity Identity, directory string, changed func())
 		return nil, err
 	}
 	var err error
-	r.clients, err = newClients(db, identity)
+	r.clients, err = newClients(db, identity, ca)
 	if err != nil {
 		cancel()
 		return nil, err

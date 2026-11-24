@@ -131,6 +131,7 @@ func TestRenewalSendsSmallAcknowledgement(t *testing.T) {
 		t.Fatal(err)
 	}
 	server.StartTLS()
+	server.TLS.Certificates = nil // serve the controller certificate, not httptest's
 	defer server.Close()
 	c, err := NewClient(cache, controllerTestRuntime{}, Options{Server: server.URL, Version: "test"})
 	if err != nil {
@@ -217,6 +218,7 @@ func TestPersistentConfigErrorNeverSendsAckRevision(t *testing.T) {
 		t.Fatal(err)
 	}
 	server.StartTLS()
+	server.TLS.Certificates = nil // serve the controller certificate, not httptest's
 	defer server.Close()
 
 	c, err := NewClient(cache, failingRuntime{failRev: bad.Revision}, Options{Server: server.URL, Version: "test"})

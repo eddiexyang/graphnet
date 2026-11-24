@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -104,6 +105,11 @@ func startTestController(t *testing.T) (*store.Store, *control.Server, *pki.Auth
 		t.Fatal(err)
 	}
 	listener.StartTLS()
+	listener.TLS.Certificates = nil // serve the controller certificate, not httptest's
+	// listener.Client() trusts the controller CA instead of httptest's certificate.
+	roots := x509.NewCertPool()
+	roots.AppendCertsFromPEM(ca.PEM)
+	listener.Client().Transport.(*http.Transport).TLSClientConfig.RootCAs = roots
 	t.Cleanup(listener.Close)
 
 	serverNode.Endpoints = []model.ServerEndpoint{{

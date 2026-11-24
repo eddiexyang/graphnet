@@ -12,7 +12,7 @@ import (
 )
 
 func (s *Server) StartCluster(identity cluster.Identity, directory string) (*cluster.Runtime, error) {
-	runtime, err := cluster.Start(s.db, identity, directory, s.notify)
+	runtime, err := cluster.Start(s.db, identity, directory, s.notify, s.ca)
 	if err != nil {
 		return nil, err
 	}

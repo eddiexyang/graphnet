@@ -16,18 +16,46 @@ import (
 	"github.com/coder/websocket"
 	"github.com/eddiexyang/graphnet/internal/controltransport"
 	"github.com/eddiexyang/graphnet/internal/model"
+	"github.com/eddiexyang/graphnet/internal/pki"
 	"github.com/eddiexyang/graphnet/internal/store"
 )
 
 type clients struct {
 	mu         sync.Mutex
 	roots      *x509.CertPool
+	db         *store.Store
+	ca         *pki.Authority // nil: no renewal
+	identity   Identity
+	certMu     sync.Mutex
 	cert       tls.Certificate
 	transports map[string]*http.Transport
 	next       map[model.ID]string
 }
 
-func newClients(db *store.Store, identity Identity) (*clients, error) {
+// certificate presents the server client certificate, re-issuing and saving
+// it from the local cluster CA once it is within pki.RenewBefore of expiry.
+func (c *clients) certificate(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+	c.certMu.Lock()
+	defer c.certMu.Unlock()
+	now := time.Now()
+	if c.ca != nil && pki.NeedsRenewal(c.cert.Leaf, now) {
+		identity := c.identity
+		err := identity.Renew(c.db, c.ca)
+		if err == nil {
+			cert, e := identity.TLSCertificate()
+			if err = e; err == nil {
+				c.identity, c.cert = identity, cert
+			}
+		}
+		if err != nil && !now.Before(c.cert.Leaf.NotAfter) {
+			return nil, err
+		}
+	}
+	cert := c.cert
+	return &cert, nil
+}
+
+func newClients(db *store.Store, identity Identity, ca *pki.Authority) (*clients, error) {
 	state, err := db.Read()
 	if err != nil {
 		return nil, err
@@ -40,7 +68,7 @@ func newClients(db *store.Store, identity Identity) (*clients, error) {
 	if !roots.AppendCertsFromPEM(state.ClusterCA) {
 		return nil, errors.New("invalid cluster trust")
 	}
-	return &clients{roots: roots, cert: cert, transports: map[string]*http.Transport{}, next: map[model.ID]string{}}, nil
+	return &clients{roots: roots, db: db, ca: ca, identity: identity, cert: cert, transports: map[string]*http.Transport{}, next: map[model.ID]string{}}, nil
 }
 func (c *clients) client(server model.Server, ep model.ServerEndpoint) *http.Client {
 	c.mu.Lock()
@@ -54,7 +82,7 @@ func (c *clients) client(server model.Server, ep model.ServerEndpoint) *http.Cli
 			}
 			clear(c.transports)
 		}
-		tr = &http.Transport{TLSClientConfig: &tls.Config{RootCAs: c.roots, Certificates: []tls.Certificate{c.cert}, ServerName: server.TLSName(), MinVersion: tls.VersionTLS13}, DialContext: controltransport.DialContext(ep.Transport, c.roots, server.TLSName()), TLSHandshakeTimeout: 3 * time.Second, ResponseHeaderTimeout: 6 * time.Second, MaxIdleConnsPerHost: 4, IdleConnTimeout: 30 * time.Second}
+		tr = &http.Transport{TLSClientConfig: &tls.Config{RootCAs: c.roots, GetClientCertificate: c.certificate, ServerName: server.TLSName(), MinVersion: tls.VersionTLS13}, DialContext: controltransport.DialContext(ep.Transport, c.roots, server.TLSName()), TLSHandshakeTimeout: 3 * time.Second, ResponseHeaderTimeout: 6 * time.Second, MaxIdleConnsPerHost: 4, IdleConnTimeout: 30 * time.Second}
 		c.transports[key] = tr
 	}
 	return &http.Client{Transport: tr, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}

@@ -427,6 +427,14 @@ func (c *Client) connect(parent context.Context, id model.ID, updates chan model
 	if err != nil {
 		return err
 	}
+	if renewed, err := c.renewCertificateIfDue(ctx); err != nil {
+		c.options.Logger.Warn("agent certificate renewal failed; retrying on the next connection", "server", c.server, "error", err)
+	} else if renewed {
+		// Present the new certificate on this connection.
+		if target, err = c.selectTarget(); err != nil {
+			return err
+		}
+	}
 	defer func() { c.failedTargets[target.key] = true }()
 	dialCtx, stop := context.WithTimeout(ctx, 4*time.Second)
 	conn, resp, err := websocket.Dial(dialCtx, c.server+"/api/v1/agent/control", &websocket.DialOptions{HTTPClient: c.http, Subprotocols: []string{model.DeltaSubprotocol, model.RoutingSubprotocol}, CompressionMode: websocket.CompressionNoContextTakeover})

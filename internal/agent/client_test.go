@@ -91,6 +91,7 @@ func controllerEndpoint(t *testing.T, ca *pki.Authority, name string, agentID mo
 	}
 	s.TLS.ClientAuth = tls.RequireAndVerifyClientCert
 	s.StartTLS()
+	s.TLS.Certificates = nil // serve the controller certificate, not httptest's
 	t.Cleanup(s.Close)
 	return s
 }

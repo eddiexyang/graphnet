@@ -123,6 +123,7 @@ func New(db *store.Store, options Options) (*Server, error) {
 	s.mux.HandleFunc("GET /api/v1/agent/control", s.agentControl)
 	s.mux.HandleFunc("GET "+model.AgentChallengePath, s.agentChallenge)
 	s.mux.HandleFunc("GET "+model.AgentRegistrationPath, s.agentRegistration)
+	s.mux.HandleFunc("POST "+model.AgentRenewPath, s.renewAgentCertificate)
 	s.mux.HandleFunc("GET /api/v1/telemetry", auth.require(s.getTelemetry))
 	s.mux.HandleFunc("GET /api/v1/events", auth.require(s.events))
 	s.mux.Handle("GET /", webui.Handler())

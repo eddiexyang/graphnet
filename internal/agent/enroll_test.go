@@ -62,6 +62,7 @@ func TestInvitationEnrollmentAndRepeat(t *testing.T) {
 		t.Fatal(err)
 	}
 	srv.StartTLS()
+	srv.TLS.Certificates = nil // serve the controller certificate, not httptest's
 	defer srv.Close()
 	invite.Directory.Servers[0].Endpoints = []model.ServerEndpoint{{ID: testutil.ID(91), Transport: "tcp", URL: strings.Replace(srv.URL, "https://", "tcp://", 1), Source: model.Manual}}
 	encoded, err := invite.Encode()

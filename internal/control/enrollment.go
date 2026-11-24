@@ -1,6 +1,7 @@
 package control
 
 import (
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -170,6 +171,49 @@ func (s *Server) enroll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	fail(w, 409, "configuration is busy; retry enrollment")
+}
+
+// renewAgentCertificate re-issues the client certificate of an enrolled Agent
+// before or after it expires. The Agent authenticates by a valid certificate
+// or, once that has expired, by a challenge signed with its registered key;
+// the request must carry that same key.
+func (s *Server) renewAgentCertificate(w http.ResponseWriter, r *http.Request) {
+	id, err := s.authenticatedAgent(r)
+	if err != nil {
+		fail(w, 401, "valid agent identity required")
+		return
+	}
+	var in struct {
+		CSR []byte `json:"csr"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	if len(in.CSR) > 4096 {
+		fail(w, 400, "CSR too large")
+		return
+	}
+	state, err := s.db.Read()
+	if err != nil {
+		s.internal(w, err)
+		return
+	}
+	var registered ed25519.PublicKey
+	for _, a := range state.Agents {
+		if a.ID == id && !a.Revoked {
+			registered = ed25519.PublicKey(a.PublicKey)
+		}
+	}
+	certificate, pub, err := s.ca.IssueAgent(id, in.CSR)
+	if err != nil {
+		fail(w, 400, "invalid Ed25519 certificate request")
+		return
+	}
+	if registered == nil || !pub.Equal(registered) {
+		fail(w, 403, "certificate request key is not the agent's registered key")
+		return
+	}
+	respond(w, 200, map[string]any{"agent_id": id, "certificate": certificate, "ca_certificate": s.ca.PEM})
 }
 
 var errInvalidToken = errors.New("invalid enrollment token")

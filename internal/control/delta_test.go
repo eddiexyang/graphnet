@@ -65,6 +65,7 @@ func TestControlDeltaNegotiationAndReconnect(t *testing.T) {
 				t.Fatal(err)
 			}
 			server.StartTLS()
+			server.TLS.Certificates = nil // serve the controller certificate, not httptest's
 			defer server.Close()
 			tr := &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots, Certificates: []tls.Certificate{cert}}}
 			defer tr.CloseIdleConnections()
