@@ -3,6 +3,7 @@ package forwarding_test
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net/netip"
 	"testing"
@@ -162,5 +163,31 @@ func TestEqualCostExits(t *testing.T) {
 	}
 	if len(used) != 2 {
 		t.Fatalf("ecmp used exits %v", used)
+	}
+}
+
+func TestTCPExitUnreachableWhenAllExitsDown(t *testing.T) {
+	state := exitTopology()
+	n := &state.Networks[0]
+	for i := range n.Edges {
+		if n.Edges[i].A == n.Nodes[0].ID || n.Edges[i].B == n.Nodes[0].ID {
+			n.Edges[i].Enabled = false
+		}
+	}
+	snapshot, err := routing.Compile(state, n.Nodes[0].AgentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := forwarding.New(snapshot, func(context.Context, model.ID, model.ID, []byte) error { return nil }, func(context.Context, model.ID, []byte) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	from := netip.MustParseAddrPort("10.42.0.1:40000")
+	to := netip.MustParseAddrPort("192.168.0.7:9000")
+	if exit, err := r.TCPExit(n.ID, from, to); !errors.Is(err, forwarding.ErrUnreachable) {
+		t.Fatalf("TCPExit when all advertisers unreachable = (%s, %v), want ErrUnreachable", exit, err)
+	}
+	if !r.TCPAdmits(n.ID, n.Nodes[1].ID, to.Addr()) || !r.TCPAdmits(n.ID, n.Nodes[3].ID, to.Addr()) {
+		t.Fatal("TCPAdmits false while advertisers remain in directory")
 	}
 }

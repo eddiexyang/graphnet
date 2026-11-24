@@ -309,9 +309,9 @@ func (r *Router) encapsulateSource(ctx context.Context, n *network, raw []byte, 
 		return nil, "", ErrSource
 	}
 	flow := func() uint64 { return info.Flow }
-	destination := n.exit(info.Destination, flow)
-	if destination == nil {
-		return nil, "", ErrDestination
+	destination, err := n.exit(info.Destination, flow)
+	if err != nil {
+		return nil, "", err
 	}
 	if destination.id == n.self.ID {
 		return nil, "", r.deliver(ctx, n.id, raw)
@@ -588,8 +588,8 @@ func (r *Router) CompactHeader(header []byte, networkWire [16]byte, hopLimit uin
 		return false
 	}
 	source := n.sourceOwner(info.Source)
-	destination := n.exit(info.Destination, func() uint64 { flow, _ := packet.InspectIP(payload); return flow.Flow })
-	if source == nil || destination == nil {
+	destination, err := n.exit(info.Destination, func() uint64 { flow, _ := packet.InspectIP(payload); return flow.Flow })
+	if source == nil || err != nil {
 		return false
 	}
 	packet.PutHeader(header, networkWire, source.wire, destination.wire, hopLimit, len(payload))
@@ -614,21 +614,23 @@ func (n *network) advertisers(ip netip.Addr) []exit {
 	return nil
 }
 
+func (n *network) hasDestination(ip netip.Addr) bool {
+	return n.byAddress[ip] != nil || len(n.advertisers(ip)) > 0
+}
+
 // exit chooses the Node that receives traffic to ip: the overlay host, or the
 // advertiser of the longest matching prefix with the lowest path cost plus
 // metric. A tie goes to the lowest Node ID, or with ECMP to the flow's hash;
 // flow is called only then. Unreachable advertisers are skipped; when none is
-// reachable traffic drops rather than using a shorter prefix.
-func (n *network) exit(ip netip.Addr, flow func() uint64) *node {
+// reachable ErrUnreachable is returned rather than using a shorter prefix or an
+// arbitrary unreachable exit.
+func (n *network) exit(ip netip.Addr, flow func() uint64) (*node, error) {
 	if host := n.byAddress[ip]; host != nil {
-		return host
+		return host, nil
 	}
 	exits := n.advertisers(ip)
-	switch len(exits) {
-	case 0:
-		return nil
-	case 1:
-		return exits[0].node
+	if len(exits) == 0 {
+		return nil, ErrDestination
 	}
 	best, reachable := ^uint64(0), false
 	for _, e := range exits {
@@ -637,7 +639,7 @@ func (n *network) exit(ip netip.Addr, flow func() uint64) *node {
 		}
 	}
 	if !reachable {
-		return exits[0].node // next hop lookup reports it unreachable
+		return nil, ErrUnreachable
 	}
 	ties := uint64(0)
 	for _, e := range exits {
@@ -653,12 +655,12 @@ func (n *network) exit(ip netip.Addr, flow func() uint64) *node {
 	for _, e := range exits {
 		if cost, ok := n.exitCost(e); ok && cost == best {
 			if pick == 0 {
-				return e.node
+				return e.node, nil
 			}
 			pick--
 		}
 	}
-	return nil
+	return nil, ErrUnreachable
 }
 
 func (n *network) exitCost(e exit) (uint64, bool) {

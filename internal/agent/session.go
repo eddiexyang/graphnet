@@ -60,8 +60,9 @@ type relayChain struct {
 }
 
 type egressSession struct {
-	ready chan struct{}
-	end   *streamproxy.End // nil when the server could not be reached
+	request streamproxy.Request
+	ready   chan struct{}
+	end     *streamproxy.End // nil when the server could not be reached
 }
 
 func (s *sessions) init() {
@@ -98,9 +99,10 @@ func (r *DataPlane) rerouteLoop() {
 }
 
 // rerouteSessions moves every chain whose next hop changed: the ingress
-// rebuilds its own, a relay resets its part so the ingress rebuilds. A
-// connection whose destination now leaves the network at another Node is
-// reset.
+// rebuilds its own, a relay resets its part so the ingress rebuilds. Existing
+// sessions stay pinned to their original egress while it remains in the
+// directory and continues admitting the destination address; only withdrawal
+// of source or destination ownership aborts the connection.
 func (r *DataPlane) rerouteSessions() {
 	state := r.state.Load()
 	if state == nil {
@@ -109,10 +111,8 @@ func (r *DataPlane) rerouteSessions() {
 	r.sessions.mu.Lock()
 	var moved, ended []*ingressSession
 	for key, s := range r.sessions.ingress {
-		// A connection's state is at its egress. When traffic to its
-		// destination leaves at another Node now, the connection ends there
-		// with a reset; it never continues on another egress.
-		if exit, err := state.router.TCPExit(s.request.Network, s.request.From, s.request.To); err == nil && exit != s.request.Destination {
+		if !state.router.TCPAdmits(s.request.Network, s.request.Source, s.request.From.Addr()) ||
+			!state.router.TCPAdmits(s.request.Network, s.request.Destination, s.request.To.Addr()) {
 			ended = append(ended, s)
 			delete(r.sessions.ingress, key)
 			r.sessions.exits++
@@ -121,6 +121,14 @@ func (r *DataPlane) rerouteSessions() {
 		next, local, err := state.router.TCPRoute(s.request, "")
 		if err != nil || local || next != s.next || !state.mesh.ResumeAvailable(s.request.Network, next) {
 			moved = append(moved, s)
+		}
+	}
+	var endedEgress []*streamproxy.End
+	for key, e := range r.sessions.egress {
+		if e.end != nil && (!state.router.TCPAdmits(e.request.Network, e.request.Source, e.request.From.Addr()) ||
+			!state.router.TCPAdmits(e.request.Network, e.request.Destination, e.request.To.Addr())) {
+			endedEgress = append(endedEgress, e.end)
+			delete(r.sessions.egress, key)
 		}
 	}
 	var reset []*relayChain
@@ -135,6 +143,9 @@ func (r *DataPlane) rerouteSessions() {
 	r.sessions.mu.Unlock()
 	for _, s := range ended {
 		s.end.Abort()
+	}
+	for _, end := range endedEgress {
+		end.Abort()
 	}
 	for _, s := range moved {
 		s.end.Reroute()
@@ -393,7 +404,7 @@ func (r *DataPlane) acceptEgress(parent, ctx context.Context, network, remote mo
 	tombstone, ended := r.sessions.ended[key]
 	create := entry == nil && !ended && request.Gen == 0 && request.Down == 0 && request.Up == 0
 	if create {
-		entry = &egressSession{ready: make(chan struct{})}
+		entry = &egressSession{request: request, ready: make(chan struct{})}
 		r.sessions.egress[key] = entry
 	}
 	r.sessions.mu.Unlock()

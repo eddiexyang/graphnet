@@ -42,8 +42,25 @@ type Engine struct {
 	open        func(context.Context, netip.AddrPort, netip.AddrPort) (Conn, error)
 	mu          sync.Mutex
 	closed      bool
+	conns       map[*accessConn]netip.Addr
 	wg          sync.WaitGroup
 	flowHook    atomic.Pointer[func(from, to netip.AddrPort, open bool)]
+}
+
+// AbortUnadmitted resets any active local socket whose local host address is
+// no longer admitted by this Node, leaving all other flows untouched.
+func (e *Engine) AbortUnadmitted(admits func(netip.Addr) bool) {
+	e.mu.Lock()
+	var victims []*accessConn
+	for c, localAddr := range e.conns {
+		if !admits(localAddr) {
+			victims = append(victims, c)
+		}
+	}
+	e.mu.Unlock()
+	for _, c := range victims {
+		c.Abort()
+	}
 }
 
 // SetFlowHook reports when an accepted connection starts and ends its relay.
@@ -138,7 +155,7 @@ func newEngine(parent context.Context, mtu int, output func([]byte) error, open 
 		return nil, errors.New("TCP callbacks are required")
 	}
 	ctx, cancel := context.WithCancel(parent)
-	e := &Engine{ctx: ctx, cancel: cancel, output: output, outputBatch: batch, open: open}
+	e := &Engine{ctx: ctx, cancel: cancel, output: output, outputBatch: batch, open: open, conns: map[*accessConn]netip.Addr{}}
 	e.stack = stack.New(stack.Options{NetworkProtocols: []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol}, TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol}})
 	// Access TCP remains on the local host. gVisor's SACK recovery can count
 	// stale, out-of-window segments as pipe after a receiver shrinks its window,
@@ -238,6 +255,14 @@ func (e *Engine) forward(request *tcp.ForwarderRequest) {
 		return
 	}
 	local = &accessConn{TCPConn: gonet.NewTCPConn(&queue, endpoint), endpoint: endpoint, queue: &queue}
+	e.mu.Lock()
+	e.conns[local] = from.Addr()
+	e.mu.Unlock()
+	defer func() {
+		e.mu.Lock()
+		delete(e.conns, local)
+		e.mu.Unlock()
+	}()
 	Relay(e.ctx, local, remote)
 }
 
@@ -313,13 +338,36 @@ func (e *Engine) Dial(ctx context.Context, from, to netip.AddrPort) (Conn, error
 		return nil, fmt.Errorf("connect TCP target: %s", err.String())
 	}
 	connected = true
-	return &accessConn{TCPConn: gonet.NewTCPConn(&queue, endpoint), endpoint: endpoint, queue: &queue}, nil
+	conn := &accessConn{TCPConn: gonet.NewTCPConn(&queue, endpoint), endpoint: endpoint, queue: &queue, onClose: func(c *accessConn) {
+		e.mu.Lock()
+		delete(e.conns, c)
+		e.mu.Unlock()
+	}}
+	e.mu.Lock()
+	e.conns[conn] = to.Addr()
+	e.mu.Unlock()
+	return conn, nil
 }
 
 type accessConn struct {
 	*gonet.TCPConn
 	endpoint tcpip.Endpoint
 	queue    *waiter.Queue
+	onClose  func(*accessConn)
+	unhooked sync.Once
+}
+
+func (c *accessConn) Close() error {
+	c.unhook()
+	return c.TCPConn.Close()
+}
+
+func (c *accessConn) unhook() {
+	c.unhooked.Do(func() {
+		if c.onClose != nil {
+			c.onClose(c)
+		}
+	})
 }
 
 // closedLinger bounds how long a closed connection's flow is kept for the
@@ -351,6 +399,7 @@ func (c *accessConn) waitClosed(ctx context.Context) {
 func (c *accessConn) WaitClosed(ctx context.Context) { c.waitClosed(ctx) }
 
 func (c *accessConn) Abort() {
+	c.unhook()
 	if endpoint, ok := c.endpoint.(interface{ Abort() }); ok {
 		endpoint.Abort()
 	}

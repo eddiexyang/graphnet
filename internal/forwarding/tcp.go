@@ -43,7 +43,7 @@ func (r *Router) tcpIngress(networkID model.ID, raw []byte, segmentSize int) err
 	if !n.admits(n.byAddress[n.self.Address], info.Source) {
 		return ErrSource
 	}
-	if n.exit(info.Destination, func() uint64 { return 0 }) == nil {
+	if !n.hasDestination(info.Destination) {
 		return ErrDestination
 	}
 	return nil
@@ -68,9 +68,9 @@ func (r *Router) nextHop(networkID model.ID, destination netip.Addr, flow func()
 	if n == nil {
 		return "", false, ErrNetwork
 	}
-	dest := n.exit(destination, flow)
-	if dest == nil {
-		return "", false, ErrDestination
+	dest, err := n.exit(destination, flow)
+	if err != nil {
+		return "", false, err
 	}
 	if dest.id == n.self.ID {
 		return "", true, nil
@@ -89,11 +89,34 @@ func (r *Router) TCPExit(networkID model.ID, from, to netip.AddrPort) (model.ID,
 	if n == nil {
 		return "", ErrNetwork
 	}
-	dest := n.exit(to.Addr(), func() uint64 { return packet.TCPFlowHash(from, to) })
-	if dest == nil {
-		return "", ErrDestination
+	dest, err := n.exit(to.Addr(), func() uint64 { return packet.TCPFlowHash(from, to) })
+	if err != nil {
+		return "", err
+	}
+	if dest.id != n.self.ID {
+		if _, ok := n.costs[dest.id]; !ok {
+			return "", ErrUnreachable
+		}
 	}
 	return dest.id, nil
+}
+
+// TCPAdmits reports whether nodeID exists in networkID and still admits ip.
+func (r *Router) TCPAdmits(networkID, nodeID model.ID, ip netip.Addr) bool {
+	n := r.state.Load().networks[networkID]
+	if n == nil {
+		return false
+	}
+	return n.admits(n.byNode[wireID(nodeID)], ip)
+}
+
+// AdmitsLocal reports whether this Agent's Node in networkID still admits ip.
+func (r *Router) AdmitsLocal(networkID model.ID, ip netip.Addr) bool {
+	n := r.state.Load().networks[networkID]
+	if n == nil {
+		return false
+	}
+	return n.admits(n.byAddress[n.self.Address], ip)
 }
 
 func (r *Router) TCPRequest(networkID model.ID, from, to netip.AddrPort) (streamproxy.Request, error) {
@@ -108,12 +131,12 @@ func (r *Router) TCPRequest(networkID model.ID, from, to netip.AddrPort) (stream
 	if !n.admits(source, from.Addr()) {
 		source = n.sourceOwner(from.Addr())
 	}
-	dest := n.exit(to.Addr(), func() uint64 { return packet.TCPFlowHash(from, to) })
 	if source == nil {
 		return streamproxy.Request{}, ErrSource
 	}
-	if dest == nil {
-		return streamproxy.Request{}, ErrDestination
+	dest, err := n.exit(to.Addr(), func() uint64 { return packet.TCPFlowHash(from, to) })
+	if err != nil {
+		return streamproxy.Request{}, err
 	}
 	request := streamproxy.Request{Network: networkID, Source: source.id, Destination: dest.id, From: from, To: to, Hops: packet.DefaultHopLimit}
 	return request, request.Validate()
@@ -171,9 +194,9 @@ func (r *Router) TCPOutput(ctx context.Context, networkID model.ID, raw []byte) 
 		return r.deliver(ctx, networkID, raw)
 	}
 	flow := func() uint64 { info, _ := packet.InspectIP(raw); return info.Flow }
-	dest := n.exit(info.Destination, flow)
-	if dest == nil {
-		return ErrDestination
+	dest, err := n.exit(info.Destination, flow)
+	if err != nil {
+		return err
 	}
 	source := self
 	if !n.admits(source, info.Source) {

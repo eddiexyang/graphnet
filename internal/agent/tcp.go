@@ -154,38 +154,21 @@ func (r *DataPlane) forwardTCP(state *runtimeState, network model.ID, raw []byte
 	return err
 }
 
-// Endpoint refreshes, MTU changes and live route changes preserve access TCP
-// state. Changes to address ownership invalidate it.
+// Endpoint refreshes, MTU changes, topology edits, cipher rotations and
+// subnet/route updates preserve the access TCP stack; only changes to this
+// Node's own overlay identity or CIDR recreate it.
 func tcpFingerprint(cfg model.NetworkConfig) string {
-	directory := append([]model.Destination(nil), cfg.Directory...)
-	for i := range directory {
-		directory[i].AdvertisedSubnets = withoutMetrics(directory[i].AdvertisedSubnets)
-	}
 	raw, _ := json.Marshal(struct {
 		Self struct {
 			ID      model.ID
 			Address netip.Addr
-			Subnets []model.AdvertisedSubnet
 		}
-		CIDR      netip.Prefix
-		Cipher    model.CipherSuite
-		Directory []model.Destination
+		CIDR netip.Prefix
 	}{struct {
 		ID      model.ID
 		Address netip.Addr
-		Subnets []model.AdvertisedSubnet
-	}{cfg.Self.ID, cfg.Self.Address, withoutMetrics(cfg.Self.AdvertisedSubnets)}, cfg.CIDR, cfg.Cipher, directory})
+	}{cfg.Self.ID, cfg.Self.Address}, cfg.CIDR})
 	return string(raw)
-}
-
-// withoutMetrics keeps a subnet's ownership and drops its metric, which only
-// ranks exits like an edge weight.
-func withoutMetrics(subnets []model.AdvertisedSubnet) []model.AdvertisedSubnet {
-	out := append([]model.AdvertisedSubnet(nil), subnets...)
-	for i := range out {
-		out[i].Metric = 0
-	}
-	return out
 }
 
 func (r *DataPlane) newTCP(network model.ID, fingerprint string, mtu int, offload bool) (*runtimeTCP, error) {
@@ -205,6 +188,9 @@ func (r *DataPlane) newTCP(network model.ID, fingerprint string, mtu int, offloa
 		}
 		request, err := state.router.TCPRequest(network, from, to)
 		if err != nil {
+			if noRoute(err) {
+				err = fmt.Errorf("%w: %w", streamproxy.ErrNoRoute, err)
+			}
 			return nil, err
 		}
 		return r.openAccessTCP(ctx, request)

@@ -283,6 +283,9 @@ func (r *DataPlane) Apply(ctx context.Context, snapshot model.Snapshot) error {
 	}
 	for _, network := range snapshot.Networks {
 		next.tcp[network.ID].engine.SetMTU(network.MTU)
+		next.tcp[network.ID].engine.AbortUnadmitted(func(ip netip.Addr) bool {
+			return next.router.AdmitsLocal(network.ID, ip)
+		})
 	}
 	select {
 	case r.discoveryWake <- struct{}{}:

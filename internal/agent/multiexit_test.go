@@ -3,6 +3,7 @@ package agent
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
 	"fmt"
 	"io"
@@ -21,10 +22,11 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
-// B (cost 10 + metric 0) and D (1 + 20) both advertise 192.168.0.0/24. When
-// D becomes the cheaper exit, a connection through B ends with a reset after
-// a correct prefix of its byte stream; it never continues at D. A new
-// connection exits at D.
+// B (cost 10 + metric 0) and D (1 + 20) both advertise 192.168.0.0/24.
+// Live connections stay pinned to their original exit across topology edits,
+// temporary total-uplink outages and exit-metric changes, while new
+// connections pick the cheaper exit D. Withdrawing the exit's prefix resets
+// connections using that exit without continuing them on D.
 func TestTCPConnectionResetsOnExitChange(t *testing.T) {
 	prefix := netip.MustParsePrefix("192.168.0.0/24")
 	agents, devices, state := graphAgents(t, model.TCP, streamOptions{}, 4, 4, func(s *model.State) {
@@ -33,8 +35,9 @@ func TestTCPConnectionResetsOnExitChange(t *testing.T) {
 	})
 	waitConverged(t, agents[0], state, 0)
 	server := tcpip.AddrFrom4(netip.MustParseAddr("192.168.0.7").As4())
-	accepted := make(chan int, 4)
+	accepted := make(chan int, 8)
 	for _, exit := range []int{1, 3} {
+		exit := exit
 		if err := devices[exit].stack.AddProtocolAddress(1, tcpip.ProtocolAddress{Protocol: ipv4.ProtocolNumber, AddressWithPrefix: tcpip.AddressWithPrefix{Address: server, PrefixLen: 32}}, stack.AddressProperties{}); err != nil {
 			t.Fatal(err)
 		}
@@ -81,16 +84,19 @@ func TestTCPConnectionResetsOnExitChange(t *testing.T) {
 			t.Fatalf("echo: %v", err)
 		}
 	}
+
+	// Phase 1: Establish live stream through B and keep it uninterrupted across:
+	// (a) adding and removing an unrelated node + cipher change,
+	// (b) temporary isolation of A where all exits are unreachable, and
+	// (c) raising B's metric so D becomes the preferred exit for new flows.
 	conn, exit := dial()
 	defer conn.Close()
 	if exit != 1 {
 		t.Fatalf("first connection exits at node %d, want B", exit)
 	}
-	// Stream random bytes and compare the echo with what was sent, before and
-	// after the exit changes.
-	sent := make([]byte, 64<<20)
+	sent := make([]byte, 6<<20)
 	rand.Read(sent)
-	conn.SetDeadline(time.Now().Add(20 * time.Second))
+	conn.SetDeadline(time.Now().Add(30 * time.Second))
 	writeErr := make(chan error, 1)
 	go func() {
 		for offset := 0; offset < len(sent); offset += 16 << 10 {
@@ -98,57 +104,145 @@ func TestTCPConnectionResetsOnExitChange(t *testing.T) {
 				writeErr <- err
 				return
 			}
-			time.Sleep(time.Millisecond)
 		}
 		writeErr <- nil
 	}()
+
 	received := make([]byte, 0, len(sent))
 	buf := make([]byte, 64<<10)
-	changed := false
-	var readErr error
-	for readErr == nil {
-		var n int
-		n, readErr = conn.Read(buf)
+	step := 0
+	for len(received) < len(sent) {
+		n, err := conn.Read(buf[:min(len(buf), len(sent)-len(received))])
+		if err != nil {
+			t.Fatalf("live connection interrupted at step %d (%d/%d bytes): %v", step, len(received), len(sent), err)
+		}
 		received = append(received, buf[:n]...)
 		if !bytes.Equal(received, sent[:len(received)]) {
-			t.Fatalf("echo differs from the sent stream within %d bytes", len(received))
+			t.Fatalf("echo differs from sent stream within %d bytes", len(received))
 		}
-		if !changed && len(received) >= 1<<20 {
-			changed = true
+		switch {
+		case step == 0 && len(received) >= 1<<20:
+			step = 1
+			// (a) Add and remove an unrelated remote node and a local subnet on A
+			// (both previously invalidated tcpFingerprint and tore down Engine).
+			base := state.Networks[0].CIDR.Addr().As4()
+			base[3] = 99
+			extraPub, _, _ := ed25519.GenerateKey(rand.Reader)
+			extraAgent := model.Agent{ID: model.NewID(), Name: "extra", PublicKey: extraPub, ListenPort: 24752}
+			extraNode := model.Node{ID: model.NewID(), Name: "extra", Index: 99, AgentID: extraAgent.ID, Address: netip.AddrFrom4(base)}
+			state.Revision++
+			state.Agents = append(state.Agents, extraAgent)
+			state.Networks[0].Nodes = append(state.Networks[0].Nodes, extraNode)
+			state.Networks[0].LastIndex = 99
+			state.Networks[0].Nodes[0].AdvertisedSubnets = []model.AdvertisedSubnet{{Prefix: netip.MustParsePrefix("172.30.0.0/24"), GatewayMode: model.GatewayOff}}
+			applyAll(t, agents, state)
+
+			state.Revision++
+			state.Networks[0].Nodes = state.Networks[0].Nodes[:4]
+			state.Agents = state.Agents[:4]
+			state.Networks[0].Nodes[0].AdvertisedSubnets = nil
+			applyAll(t, agents, state)
+		case step == 1 && len(received) >= 2<<20:
+			step = 2
+			// (b) Drop all routes on A so every exit is temporarily unreachable, then restore.
+			compiledA, err := routing.Compile(state, state.Agents[0].ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := agents[0].ApplyRoutes(model.RouteUpdate{
+				Revision: state.Revision,
+				Networks: []model.NetworkRoutes{{ID: state.Networks[0].ID, Routes: nil}},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(50 * time.Millisecond)
+			if err := agents[0].ApplyRoutes(model.RouteUpdate{
+				Revision: state.Revision,
+				Networks: []model.NetworkRoutes{{ID: state.Networks[0].ID, Routes: compiledA.Networks[0].Routes}},
+			}); err != nil {
+				t.Fatal(err)
+			}
+		case step == 2 && len(received) >= 3<<20:
+			step = 3
+			// (c) Make D cheaper than B: live session stays on B without resetting.
 			state.Revision++
 			state.Networks[0].Nodes[1].AdvertisedSubnets[0].Metric = 50 // B: 60, D: 21
 			applyAll(t, agents, state)
 		}
 	}
-	if !changed {
-		t.Fatalf("connection ended before the exit changed: %v", readErr)
+	if err := <-writeErr; err != nil {
+		t.Fatalf("writer failed on live connection: %v", err)
 	}
-	// The stack reports a reset to one call; the other then sees the closed
-	// connection.
-	var written error
-	select {
-	case written = <-writeErr:
-	case <-time.After(5 * time.Second):
+	if agents[0].Counters()["session_exit_resets"] != 0 {
+		t.Fatalf("unexpected exit resets during topology/uplink/metric changes: %d", agents[0].Counters()["session_exit_resets"])
 	}
-	reset := func(err error) bool { return err != nil && strings.Contains(err.Error(), "connection reset by peer") }
-	if !reset(readErr) && !reset(written) {
-		t.Fatalf("connection through the old exit was not reset: read %v, write %v", readErr, written)
-	}
-	t.Logf("reset after %d correct bytes: read %v, write %v", len(received), readErr, written)
-	select {
-	case other := <-accepted:
-		t.Fatalf("the connection continued at node %d", other)
-	default:
-	}
-	if agents[0].Counters()["session_exit_resets"] == 0 {
-		t.Fatal("no exit reset counted")
-	}
+
+	// New connections now pick the cheaper exit D while B still advertises the prefix.
 	second, exit := dial()
 	defer second.Close()
 	if exit != 3 {
 		t.Fatalf("new connection exits at node %d, want D", exit)
 	}
 	echo(second)
+
+	// Phase 2: Withdraw D's prefix while streaming on a live connection through D;
+	// that connection must reset cleanly and never continue at B.
+	third, exit := dial()
+	defer third.Close()
+	if exit != 3 {
+		t.Fatalf("third connection exits at node %d, want D", exit)
+	}
+	third.SetDeadline(time.Now().Add(20 * time.Second))
+	withdrawSent := make([]byte, 32<<20)
+	rand.Read(withdrawSent)
+	withdrawWriteErr := make(chan error, 1)
+	go func() {
+		for offset := 0; offset < len(withdrawSent); offset += 16 << 10 {
+			if _, err := third.Write(withdrawSent[offset : offset+16<<10]); err != nil {
+				withdrawWriteErr <- err
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+		withdrawWriteErr <- nil
+	}()
+	withdrawReceived := make([]byte, 0, len(withdrawSent))
+	withdrawn := false
+	var readErr error
+	for readErr == nil {
+		var n int
+		n, readErr = third.Read(buf)
+		withdrawReceived = append(withdrawReceived, buf[:n]...)
+		if !bytes.Equal(withdrawReceived, withdrawSent[:len(withdrawReceived)]) {
+			t.Fatalf("echo differs before withdrawal within %d bytes", len(withdrawReceived))
+		}
+		if !withdrawn && len(withdrawReceived) >= 512<<10 {
+			withdrawn = true
+			state.Revision++
+			state.Networks[0].Nodes[3].AdvertisedSubnets = nil
+			applyAll(t, agents, state)
+		}
+	}
+	if !withdrawn {
+		t.Fatalf("connection ended before prefix withdrawal: %v", readErr)
+	}
+	var written error
+	select {
+	case written = <-withdrawWriteErr:
+	case <-time.After(5 * time.Second):
+	}
+	reset := func(err error) bool { return err != nil && strings.Contains(err.Error(), "connection reset by peer") }
+	if !reset(readErr) && !reset(written) {
+		t.Fatalf("connection through withdrawn exit was not reset: read %v, write %v", readErr, written)
+	}
+	select {
+	case other := <-accepted:
+		t.Fatalf("the connection continued at node %d", other)
+	default:
+	}
+	if agents[0].Counters()["session_exit_resets"] == 0 {
+		t.Fatal("no exit reset counted on prefix withdrawal")
+	}
 	assertNoTCPOverTCP(t, agents)
 }
 
