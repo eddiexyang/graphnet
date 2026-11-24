@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/eddiexyang/graphnet/internal/model"
 	"github.com/eddiexyang/graphnet/internal/testutil"
@@ -280,5 +281,12 @@ func TestReplayWindowAndForgery(t *testing.T) {
 	}
 	if _, err := bs.Open(frames[1]); !errors.Is(err, ErrReplay) {
 		t.Fatal("old packet accepted")
+	}
+	if as.RenewalDue(time.Hour) {
+		t.Fatal("fresh session reported RenewalDue")
+	}
+	as.sequence = RenewMessages
+	if !as.RenewalDue(time.Hour) {
+		t.Fatal("session at RenewMessages did not report RenewalDue")
 	}
 }

@@ -16,6 +16,7 @@ const (
 	ReplayWindow = 1024
 	// A fresh handshake must replace the session before either limit is reached.
 	MaxMessages   = uint64(1) << 32
+	RenewMessages = 3 * (uint64(1) << 30)
 	MaxSessionAge = time.Hour
 	// Plaintext includes a message type and, for data, a complete overlay
 	// frame, which a compact frame's prefix precedes with two more bytes.
@@ -54,6 +55,12 @@ func newSession(id string, binding []byte, send, receive noise.Cipher) *Session 
 
 func (s *Session) ID() string         { return s.id }
 func (s *Session) Created() time.Time { return s.created }
+func (s *Session) RenewalDue(after time.Duration) bool {
+	s.sendMu.Lock()
+	seq := s.sequence
+	s.sendMu.Unlock()
+	return seq >= RenewMessages || time.Since(s.created) >= after
+}
 func (s *Session) NeedsRekey() bool {
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()

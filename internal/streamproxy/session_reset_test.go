@@ -168,3 +168,89 @@ func TestWatchOpeningUpstreamForwardsTermination(t *testing.T) {
 		}
 	}
 }
+
+type partialLeftoverHop struct {
+	chunkHop
+	keep     *Keep
+	leftover []byte
+	failAt   int
+	written  []byte
+}
+
+func (h *partialLeftoverHop) SetRetention(k *Keep) { h.keep = k }
+func (h *partialLeftoverHop) Leftover() []byte {
+	out := h.leftover
+	h.leftover = nil
+	return out
+}
+func (h *partialLeftoverHop) ReadFrom(r io.Reader) (int64, error) {
+	data, _ := io.ReadAll(r)
+	if len(data) == 0 {
+		return 0, nil
+	}
+	h.leftover = data
+	return 0, io.ErrClosedPipe
+}
+func (h *partialLeftoverHop) Write(p []byte) (int, error) {
+	if h.failAt > 0 && len(p) > h.failAt {
+		part := p[:h.failAt]
+		if h.keep != nil {
+			h.keep.Add(part, nil, 0)
+		}
+		h.written = append(h.written, part...)
+		return len(part), io.ErrClosedPipe
+	}
+	if h.keep != nil {
+		h.keep.Add(p, nil, 0)
+	}
+	h.written = append(h.written, p...)
+	return len(p), nil
+}
+
+func TestPartialLeftoverWriteDoesNotDuplicateBytesAndCanceledRebuildMonotonicGen(t *testing.T) {
+	hop0 := &partialLeftoverHop{}
+	hop1 := &partialLeftoverHop{failAt: 5}
+	hop2 := &partialLeftoverHop{}
+	var gens []uint32
+	canceledOnce := false
+	end, err := StartIngress(t.Context(), func(ctx context.Context, gen uint32, _, _ uint64) (Hop, uint64, error) {
+		gens = append(gens, gen)
+		switch gen {
+		case 0:
+			return hop0, 0, nil
+		case 1:
+			if !canceledOnce {
+				canceledOnce = true
+				return nil, 0, context.Canceled
+			}
+			t.Fatalf("reused canceled generation %d", gen)
+			return nil, 0, context.Canceled
+		case 2:
+			return hop1, 0, nil
+		default:
+			return hop2, 0, nil
+		}
+	}, &Counters{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer end.Abort()
+
+	msg := []byte("0123456789abcdef")
+	n, err := end.Write(msg)
+	if err != nil || n != len(msg) {
+		t.Fatalf("Write = (%d, %v), want (%d, nil)", n, err, len(msg))
+	}
+	if string(hop2.written) != string(msg) {
+		t.Fatalf("hop2 received %q, want %q (gens=%v)", hop2.written, msg, gens)
+	}
+
+	egress := NewEgress(t.Context(), newReplacementResetHop(), func(uint32) {}, &Counters{})
+	defer egress.Abort()
+	if err := egress.Accept(newReplacementResetHop(), 2, 0, 0, true, func(uint64) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if err := egress.Accept(newReplacementResetHop(), 1, 0, 0, true, func(uint64) error { return nil }); !errors.Is(err, ErrStaleGen) {
+		t.Fatalf("stale gen error = %v, want ErrStaleGen", err)
+	}
+}

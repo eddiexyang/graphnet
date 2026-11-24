@@ -417,8 +417,12 @@ func (r *DataPlane) acceptEgress(parent, ctx context.Context, network, remote mo
 		case <-ctx.Done():
 			return
 		}
-		if entry.end == nil || entry.end.Gen() >= request.Gen {
+		if entry.end == nil {
 			refuse(ctx, hop, streamproxy.StatusUnknown)
+			return
+		}
+		if entry.end.Gen() >= request.Gen {
+			refuse(ctx, hop, streamproxy.StatusRefused)
 			return
 		}
 		answer := func(from uint64) error {

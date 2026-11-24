@@ -43,9 +43,10 @@ type Channel struct {
 	ignore         [][]byte
 }
 
-func (c *Channel) ID() string         { return c.session.ID() }
-func (c *Channel) NeedsRekey() bool   { return c.session.NeedsRekey() }
-func (c *Channel) Created() time.Time { return c.session.Created() }
+func (c *Channel) ID() string                          { return c.session.ID() }
+func (c *Channel) NeedsRekey() bool                    { return c.session.NeedsRekey() }
+func (c *Channel) RenewalDue(after time.Duration) bool { return c.session.RenewalDue(after) }
+func (c *Channel) Created() time.Time                  { return c.session.Created() }
 func (c *Channel) Close() error       { return c.conn.Close() }
 
 // UseKernelWriteBacklog removes the packet carrier's unsent-byte bound when

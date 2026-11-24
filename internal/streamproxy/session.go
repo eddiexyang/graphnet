@@ -62,6 +62,7 @@ const (
 
 var ErrLegacy = errors.New("a hop does not support resumable TCP")
 var ErrUnknownSession = errors.New("egress has no such TCP session")
+var ErrStaleGen = errors.New("TCP session generation superseded")
 var ErrSessionEnded = errors.New("egress ended the TCP session")
 
 // ErrNoRoute is a connection that has no path for now. As for a packet with
@@ -444,6 +445,7 @@ type End struct {
 	// replacement is a hop being opened or replayed before installation.
 	replacement Hop
 	gen         uint32
+	nextGen     uint32
 	in          uint64 // session offset where the hop's received bytes start
 	inRead      uint64 // received bytes read from the hop
 	read        uint64 // received bytes delivered to the local connection
@@ -583,9 +585,17 @@ func (e *End) resend(hop Hop, out uint64) error {
 // offset before any byte is resent.
 func (e *End) Accept(hop Hop, gen uint32, down, up uint64, at bool, answer func(from uint64) error) error {
 	e.mu.Lock()
-	if e.done || gen <= e.gen {
+	if e.done {
 		e.mu.Unlock()
 		return ErrUnknownSession
+	}
+	if gen <= e.gen {
+		e.mu.Unlock()
+		return ErrStaleGen
+	}
+	if base, end := e.keep.bounds(); up < base || up > end {
+		e.mu.Unlock()
+		return ErrStaleGen
 	}
 	if old := e.hop; old != nil {
 		old.Abort()
@@ -606,8 +616,11 @@ func (e *End) Accept(hop Hop, gen uint32, down, up uint64, at bool, answer func(
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.done || e.gen != gen {
+	if e.done {
 		return ErrUnknownSession
+	}
+	if e.gen != gen {
+		return ErrStaleGen
 	}
 	if hop.Aborted() {
 		e.finishLocked(errAborted)
@@ -731,7 +744,8 @@ func (e *End) rebuild() {
 			e.mu.Unlock()
 			return
 		}
-		gen := e.gen + 1
+		e.nextGen = max(e.nextGen, e.gen) + 1
+		gen := e.nextGen
 		down, _ := e.keep.bounds()
 		up := e.read
 		e.mu.Unlock()
@@ -1002,7 +1016,10 @@ func (e *End) ReadFrom(src io.Reader) (int64, error) {
 		e.leftover = nil
 		e.mu.Unlock()
 		if len(leftover) > 0 {
-			if _, err := hop.Write(leftover); err != nil {
+			n, err := hop.Write(leftover)
+			total += int64(n)
+			if err != nil {
+				leftover = leftover[n:]
 				e.mu.Lock()
 				if hop.Aborted() {
 					e.finishLocked(errAborted)
@@ -1145,7 +1162,9 @@ func (e *End) discard(hop Hop, n uint64) error {
 		read, err := hop.Read(buf[:min(n, uint64(len(buf)))])
 		n -= uint64(read)
 		e.mu.Lock()
-		e.inRead += uint64(read)
+		if hop == e.hop {
+			e.inRead += uint64(read)
+		}
 		e.mu.Unlock()
 		if err != nil {
 			e.received(hop, 0, err)

@@ -409,8 +409,13 @@ func (l *Link) WakeStreams() {
 func (l *Link) Info() Info             { return l.info }
 func (l *Link) Packets() <-chan []byte { return l.packets }
 func (l *Link) Done() <-chan struct{}  { return l.done }
-func (l *Link) Created() time.Time     { return l.channel.Created() }
-func (l *Link) RenewalDue() bool       { return time.Since(l.channel.Created()) >= l.options.RenewAfter }
+func (l *Link) Created() time.Time { return l.channel.Created() }
+func (l *Link) RenewalDue() bool {
+	if r, ok := l.channel.(interface{ RenewalDue(time.Duration) bool }); ok {
+		return r.RenewalDue(l.options.RenewAfter)
+	}
+	return time.Since(l.channel.Created()) >= l.options.RenewAfter
+}
 func (l *Link) stop() {
 	l.stopOnce.Do(func() { l.queueMu.Lock(); l.cancel(); l.queueMu.Unlock(); l.channel.Close() })
 }

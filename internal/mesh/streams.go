@@ -78,13 +78,43 @@ func (g *group) tcpBacked() bool {
 	return false
 }
 
+func (g *group) allowsStreamLink() bool {
+	cfg := g.policy.Load()
+	if cfg == nil {
+		return false
+	}
+	for _, t := range cfg.peer.Edge.Transports {
+		if !streamTransport(t) {
+			continue
+		}
+		for _, ep := range cfg.peer.Endpoints {
+			if ep.Transport == t {
+				return true
+			}
+		}
+		for _, ep := range cfg.endpoints {
+			if ep.Transport == t {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // PacketsOnly reports whether the Edge to remote has a selected Link that
 // carries no streams, such as UDP: TCP crosses it only as packets.
 func (m *Mesh) PacketsOnly(network, remote model.ID) bool {
+	streamOn := m.streamsEnabled()
 	m.mu.Lock()
 	g := m.groups[key{network, remote}]
 	m.mu.Unlock()
-	return g != nil && g.edge.Active() != nil && !g.mux.Available() && !g.tcpBacked()
+	if g == nil {
+		return false
+	}
+	if streamOn && g.allowsStreamLink() {
+		return false
+	}
+	return g.edge.Active() != nil && !g.mux.Available() && !g.tcpBacked()
 }
 
 // TCPCarrier reports whether the Edge to remote sends on a TCP, WS, WSS or
