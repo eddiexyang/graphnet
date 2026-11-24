@@ -54,6 +54,7 @@ type Mesh struct {
 	extensionSlots chan struct{}
 	dns            *endpointDNS
 	identity       ed25519.PrivateKey
+	replay         secure.ReplayFilter
 	ctx            context.Context
 	cancel         context.CancelFunc
 	listener       net.Listener
@@ -255,6 +256,13 @@ func (m *Mesh) Apply(snapshot model.Snapshot) error {
 		}
 	}
 	m.groups = next
+	admittedPeers := map[[32]byte]bool{}
+	for _, g := range next {
+		if peerX, err := secure.Ed25519PublicToX25519(g.policy.Load().peer.PublicKey); err == nil {
+			admittedPeers[peerX] = true
+		}
+	}
+	m.replay.Prune(admittedPeers)
 	stalePunches := []*transport.PunchMux{}
 	for k, session := range m.punches {
 		if !m.allowsTCPPunchLocked(session.Identity()) {
@@ -391,7 +399,7 @@ func (m *Mesh) accept(conn transport.Conn, kind model.Transport) {
 		ctx, cancel := context.WithTimeout(m.ctx, 12*time.Second)
 		defer cancel()
 		var selected *group
-		channel, err := peer.Accept(ctx, conn, kind, func(hello peer.Hello) (secure.Config, error) {
+		channel, err := peer.Accept(ctx, conn, kind, m.identity, &m.replay, func(hello secure.ClientHello) (secure.Config, error) {
 			m.mu.Lock()
 			g := m.groups[key{hello.Network, hello.Initiator}]
 			m.mu.Unlock()

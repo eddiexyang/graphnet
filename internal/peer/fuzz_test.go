@@ -14,11 +14,22 @@ import (
 	"github.com/eddiexyang/graphnet/internal/transport"
 )
 
-// A hello comes from anyone who can reach the port.
-func FuzzParseHello(f *testing.F) {
-	hello, _ := Hello{Network: "00000000000000000000000000000001", Edge: "00000000000000000000000000000002", Initiator: "00000000000000000000000000000003", Responder: "00000000000000000000000000000004", Transport: "udp"}.marshal([]byte("noise"))
-	f.Add(hello)
-	f.Fuzz(func(t *testing.T, raw []byte) { parseHello(raw) })
+// Handshake initiation arrives from anyone who can reach the port.
+func FuzzRespondHandshake(f *testing.F) {
+	seedA, seedB := make([]byte, ed25519.SeedSize), make([]byte, ed25519.SeedSize)
+	seedA[0], seedB[0] = 1, 2
+	keyA, keyB := ed25519.NewKeyFromSeed(seedA), ed25519.NewKeyFromSeed(seedB)
+	a := secure.Config{Network: testutil.ID(1), Edge: testutil.ID(2), Local: testutil.ID(3), Peer: testutil.ID(4), Transport: model.UDP, Cipher: model.ChaCha20Poly1305, Identity: keyA, PeerIdentity: keyB.Public().(ed25519.PublicKey), Initiator: true}
+	b := a
+	b.Local, b.Peer, b.Identity, b.PeerIdentity, b.Initiator = a.Peer, a.Local, keyB, keyA.Public().(ed25519.PublicKey), false
+	initHS, _ := secure.NewHandshake(a)
+	msg1, _, _ := initHS.Write()
+	f.Add(msg1)
+	f.Fuzz(func(t *testing.T, raw []byte) {
+		secure.RespondHandshake(keyB, bytes.Clone(raw), nil, func(secure.ClientHello) (secure.Config, error) {
+			return b, nil
+		})
+	})
 }
 
 // An established channel receives whatever its transport delivers, such as
@@ -48,7 +59,7 @@ func channelPair(tb testing.TB) (*Channel, *Channel) {
 	x, y := net.Pipe()
 	accepted := make(chan *Channel, 1)
 	go func() {
-		channel, _ := Accept(ctx, transport.NewStream(y), model.TCP, func(Hello) (secure.Config, error) { return b, nil })
+		channel, _ := Accept(ctx, transport.NewStream(y), model.TCP, keyB, nil, func(secure.ClientHello) (secure.Config, error) { return b, nil })
 		accepted <- channel
 	}()
 	sender, err := Dial(ctx, transport.NewStream(x), a)

@@ -4,8 +4,8 @@ package peer
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"encoding/binary"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -23,57 +23,10 @@ import (
 const (
 	helloKind          = 0x41
 	replyKind          = 0x42
-	finishKind         = 0x43
-	readyKind          = 0x44
 	dataKind           = 0x45
-	helloHeader        = 67
 	handshakeTimeout   = 10 * time.Second
 	retransmitInterval = 250 * time.Millisecond
 )
-
-type Hello struct {
-	Network, Edge, Initiator, Responder model.ID
-	Transport                           model.Transport
-}
-
-var transports = []model.Transport{model.UDP, model.TCP, model.QUIC, model.WS, model.WSS}
-
-func (h Hello) marshal(noise []byte) ([]byte, error) {
-	out := make([]byte, helloHeader, helloHeader+len(noise))
-	out[0], out[1] = helloKind, 1
-	for i, id := range []model.ID{h.Network, h.Edge, h.Initiator, h.Responder} {
-		if err := id.Validate(); err != nil {
-			return nil, err
-		}
-		hex.Decode(out[2+i*16:18+i*16], []byte(id))
-	}
-	found := false
-	for i, t := range transports {
-		if h.Transport == t {
-			out[66] = byte(i)
-			found = true
-			break
-		}
-	}
-	if !found {
-		return nil, errors.New("unknown handshake transport")
-	}
-	return append(out, noise...), nil
-}
-func parseHello(raw []byte) (Hello, error) {
-	var h Hello
-	if len(raw) <= helloHeader || len(raw) > helloHeader+secure.MaxHandshake || raw[0] != helloKind || raw[1] != 1 || int(raw[66]) >= len(transports) {
-		return h, errors.New("invalid peer hello")
-	}
-	for i, dest := range []*model.ID{&h.Network, &h.Edge, &h.Initiator, &h.Responder} {
-		*dest = model.ID(hex.EncodeToString(raw[2+i*16 : 18+i*16]))
-		if err := dest.Validate(); err != nil {
-			return Hello{}, err
-		}
-	}
-	h.Transport = transports[raw[66]]
-	return h, nil
-}
 
 // Channel carries authenticated plaintext messages after its handshake. It owns
 // the transport connection. A single Receive loop must remain active to service
@@ -115,9 +68,9 @@ func (c *Channel) ReceiveWindow() (int, bool) {
 func (c *Channel) LocalAddr() net.Addr  { return c.conn.LocalAddr() }
 func (c *Channel) RemoteAddr() net.Addr { return c.conn.RemoteAddr() }
 
-// Resolve authorizes the exact incoming Network/Edge/Node tuple and returns its
-// configured identities. Never construct that policy solely from the Hello.
-type Resolve func(Hello) (secure.Config, error)
+// Resolve authorizes the exact incoming Network/Edge/Node tuple decrypted from
+// Message 1 and returns its configured identities and cipher suite.
+type Resolve func(secure.ClientHello) (secure.Config, error)
 
 func Dial(parent context.Context, conn transport.Conn, config secure.Config) (channel *Channel, err error) {
 	defer func() {
@@ -136,43 +89,24 @@ func Dial(parent context.Context, conn transport.Conn, config secure.Config) (ch
 	if err != nil {
 		return nil, err
 	}
-	hello := Hello{Network: config.Network, Edge: config.Edge, Initiator: config.Local, Responder: config.Peer, Transport: config.Transport}
-	request, err := hello.marshal(first)
-	if err != nil {
-		return nil, err
-	}
+	request := append([]byte{helloKind}, first...)
 	unreliable := isDatagram(conn)
 	reply, err := exchange(ctx, conn, unreliable, request, replyKind, nil)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := handshake.Read(reply[1:]); err != nil {
-		return nil, err
-	}
-	finish, session, err := handshake.Write()
+	session, err := handshake.Read(reply[1:])
 	if err != nil {
 		return nil, err
 	}
 	if session == nil {
 		return nil, errors.New("incomplete peer handshake")
 	}
-	finish = append([]byte{finishKind}, finish...)
-	ready, err := exchange(ctx, conn, unreliable, finish, readyKind, reply)
-	if err != nil {
-		return nil, err
-	}
-	confirmation, err := session.Open(ready[1:])
-	if err != nil {
-		return nil, err
-	}
-	if !bytes.Equal(confirmation, []byte{0}) {
-		return nil, errors.New("invalid handshake confirmation")
-	}
 	markAuthenticated(conn)
-	return &Channel{conn: conn, session: session, unreliable: unreliable, repeatRequest: reply, repeatResponse: finish, ignore: [][]byte{ready}}, nil
+	return &Channel{conn: conn, session: session, unreliable: unreliable, ignore: [][]byte{reply}}, nil
 }
 
-func Accept(parent context.Context, conn transport.Conn, kind model.Transport, resolve Resolve) (channel *Channel, err error) {
+func Accept(parent context.Context, conn transport.Conn, kind model.Transport, identity ed25519.PrivateKey, replay *secure.ReplayFilter, resolve Resolve) (channel *Channel, err error) {
 	defer func() {
 		if err != nil {
 			conn.Close()
@@ -184,55 +118,25 @@ func Accept(parent context.Context, conn transport.Conn, kind model.Transport, r
 	if err != nil {
 		return nil, err
 	}
-	hello, err := parseHello(first)
+	if len(first) <= 1 || len(first) > secure.MaxHandshake+1 || first[0] != helloKind {
+		return nil, errors.New("invalid peer handshake initiation")
+	}
+	replyBody, session, err := secure.RespondHandshake(identity, first[1:], replay, func(hello secure.ClientHello) (secure.Config, error) {
+		if hello.Transport != kind {
+			return secure.Config{}, errors.New("hello transport does not match listener")
+		}
+		return resolve(hello)
+	})
 	if err != nil {
 		return nil, err
 	}
-	if hello.Transport != kind {
-		return nil, errors.New("hello transport does not match listener")
-	}
-	config, err := resolve(hello)
-	if err != nil {
+	reply := append([]byte{replyKind}, replyBody...)
+	if err := conn.Send(ctx, reply); err != nil {
 		return nil, err
 	}
-	if config.Network != hello.Network || config.Edge != hello.Edge || config.Local != hello.Responder || config.Peer != hello.Initiator || config.Transport != kind {
-		return nil, errors.New("resolved policy does not match hello")
-	}
-	config.Initiator = false
-	handshake, err := secure.NewHandshake(config)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := handshake.Read(first[helloHeader:]); err != nil {
-		return nil, err
-	}
-	reply, _, err := handshake.Write()
-	if err != nil {
-		return nil, err
-	}
-	reply = append([]byte{replyKind}, reply...)
 	unreliable := isDatagram(conn)
-	finish, err := exchange(ctx, conn, unreliable, reply, finishKind, first)
-	if err != nil {
-		return nil, err
-	}
-	session, err := handshake.Read(finish[1:])
-	if err != nil {
-		return nil, err
-	}
-	if session == nil {
-		return nil, errors.New("incomplete peer handshake")
-	}
-	confirmation, err := session.Seal([]byte{0})
-	if err != nil {
-		return nil, err
-	}
-	ready := append([]byte{readyKind}, confirmation...)
-	if err := conn.Send(ctx, ready); err != nil {
-		return nil, err
-	}
 	markAuthenticated(conn)
-	return &Channel{conn: conn, session: session, unreliable: unreliable, repeatRequest: finish, repeatResponse: ready, ignore: [][]byte{first}}, nil
+	return &Channel{conn: conn, session: session, unreliable: unreliable, repeatRequest: first, repeatResponse: reply, ignore: [][]byte{first}}, nil
 }
 
 func exchange(ctx context.Context, conn transport.Conn, unreliable bool, out []byte, want byte, duplicate []byte) ([]byte, error) {

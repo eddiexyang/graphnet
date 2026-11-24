@@ -88,15 +88,8 @@ func TestCipherMismatchCannotEstablishSession(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if _, err := responder.Read(first); err != nil {
-					return
-				}
-				second, _, err := responder.Write()
-				if err != nil {
-					return
-				}
-				if _, err := initiator.Read(second); err == nil {
-					t.Fatal("mismatched cipher authenticated")
+				if _, err := responder.Read(first); err == nil {
+					t.Fatal("mismatched cipher accepted by responder")
 				}
 			})
 		}
