@@ -28,15 +28,19 @@ func (s *Server) agentChallenge(w http.ResponseWriter, r *http.Request) {
 	challenge := base64.RawURLEncoding.EncodeToString(raw)
 	now := time.Now()
 	s.challengeMu.Lock()
+	var oldestKey string
+	var oldestExp time.Time
 	for c, expires := range s.challenges {
 		if !now.Before(expires) {
 			delete(s.challenges, c)
+			continue
+		}
+		if oldestKey == "" || expires.Before(oldestExp) {
+			oldestKey, oldestExp = c, expires
 		}
 	}
-	if len(s.challenges) >= maxAgentChallenges {
-		s.challengeMu.Unlock()
-		fail(w, 503, "too many pending agent challenges")
-		return
+	if len(s.challenges) >= maxAgentChallenges && oldestKey != "" {
+		delete(s.challenges, oldestKey)
 	}
 	s.challenges[challenge] = now.Add(agentChallengeTTL)
 	s.challengeMu.Unlock()

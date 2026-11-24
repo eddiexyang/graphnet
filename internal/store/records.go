@@ -2,7 +2,10 @@ package store
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
+	"strings"
+	"time"
 
 	bolt "go.etcd.io/bbolt"
 )
@@ -54,6 +57,40 @@ func (r *Records) Delete(key string) error {
 		return nil
 	}
 	return b.Delete([]byte(key))
+}
+
+// PurgeExpired marks expired enrollment/* and server-join/* records for
+// deletion in the proposed Command so Raft replicas apply identical key removals.
+func (r *Records) PurgeExpired(now time.Time) error {
+	b := r.tx.Bucket(recordsBucket)
+	if b == nil {
+		return nil
+	}
+	var expired []string
+	for _, prefix := range []string{"enrollment/", "server-join/"} {
+		c := b.Cursor()
+		for k, v := c.Seek([]byte(prefix)); k != nil && strings.HasPrefix(string(k), prefix); k, v = c.Next() {
+			key := string(k)
+			if pendingVal, ok := r.pending[key]; ok {
+				if pendingVal == nil {
+					continue
+				}
+				v = *pendingVal
+			}
+			var meta struct {
+				Expires time.Time `json:"expires"`
+			}
+			if json.Unmarshal(v, &meta) == nil && !meta.Expires.IsZero() && !now.Before(meta.Expires) {
+				expired = append(expired, key)
+			}
+		}
+	}
+	for _, key := range expired {
+		if err := r.Delete(key); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 func (s *Store) ReadRecords(fn func(*Records) error) error {
 	return s.db.View(func(tx *bolt.Tx) error { return fn(&Records{tx: tx}) })

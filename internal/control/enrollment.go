@@ -41,7 +41,12 @@ func (s *Server) createEnrollmentToken(w http.ResponseWriter, r *http.Request) {
 		s.internal(w, err)
 		return
 	}
-	if err := s.db.WriteRecords(func(r *store.Records) error { return r.Put(enrollmentKey(token), raw) }); err != nil {
+	if err := s.db.WriteRecords(func(r *store.Records) error {
+		if err := r.PurgeExpired(time.Now()); err != nil {
+			return err
+		}
+		return r.Put(enrollmentKey(token), raw)
+	}); err != nil {
 		s.internal(w, err)
 		return
 	}
@@ -63,7 +68,7 @@ func (s *Server) createEnrollmentToken(w http.ResponseWriter, r *http.Request) {
 	respond(w, 201, map[string]any{"token": token, "invitation": invitation, "expires_at": record.Expires})
 }
 func (s *Server) enroll(w http.ResponseWriter, r *http.Request) {
-	if !s.auth.allowAttempt(r) {
+	if !s.auth.allowEnrollAttempt(r) {
 		fail(w, 429, "too many enrollment attempts")
 		return
 	}
@@ -135,6 +140,9 @@ func (s *Server) enroll(w http.ResponseWriter, r *http.Request) {
 				if err := records.Put(enrollmentKey(token)+"/receipt", raw); err != nil {
 					return err
 				}
+			}
+			if err := records.PurgeExpired(time.Now()); err != nil {
+				return err
 			}
 			return records.Delete(enrollmentKey(token))
 		})

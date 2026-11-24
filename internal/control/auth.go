@@ -33,13 +33,14 @@ type attempt struct {
 	Until time.Time
 }
 type auth struct {
-	password    passwordRecord
-	apiTokenSet bool
-	apiToken    [32]byte
-	mu          sync.Mutex
-	sessions    map[[32]byte]session
-	attempts    map[string]attempt
-	slots       chan struct{}
+	password       passwordRecord
+	apiTokenSet    bool
+	apiToken       [32]byte
+	mu             sync.Mutex
+	sessions       map[[32]byte]session
+	loginAttempts  map[string]attempt
+	enrollAttempts map[string]attempt
+	slots          chan struct{}
 }
 
 func randomToken() string {
@@ -50,7 +51,12 @@ func randomToken() string {
 func tokenHash(token string) [32]byte { return sha256.Sum256([]byte(token)) }
 
 func newAuth(db *store.Store, password, apiToken string) (*auth, error) {
-	a := &auth{sessions: map[[32]byte]session{}, attempts: map[string]attempt{}, slots: make(chan struct{}, 4)}
+	a := &auth{
+		sessions:       map[[32]byte]session{},
+		loginAttempts:  map[string]attempt{},
+		enrollAttempts: map[string]attempt{},
+		slots:          make(chan struct{}, 4),
+	}
 	if tok := strings.TrimSpace(apiToken); tok != "" {
 		a.apiTokenSet = true
 		a.apiToken = tokenHash(tok)
@@ -100,6 +106,14 @@ func sameOrigin(r *http.Request) bool {
 	return err == nil && u.Scheme == scheme && u.Host == r.Host && u.User == nil && u.Path == "" && u.RawQuery == "" && u.Fragment == ""
 }
 func (a *auth) allowAttempt(r *http.Request) bool {
+	return a.allowBucketAttempt(r, a.loginAttempts)
+}
+
+func (a *auth) allowEnrollAttempt(r *http.Request) bool {
+	return a.allowBucketAttempt(r, a.enrollAttempts)
+}
+
+func (a *auth) allowBucketAttempt(r *http.Request, table map[string]attempt) bool {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		host = r.RemoteAddr
@@ -107,20 +121,26 @@ func (a *auth) allowAttempt(r *http.Request) bool {
 	now := time.Now()
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	for key, v := range a.attempts {
+	var oldestKey string
+	var oldestUntil time.Time
+	for key, v := range table {
 		if now.After(v.Until) {
-			delete(a.attempts, key)
+			delete(table, key)
+			continue
+		}
+		if oldestKey == "" || v.Until.Before(oldestUntil) {
+			oldestKey, oldestUntil = key, v.Until
 		}
 	}
-	v, exists := a.attempts[host]
+	v, exists := table[host]
 	if !exists {
-		if len(a.attempts) >= 4096 {
-			return false
+		if len(table) >= 4096 && oldestKey != "" {
+			delete(table, oldestKey)
 		}
 		v.Until = now.Add(time.Minute)
 	}
 	v.Count++
-	a.attempts[host] = v
+	table[host] = v
 	return v.Count <= 10
 }
 func (a *auth) login(w http.ResponseWriter, r *http.Request) {
@@ -158,19 +178,25 @@ func (a *auth) login(w http.ResponseWriter, r *http.Request) {
 	token := randomToken()
 	s := session{CSRF: randomToken(), Expires: time.Now().Add(12 * time.Hour)}
 	a.mu.Lock()
+	now := time.Now()
+	var oldestSess [32]byte
+	var hasOldest bool
+	var oldestExp time.Time
 	for k, v := range a.sessions {
-		if time.Now().After(v.Expires) {
+		if now.After(v.Expires) {
 			delete(a.sessions, k)
+			continue
 		}
-	}
-	if len(a.sessions) >= 256 {
-		a.mu.Unlock()
-		fail(w, 429, "session limit reached")
-		return
+		if !hasOldest || v.Expires.Before(oldestExp) {
+			oldestSess, oldestExp, hasOldest = k, v.Expires, true
+		}
 	}
 	// Logging in rotates an existing session in the same browser.
 	if c, err := r.Cookie(cookieName); err == nil {
 		delete(a.sessions, tokenHash(c.Value))
+	}
+	if len(a.sessions) >= 256 && hasOldest {
+		delete(a.sessions, oldestSess)
 	}
 	a.sessions[tokenHash(token)] = s
 	a.mu.Unlock()

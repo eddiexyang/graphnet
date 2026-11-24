@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/eddiexyang/graphnet/internal/model"
+	"github.com/eddiexyang/graphnet/internal/store"
 	"github.com/hashicorp/raft"
 )
 
@@ -75,6 +76,7 @@ func (r *Runtime) StartMembership(local func() []model.AgentStatus) {
 		defer r.wg.Done()
 		tick := time.NewTicker(time.Second)
 		defer tick.Stop()
+		var lastGC time.Time
 		for {
 			select {
 			case <-r.ctx.Done():
@@ -115,6 +117,12 @@ func (r *Runtime) StartMembership(local func() []model.AgentStatus) {
 			if r.Raft.State() != raft.Leader {
 				continue
 			}
+			if time.Since(lastGC) >= time.Minute {
+				lastGC = time.Now()
+				_ = r.DB.WriteRecords(func(rec *store.Records) error {
+					return rec.PurgeExpired(lastGC)
+				})
+			}
 			future := r.Raft.GetConfiguration()
 			if future.Error() != nil {
 				continue
@@ -122,6 +130,20 @@ func (r *Runtime) StartMembership(local func() []model.AgentStatus) {
 			members := map[model.ID]raft.Server{}
 			for _, p := range future.Configuration().Servers {
 				members[model.ID(p.ID)] = p
+			}
+			removed := false
+			for id, member := range members {
+				if id == r.Identity.ID {
+					continue
+				}
+				if !allowed[id] {
+					r.Raft.RemoveServer(member.ID, 0, time.Second).Error()
+					removed = true
+					break
+				}
+			}
+			if removed {
+				continue
 			}
 			for _, p := range state.Servers {
 				if p.Revoked || p.ID == r.Identity.ID {

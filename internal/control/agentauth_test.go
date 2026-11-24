@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -17,6 +18,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 	"github.com/eddiexyang/graphnet/internal/model"
+	"github.com/eddiexyang/graphnet/internal/pki"
 	"github.com/eddiexyang/graphnet/internal/store"
 	"github.com/eddiexyang/graphnet/internal/testutil"
 )
@@ -204,4 +206,104 @@ func TestSignedChallengeRequiresTLSAndBindsRequest(t *testing.T) {
 	if conn, status := dial(&testChallengeRoundTripper{base: baseTransport, id: id, key: key, challengeValue: challenge()}); conn != nil || status != http.StatusUnauthorized {
 		t.Errorf("revoked agent: status=%d, want 401", status)
 	}
+}
+
+func TestBoundedAuthTablesEvictOldestAndPurgeExpiredRecords(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	apiToken := "0123456789abcdef0123456789abcdef"
+	s, err := New(db, Options{Password: "strong-admin-password-123", APIToken: apiToken})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ca, err := pki.LoadOrCreate(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, _, _ := ed25519.GenerateKey(nil)
+	cur, _ := db.Read()
+	_, _ = db.Update(cur.Revision, func(st *model.State) error {
+		st.ClusterID = model.NewID()
+		st.ClusterCA = ca.PEM
+		st.Servers = []model.Server{{ID: model.NewID(), Name: "c1", PublicKey: pub}}
+		return nil
+	})
+	server := httptest.NewUnstartedServer(s)
+	server.TLS, err = ca.ServerTLS([]string{"127.0.0.1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.StartTLS()
+	defer server.Close()
+	roots := x509.NewCertPool()
+	roots.AppendCertsFromPEM(ca.PEM)
+	tlsClient := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS13}}}
+
+	// 1. Overfilling maxAgentChallenges (4096) evicts oldest instead of returning 503.
+	s.challengeMu.Lock()
+	s.challenges["oldest-challenge"] = time.Now().Add(10 * time.Second)
+	for i := range maxAgentChallenges - 1 {
+		s.challenges[string(rune(i+1))+"-c"] = time.Now().Add(50 * time.Second)
+	}
+	s.challengeMu.Unlock()
+	resp, err := tlsClient.Get(server.URL + model.AgentChallengePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("agentChallenge under flood returned %d, want 200", resp.StatusCode)
+	}
+	if s.consumeChallenge("oldest-challenge") {
+		t.Fatal("oldest challenge was not evicted at capacity")
+	}
+
+	// 2. Enrollment attempt flood from 4100 IPs neither locks out a fresh IP nor affects loginAttempts.
+	for i := range 4100 {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/enroll", nil)
+		req.RemoteAddr = "198.51.100.1:" + string(rune(i+1000))
+		// Distinct host IPs:
+		req.RemoteAddr = net.IPv4(10, byte(i>>16), byte(i>>8), byte(i)).String() + ":12345"
+		if !s.auth.allowEnrollAttempt(req) {
+			t.Fatalf("allowEnrollAttempt rejected fresh IP %d under flood", i)
+		}
+	}
+	loginReq := httptest.NewRequest(http.MethodPost, "/api/v1/login", nil)
+	loginReq.RemoteAddr = "10.0.0.1:54321"
+	if !s.auth.allowAttempt(loginReq) {
+		t.Fatal("enrollment flood polluted loginAttempts bucket")
+	}
+
+	// 3. Expired enrollment/* and server-join/* records are deterministically purged on write.
+	expiredRaw, _ := json.Marshal(map[string]any{"expires": time.Now().Add(-time.Minute)})
+	if err := db.WriteRecords(func(r *store.Records) error {
+		_ = r.Put("enrollment/deadbeef", expiredRaw)
+		_ = r.Put("enrollment/deadbeef/receipt", expiredRaw)
+		return r.Put("server-join/cafebabe", expiredRaw)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tokReq, _ := http.NewRequest(http.MethodPost, server.URL+"/api/v1/enrollment-tokens", strings.NewReader(`{"ttl_seconds":60}`))
+	tokReq.Header.Set("Content-Type", "application/json")
+	tokReq.Header.Set("Authorization", "Bearer "+apiToken)
+	tokResp, err := tlsClient.Do(tokReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokResp.Body.Close()
+	if tokResp.StatusCode != 201 {
+		t.Fatalf("createEnrollmentToken = %d", tokResp.StatusCode)
+	}
+	_ = db.ReadRecords(func(r *store.Records) error {
+		for _, k := range []string{"enrollment/deadbeef", "enrollment/deadbeef/receipt", "server-join/cafebabe"} {
+			if r.Get(k) != nil {
+				t.Fatalf("expired record %s survived PurgeExpired", k)
+			}
+		}
+		return nil
+	})
 }

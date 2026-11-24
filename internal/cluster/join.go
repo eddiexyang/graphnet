@@ -56,7 +56,12 @@ func (r *Runtime) Invite() (string, error) {
 	}
 	token := base64.RawURLEncoding.EncodeToString(rawToken)
 	raw, _ := json.Marshal(joinToken{Expires: time.Now().Add(time.Hour)})
-	if err := r.DB.WriteRecords(func(records *store.Records) error { return records.Put(tokenKey(token), raw) }); err != nil {
+	if err := r.DB.WriteRecords(func(records *store.Records) error {
+		if err := records.PurgeExpired(time.Now()); err != nil {
+			return err
+		}
+		return records.Put(tokenKey(token), raw)
+	}); err != nil {
 		return "", err
 	}
 	state, err := r.DB.Read()
