@@ -133,6 +133,7 @@ func (r *DataPlane) repairTunnels(now time.Time) {
 			continue
 		}
 		r.state.Store(&next)
+		r.forwarding.fire()
 		state = &next
 		r.wg.Add(1)
 		go r.readTunnel(network.ID, replacement)

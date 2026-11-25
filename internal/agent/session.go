@@ -70,6 +70,7 @@ func (s *sessions) init() {
 
 // routesChanged schedules a check of every chain against the routes.
 func (r *DataPlane) routesChanged() {
+	r.forwarding.fire()
 	select {
 	case r.sessions.wake <- struct{}{}:
 	default:

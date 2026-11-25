@@ -69,6 +69,8 @@ type runtimeState struct {
 }
 
 type DataPlane struct {
+	// forwarding fires when configuration or routes change.
+	forwarding    changeSignal
 	gateway       gateway.Manager
 	identity      ed25519.PrivateKey
 	options       DataPlaneOptions
@@ -273,6 +275,7 @@ func (r *DataPlane) Apply(ctx context.Context, snapshot model.Snapshot) error {
 		return err
 	}
 	r.state.Store(next)
+	r.forwarding.fire()
 	if linkstate.Active(snapshot) {
 		// Install link-state routes with the configuration, so forwarding never
 		// uses the controller's routes for a revision, even briefly.

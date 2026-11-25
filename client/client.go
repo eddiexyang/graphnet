@@ -274,6 +274,9 @@ func (t *trackedStack) Close() error {
 func (c *Client) route(ctx context.Context, destination netip.Addr) (model.ID, *netstack, error) {
 	delay := 10 * time.Millisecond
 	for {
+		// A route appears with a configuration or route change: wake on it
+		// rather than at the next poll, which only covers changes it misses.
+		changed := c.runtime.ForwardingChanged()
 		network, local, err := c.runtime.NetworkFor(destination.Unmap())
 		if err == nil {
 			c.mu.Lock()
@@ -296,6 +299,8 @@ func (c *Client) route(ctx context.Context, destination netip.Addr) (model.ID, *
 			return "", nil, fmt.Errorf("graphnet: waiting for a route to %s: %w", destination, err)
 		case <-c.ctx.Done():
 			return "", nil, net.ErrClosed
+		case <-changed:
+			continue
 		case <-time.After(delay):
 		}
 		delay = min(2*delay, 250*time.Millisecond)
