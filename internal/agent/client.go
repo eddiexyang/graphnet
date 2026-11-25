@@ -75,6 +75,9 @@ type Client struct {
 	// transportKey identifies what transport was built from; a control
 	// target that would build the same one reuses it and its connections.
 	transportKey string
+	// spare is the transport's tunnel dialer, whose untaken spare closes
+	// with the transport.
+	spare *spareDialer
 }
 
 func serverURL(raw string) (string, error) {
@@ -132,13 +135,15 @@ func NewClient(cache *Cache, runtime Runtime, options Options) (*Client, error) 
 	}
 	tlsConfig := &tls.Config{RootCAs: options.Roots, MinVersion: tls.VersionTLS13}
 	dial := controltransport.DialContext(options.ServerTransport, options.Roots)
+	var spare *spareDialer
 	if tunnelTransport(options.ServerTransport) {
 		// Registration happens before the directory can name the controller's
 		// TLS identity, and a gateway entrance never matches it: pin the
 		// controller by chain, not by the entrance hostname. The gateway hop,
 		// where one exists, is authenticated separately by GatewayDialContext.
 		tlsConfig = pinnedTLSConfig(options.Roots, "")
-		dial = controltransport.GatewayDialContext(options.ServerTransport, options.GatewayRoots)
+		spare = newSpareDialer(controltransport.GatewayDialContext(options.ServerTransport, options.GatewayRoots))
+		dial = spare.DialContext
 	}
 	transport := &http.Transport{TLSClientConfig: tlsConfig, TLSHandshakeTimeout: 10 * time.Second, ResponseHeaderTimeout: 15 * time.Second, MaxIdleConnsPerHost: 2}
 	transport.DialContext = dial
@@ -159,9 +164,14 @@ func NewClient(cache *Cache, runtime Runtime, options Options) (*Client, error) 
 		}
 		key = transportKey(options.ServerTransport, server, "", true, ca, nil)
 	}
-	return &Client{configuredServer: configuredServer, lastTarget: last, failedTargets: map[string]bool{}, cache: cache, reconcile: NewReconciler(cache, runtime), options: options, server: server, http: client, transport: transport, transportKey: key, endpointsChanged: make(chan struct{}, 1)}, nil
+	return &Client{configuredServer: configuredServer, lastTarget: last, failedTargets: map[string]bool{}, cache: cache, reconcile: NewReconciler(cache, runtime), options: options, server: server, http: client, transport: transport, transportKey: key, spare: spare, endpointsChanged: make(chan struct{}, 1)}, nil
 }
-func (c *Client) Close() { c.transport.CloseIdleConnections() }
+func (c *Client) Close() {
+	c.transport.CloseIdleConnections()
+	if c.spare != nil {
+		c.spare.close()
+	}
+}
 
 // tunnelTransport reports carriers whose byte stream reaches the controller
 // through a tunnel, so the controller TLS handshake runs above the carrier.
@@ -748,13 +758,18 @@ func (c *Client) selectTarget() (controlTarget, error) {
 		return *selected, nil
 	}
 	c.transport.CloseIdleConnections()
+	if c.spare != nil {
+		c.spare.close()
+		c.spare = nil
+	}
 	c.transportKey = key
 	dial := controltransport.DialContext(selected.transport, roots, selected.tlsName)
 	if gateway {
 		// The configured entrance is a gateway: the outer TLS is the
 		// gateway's own certificate, and the controller is verified above
 		// the tunnel by its pinned CA below.
-		dial = controltransport.GatewayDialContext(selected.transport, c.options.GatewayRoots)
+		c.spare = newSpareDialer(controltransport.GatewayDialContext(selected.transport, c.options.GatewayRoots))
+		dial = c.spare.DialContext
 	}
 	inner := &tls.Config{RootCAs: roots, Certificates: certificates, ServerName: selected.tlsName, MinVersion: tls.VersionTLS13}
 	if tunnelTransport(selected.transport) {
