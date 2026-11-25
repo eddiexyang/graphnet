@@ -80,6 +80,9 @@ func (s *Server) patchServer(w http.ResponseWriter, r *http.Request) {
 		Name            *string                 `json:"name"`
 		ManualEndpoints *[]model.ServerEndpoint `json:"manual_endpoints"`
 		STUNServers     *[]string               `json:"stun_servers"`
+		// Revoked removes the server from the cluster: the Raft leader drops
+		// it from the configuration and agents stop using its endpoints.
+		Revoked *bool `json:"revoked"`
 	}
 	if !decode(w, r, &input) {
 		return
@@ -101,6 +104,18 @@ func (s *Server) patchServer(w http.ResponseWriter, r *http.Request) {
 			}
 			if input.STUNServers != nil {
 				p.STUNServers = append([]string{}, (*input.STUNServers)...)
+			}
+			if input.Revoked != nil {
+				p.Revoked = *input.Revoked
+				remaining := 0
+				for _, other := range state.Servers {
+					if !other.Revoked {
+						remaining++
+					}
+				}
+				if remaining == 0 {
+					return errors.New("cannot revoke the last server of the cluster")
+				}
 			}
 			if input.ManualEndpoints != nil {
 				manual := []model.ServerEndpoint{}

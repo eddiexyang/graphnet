@@ -124,3 +124,61 @@ func jsonRevision(rev uint64) string {
 	raw, _ := json.Marshal(rev)
 	return string(raw)
 }
+
+// A dead or compromised controller can be revoked, which removes it from the
+// cluster; the last server cannot be.
+func TestPatchServerRevokes(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "controller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	apiToken := "0123456789abcdef0123456789abcdef"
+	srv, err := New(db, Options{Password: "strong-admin-password-123", APIToken: apiToken})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	ca, err := pki.LoadOrCreate(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := []model.ID{model.NewID(), model.NewID()}
+	cur, _ := db.Read()
+	if _, err := db.Update(cur.Revision, func(s *model.State) error {
+		s.ClusterID = model.NewID()
+		s.ClusterCA = ca.PEM
+		for i, id := range ids {
+			pub, _, _ := ed25519.GenerateKey(rand.Reader)
+			s.Servers = append(s.Servers, model.Server{ID: id, Name: "ctrl-" + string(rune('a'+i)), PublicKey: pub})
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	patch := func(id model.ID, revoked bool) *httptest.ResponseRecorder {
+		state, _ := db.Read()
+		payload, _ := json.Marshal(map[string]any{"revoked": revoked})
+		req := httptest.NewRequest(http.MethodPatch, "/api/v1/servers/"+string(id), bytes.NewReader(payload))
+		req.SetPathValue("id", string(id))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+apiToken)
+		req.Header.Set("If-Match", `"`+jsonRevision(state.Revision)+`"`)
+		rec := httptest.NewRecorder()
+		srv.auth.require(srv.patchServer)(rec, req)
+		return rec
+	}
+	if rec := patch(ids[1], true); rec.Code != 200 {
+		t.Fatalf("revoke = %d: %s", rec.Code, rec.Body.String())
+	}
+	state, _ := db.Read()
+	if !state.Servers[1].Revoked || state.Servers[0].Revoked {
+		t.Fatalf("servers after revoke: %+v", state.Servers)
+	}
+	if rec := patch(ids[0], true); rec.Code == 200 {
+		t.Fatal("revoked the last server of the cluster")
+	}
+	if rec := patch(ids[1], false); rec.Code != 200 {
+		t.Fatalf("restore = %d: %s", rec.Code, rec.Body.String())
+	}
+}
