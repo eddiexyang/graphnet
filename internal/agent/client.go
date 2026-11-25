@@ -13,6 +13,7 @@ import (
 	"io"
 	"log/slog"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"net/url"
 	"slices"
@@ -26,6 +27,7 @@ import (
 	"github.com/eddiexyang/graphnet/internal/controltransport"
 	"github.com/eddiexyang/graphnet/internal/discovery"
 	"github.com/eddiexyang/graphnet/internal/model"
+	"github.com/eddiexyang/graphnet/internal/sockets"
 )
 
 type Updater interface {
@@ -56,6 +58,10 @@ type Options struct {
 	// Without it the saved configuration runs only when no controller
 	// answers at startup.
 	EagerFallback bool
+	// NetworkDial, when set, reaches the configured server address through a
+	// network this process runs. Once a direct dial of it fails while a
+	// configuration runs, the next attempt dials the same address that way.
+	NetworkDial sockets.NetworkDial
 }
 
 type Client struct {
@@ -77,6 +83,7 @@ type Client struct {
 	pendingUpdate       *model.UpdateRequest
 	fallbackTried       bool // Run-only state
 	fallbackRunning     bool
+	directDialFailed    bool // the last direct control dial failed
 
 	// transportKey identifies what transport was built from; a control
 	// target that would build the same one reuses it and its connections.
@@ -487,13 +494,25 @@ func (c *Client) connect(parent context.Context, id model.ID, updates chan model
 		if resp != nil {
 			resp.Body.Close()
 		}
+		if !target.network {
+			c.directDialFailed = true
+		}
 		return err
 	}
-	c.lastTarget = target.key
+	if target.network {
+		c.options.Logger.Warn("controller reached through the network", "server", c.server)
+	} else {
+		// Reconnects start with the direct address; the network path is only
+		// taken after it fails again.
+		c.directDialFailed = false
+		c.lastTarget = target.key
+	}
 	clear(c.failedTargets)
-	if err := c.cache.saveLastServer(target.key); err != nil {
-		conn.CloseNow()
-		return err
+	if !target.network {
+		if err := c.cache.saveLastServer(target.key); err != nil {
+			conn.CloseNow()
+			return err
+		}
 	}
 	defer conn.CloseNow()
 	conn.SetReadLimit(maxSnapshotBytes)
@@ -763,6 +782,9 @@ func (c *Client) selectTarget() (controlTarget, error) {
 		ca = c.options.CA
 	}
 	key := transportKey(selected.transport, selected.origin, selected.tlsName, gateway, ca, certificates)
+	if key != "" && selected.network {
+		key += "/network"
+	}
 	if key != "" && key == c.transportKey {
 		// The same entrance, carrier and identities as the transport that
 		// registered: keep its connection instead of opening another tunnel.
@@ -787,6 +809,13 @@ func (c *Client) selectTarget() (controlTarget, error) {
 		// the tunnel by its pinned CA below.
 		c.spare = newSpareDialer(controltransport.GatewayDialContext(selected.transport, c.options.GatewayRoots))
 		dial = c.spare.DialContext
+	}
+	if selected.network {
+		// The same address, carrier and TLS, carried through the network.
+		direct, through := dial, c.options.NetworkDial
+		dial = func(ctx context.Context, network, address string) (net.Conn, error) {
+			return direct(sockets.WithNetwork(ctx, through), network, address)
+		}
 	}
 	inner := &tls.Config{RootCAs: roots, Certificates: certificates, ServerName: selected.tlsName, MinVersion: tls.VersionTLS13}
 	if tunnelTransport(selected.transport) {

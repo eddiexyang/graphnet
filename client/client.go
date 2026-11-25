@@ -210,7 +210,7 @@ func Start(ctx context.Context, cfg Config) (*Client, error) {
 		c.cache.Close()
 		return nil, err
 	}
-	control, err = agent.NewClient(c.cache, c.runtime, agent.Options{Server: serverOrigin, ServerTransport: serverTransport, Roots: roots, CA: cfg.CA, GatewayRoots: gatewayRoots, Version: "client", Logger: cfg.Logger, EagerFallback: true})
+	control, err = agent.NewClient(c.cache, c.runtime, agent.Options{Server: serverOrigin, ServerTransport: serverTransport, Roots: roots, CA: cfg.CA, GatewayRoots: gatewayRoots, Version: "client", Logger: cfg.Logger, EagerFallback: true, NetworkDial: c.DialTCP})
 	if err != nil {
 		c.runtime.Close()
 		c.cancel()

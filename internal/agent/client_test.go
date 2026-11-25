@@ -6,8 +6,10 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -258,5 +260,73 @@ func TestConfiguredControllerRespectsRevocationAndDefaultSelection(t *testing.T)
 	defer c.Close()
 	if _, err := c.selectTarget(); err == nil {
 		t.Fatal("explicit address bypassed revoked controller identity")
+	}
+}
+
+// While a configuration runs, a configured address whose direct dial failed
+// is dialed again through the network; it is not offered before either holds,
+// and once its session ends the direct address comes first again.
+func TestConfiguredControllerThroughNetwork(t *testing.T) {
+	cache, ca, server := registeredController(t)
+	reg, _ := cache.Registration()
+	s := controllerEndpoint(t, ca, server.TLSName(), reg.AgentID)
+	var through []netip.AddrPort
+	c, err := NewClient(cache, controllerTestRuntime{}, Options{Server: "https://127.0.0.1:1", ServerTransport: "tcp",
+		NetworkDial: func(ctx context.Context, address netip.AddrPort) (net.Conn, error) {
+			through = append(through, address)
+			var d net.Dialer
+			return d.DialContext(ctx, "tcp", s.Listener.Addr().String())
+		}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	network := func() []controlTarget {
+		var out []controlTarget
+		for _, target := range c.targets(*reg) {
+			if target.network {
+				out = append(out, target)
+			}
+		}
+		return out
+	}
+	if len(network()) != 0 {
+		t.Fatal("network target offered before a direct dial failed")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := c.connect(ctx, reg.AgentID, make(chan model.Snapshot), make(chan struct{})); err == nil {
+		t.Fatal("refused configured address connected")
+	}
+	if len(network()) != 0 {
+		t.Fatal("network target offered without a running configuration")
+	}
+	c.reconcile.mu.Lock()
+	c.reconcile.running = true
+	c.reconcile.mu.Unlock()
+	offered := network()
+	list := c.targets(*reg)
+	if len(offered) != 1 || list[len(list)-1] != offered[0] || offered[0].origin != "https://127.0.0.1:1" || offered[0].tlsName != server.TLSName() {
+		t.Fatalf("network target %+v in %+v", offered, list)
+	}
+	target, err := c.selectTarget()
+	if err != nil || !target.network {
+		t.Fatalf("after the direct address failed: %+v, %v", target, err)
+	}
+	response, err := c.http.Get(c.server)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatal(response.Status)
+	}
+	if len(through) != 1 || through[0] != netip.MustParseAddrPort("127.0.0.1:1") {
+		t.Fatalf("network dials %v", through)
+	}
+	// The session through the network ended: the direct address comes next.
+	c.failedTargets[target.key] = true
+	if target, err := c.selectTarget(); err != nil || target.network {
+		t.Fatalf("after the network session: %+v, %v", target, err)
 	}
 }

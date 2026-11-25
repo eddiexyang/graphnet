@@ -81,7 +81,10 @@ func (c *Cache) SaveDirectory(directory *model.ServerDirectory, roots *x509.Cert
 	return nil
 }
 
-type controlTarget struct{ key, origin, transport, tlsName string }
+type controlTarget struct {
+	key, origin, transport, tlsName string
+	network                         bool // dialed through the network, not a host socket
+}
 
 func targets(reg Registration) []controlTarget {
 	if reg.Directory == nil {
@@ -146,8 +149,19 @@ func (c *Client) targets(reg Registration) []controlTarget {
 	for _, target := range preferred {
 		seen[target.key] = true
 	}
+	configured := len(preferred)
 	for _, target := range cached {
 		if !seen[target.key] {
+			preferred = append(preferred, target)
+		}
+	}
+	// The configured address through the network comes last, offered only
+	// after its direct dial failed while a configuration runs, whose routes
+	// can carry it.
+	if c.options.NetworkDial != nil && c.directDialFailed && c.reconcile.Configured() {
+		for _, target := range preferred[:configured] {
+			target.key += "#network"
+			target.network = true
 			preferred = append(preferred, target)
 		}
 	}

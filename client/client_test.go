@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/netip"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -560,5 +561,105 @@ func TestRestartedClientRunsSavedConfigurationAtOnce(t *testing.T) {
 	defer second.Close()
 	if err := dial(second, 3*time.Second); err != nil {
 		t.Fatalf("restarted client without a controller: %v", err)
+	}
+}
+
+// A restarted client whose controller address cannot be dialed directly runs
+// its saved configuration and reaches the same address through the network:
+// here only B's stack forwards it to the controller. The control session it
+// opens that way carries the controller's next change.
+func TestClientReachesControllerThroughTheNetwork(t *testing.T) {
+	_, clientKey, _ := ed25519.GenerateKey(rand.Reader)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cn := startClientNetwork(t, ctx, clientKey, clientKey.Public().(ed25519.PublicKey), model.TCP)
+	nodes := cn.state.Networks[0].Nodes
+	port, _ := strconv.ParseUint(cn.port, 10, 16)
+	behind := netip.AddrPortFrom(nodes[1].Address, uint16(port))
+	var resolve atomic.Value
+	resolve.Store(netip.MustParseAddr("127.0.0.1"))
+	var blocked atomic.Int64
+	config := Config{
+		Server:     "https://controller.graphnet.test:" + cn.port,
+		CA:         cn.ca.PEM,
+		PrivateKey: clientKey,
+		StateFile:  filepath.Join(t.TempDir(), "state.db"),
+		Lookup: func(context.Context, string, string) ([]netip.Addr, error) {
+			return []netip.Addr{resolve.Load().(netip.Addr)}, nil
+		},
+		Control: func(_, address string, _ syscall.RawConn) error {
+			if address == behind.String() {
+				blocked.Add(1)
+				return syscall.ECONNREFUSED
+			}
+			return nil
+		},
+	}
+	first, err := Start(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitRoute := func(c *Client, to, via model.ID, within time.Duration) bool {
+		for deadline := time.Now().Add(within); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+			for _, n := range c.runtime.LinkState().Networks {
+				for _, r := range n.Routes {
+					if r.Destination == to && r.NextHop == via {
+						return true
+					}
+				}
+			}
+		}
+		return false
+	}
+	if !waitRoute(first, nodes[2].ID, nodes[0].ID, 15*time.Second) {
+		t.Fatal("the first client did not get its configuration")
+	}
+	first.Close()
+
+	// The controller's name now resolves to an address the host cannot dial,
+	// which only B forwards to the controller.
+	resolve.Store(behind.Addr())
+	l, err := gonet.ListenTCP(cn.stacks[1].stack, fullAddress(behind), cn.stacks[1].protocol())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	var forwarded atomic.Int64
+	go func() {
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				return
+			}
+			forwarded.Add(1)
+			go func() {
+				defer conn.Close()
+				upstream, err := net.Dial("tcp", "127.0.0.1:"+cn.port)
+				if err != nil {
+					return
+				}
+				defer upstream.Close()
+				go io.Copy(upstream, conn)
+				io.Copy(conn, upstream)
+			}()
+		}
+	}()
+	second, err := Start(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	for deadline := time.Now().Add(15 * time.Second); forwarded.Load() == 0; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("the controller was not reached through the network (%d direct dials blocked)", blocked.Load())
+		}
+	}
+	if blocked.Load() == 0 {
+		t.Fatal("the direct address was not tried first")
+	}
+	// D reaches C through A until A-D costs 100; then directly.
+	cn.update(t, ctx, func(s *model.State) { s.Networks[0].Edges[2].Weight = 100 })
+	if !waitRoute(second, nodes[2].ID, nodes[2].ID, 15*time.Second) {
+		t.Fatal("the controller's change did not reach the client through the network")
 	}
 }
