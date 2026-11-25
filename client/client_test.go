@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/netip"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -39,6 +40,8 @@ type clientNetwork struct {
 	port     string
 	// accepted counts connections to the controller.
 	accepted *atomic.Int64
+	// stopController closes the controller's listener.
+	stopController func()
 }
 
 func startClientNetwork(t *testing.T, ctx context.Context, clientKey ed25519.PrivateKey, initialKey ed25519.PublicKey, carrier model.Transport) *clientNetwork {
@@ -115,10 +118,14 @@ func startClientNetwork(t *testing.T, ctx context.Context, clientKey ed25519.Pri
 	cn.accepted = new(atomic.Int64)
 	tunnel := controltransport.NewServer(countingListener{rawListener, cn.accepted}, server, tlsConfig)
 	go tunnel.Serve()
-	t.Cleanup(func() {
-		tunnel.Close()
-		tunnel.Wait()
-	})
+	var stopped sync.Once
+	cn.stopController = func() {
+		stopped.Do(func() {
+			tunnel.Close()
+			tunnel.Wait()
+		})
+	}
+	t.Cleanup(cn.stopController)
 	_, cn.port, _ = net.SplitHostPort(rawListener.Addr().String())
 	return cn
 }
@@ -487,3 +494,71 @@ func TestClientControlReusesRegistrationConnection(t *testing.T) {
 	}
 }
 
+// A restarted client runs the configuration it saved right away: it reaches
+// the network while its controller connection hangs, instead of waiting for
+// the controller to answer or time out.
+func TestRestartedClientRunsSavedConfigurationAtOnce(t *testing.T) {
+	_, clientKey, _ := ed25519.GenerateKey(rand.Reader)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cn := startClientNetwork(t, ctx, clientKey, clientKey.Public().(ed25519.PublicKey), model.TCP)
+	cn.serveEcho(t, 2, 7)
+	config := Config{
+		Server:     "https://controller.graphnet.test:" + cn.port,
+		CA:         cn.ca.PEM,
+		PrivateKey: clientKey,
+		StateFile:  filepath.Join(t.TempDir(), "state.db"),
+		Lookup: func(context.Context, string, string) ([]netip.Addr, error) {
+			return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
+		},
+	}
+	target := netip.AddrPortFrom(cn.state.Networks[0].Nodes[2].Address, 7)
+	dial := func(c *Client, within time.Duration) error {
+		dialCtx, stop := context.WithTimeout(ctx, within)
+		defer stop()
+		conn, err := c.DialTCP(dialCtx, target)
+		if err == nil {
+			conn.Close()
+		}
+		return err
+	}
+	first, err := Start(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dial(first, 20*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	first.Close()
+	cn.stopController()
+	// The controller's address now accepts connections and never answers.
+	hang, err := net.Listen("tcp", "127.0.0.1:"+cn.port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hang.Close()
+	go func() {
+		var held []net.Conn
+		defer func() {
+			for _, c := range held {
+				c.Close()
+			}
+		}()
+		for {
+			c, err := hang.Accept()
+			if err != nil {
+				return
+			}
+			held = append(held, c)
+		}
+	}()
+
+	second, err := Start(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	if err := dial(second, 3*time.Second); err != nil {
+		t.Fatalf("restarted client without a controller: %v", err)
+	}
+}

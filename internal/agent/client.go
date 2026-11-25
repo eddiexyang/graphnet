@@ -50,6 +50,12 @@ type Options struct {
 	// CA is the PEM behind Roots, when it is a pinned controller CA. It lets
 	// the control session reuse the connection that registered the Agent.
 	CA []byte
+	// EagerFallback applies the configuration saved by the previous process
+	// as soon as Run starts, so Links come up while the control session is
+	// still being set up; the controller's first configuration replaces it.
+	// Without it the saved configuration runs only when no controller
+	// answers at startup.
+	EagerFallback bool
 }
 
 type Client struct {
@@ -375,6 +381,17 @@ const startupFallbackAfter = 10 * time.Second
 // A Client instance must have at most one concurrent Run call.
 func (c *Client) Run(ctx context.Context) error {
 	runStart := time.Now()
+	if c.options.EagerFallback && !c.fallbackTried {
+		c.fallbackTried = true
+		revision, err := c.reconcile.RestoreFallback(ctx)
+		if revision != 0 {
+			c.options.Logger.Info("running saved configuration until the controller answers", "revision", revision)
+		}
+		if err != nil {
+			c.options.Logger.Warn("saved configuration failed", "error", err)
+		}
+		c.fallbackRunning = revision != 0
+	}
 	reg, err := c.registration(ctx)
 	for delay := 250 * time.Millisecond; err != nil; delay = min(delay*2, 30*time.Second) {
 		// Without a fallback running, exit as before and let the supervisor retry.
