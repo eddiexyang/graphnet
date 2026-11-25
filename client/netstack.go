@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math/rand/v2"
 	"net"
 	"net/netip"
 	"sync"
@@ -120,11 +121,13 @@ func (b *boundTCP) abortAndRelease() {
 func (n *netstack) allocPort() (uint16, func(), error) {
 	n.portMu.Lock()
 	defer n.portMu.Unlock()
+	const minPort, maxPort = 32768, 65535
 	if n.ports == nil {
 		n.ports = make(map[uint16]struct{})
-		n.nextPort = 32768
+		// Start anywhere in the range: a restarted node beginning at the same
+		// port reuses the last run's tuples while far ends still hold them.
+		n.nextPort = minPort + uint16(rand.IntN(maxPort-minPort+1))
 	}
-	const minPort, maxPort = 32768, 65535
 	for i := 0; i <= maxPort-minPort; i++ {
 		p := n.nextPort
 		if n.nextPort == maxPort {
