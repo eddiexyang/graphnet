@@ -180,7 +180,9 @@ func (e *Engine) receiveSync(networkID, peer model.ID, raw []byte) error {
 			return errors.New("oversized link-state inventory")
 		}
 		for id := range m.Sequences {
-			if !n.known(id) || n.isClient(peer) && id != peer && id != n.config.Self.ID || id <= m.After || m.Through != "" && id > m.Through {
+			// A client lists every origin it holds: an inventory only names
+			// sequences, so it cannot inject another origin's state.
+			if !n.known(id) || id <= m.After || m.Through != "" && id > m.Through {
 				e.mu.Unlock()
 				return errors.New("unknown link-state inventory origin")
 			}

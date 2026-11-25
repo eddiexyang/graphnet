@@ -38,6 +38,43 @@ func TestOfflineClientKeepsComponentOnSync(t *testing.T) {
 	}
 }
 
+// A client repairs an advertisement it lost through sync, not only through
+// the origin's next full refresh.
+func TestClientRepairsLostAdvertisementThroughSync(t *testing.T) {
+	l := clientLab(t)
+	l.run(time.Second)
+	netID := l.state.Networks[0].ID
+	// Lose every advertisement the routers send D while the A-B edge fails.
+	for _, id := range []model.ID{nodeA, nodeC} {
+		e := l.engines[id]
+		send := e.cb.Send
+		e.cb.Send = func(network, peer model.ID, raw []byte) bool {
+			var msg syncMessage
+			json.Unmarshal(raw, &msg)
+			if peer == nodeD && msg.Kind == "" {
+				return true // queued, then lost in transit
+			}
+			return send(network, peer, raw)
+		}
+		t.Cleanup(func() { e.cb.Send = send })
+	}
+	l.down[edgeAB] = true
+	l.run(time.Second)
+	if l.engines[nodeD].networks[netID].db[nodeA].up[edgeAB] == false {
+		t.Fatal("D received A's advertisement although it was lost")
+	}
+	for _, id := range []model.ID{nodeA, nodeC} {
+		l.engines[id].cb.Send = func(network, peer model.ID, raw []byte) bool {
+			l.queue = append(l.queue, message{network, id, peer, append([]byte(nil), raw...)})
+			return true
+		}
+	}
+	l.run(SyncInterval + time.Second)
+	if l.engines[nodeD].networks[netID].db[nodeA].up[edgeAB] {
+		t.Fatal("D still holds A's lost advertisement after a sync round")
+	}
+}
+
 // An edge named by an advertisement that arrived before the revision adding
 // it is usable as soon as that revision is configured.
 func TestConfigureRefiltersRetainedAdvertisements(t *testing.T) {
