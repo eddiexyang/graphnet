@@ -198,10 +198,15 @@ func (e *Engine) Configure(s model.Snapshot) *model.RouteUpdate {
 			}
 		}
 		n.syncMembers = componentMembers(c)
-		for origin := range n.db {
+		for origin, en := range n.db {
 			if !n.known(origin) {
 				delete(n.db, origin)
+				continue
 			}
+			// An advertisement received before this revision was filtered by
+			// the previous topology: an edge it names may exist only now.
+			en.up, en.fallback = n.usableEdges(en.lsa)
+			n.db[origin] = en
 		}
 		next[c.ID] = n
 	}
@@ -360,19 +365,7 @@ func (e *Engine) Receive(networkID, peer model.ID, raw []byte) error {
 		e.stats.Duplicate.Add(1)
 		return nil
 	}
-	incident := n.incidentEdges(lsa.Origin)
-	up := map[model.ID]bool{}
-	for _, id := range lsa.Up {
-		if incident[id] {
-			up[id] = true
-		}
-	}
-	fallback := map[model.ID]bool{}
-	for _, id := range lsa.Fallback {
-		if incident[id] && !up[id] {
-			fallback[id] = true
-		}
-	}
+	up, fallback := n.usableEdges(lsa)
 	if old, ok := n.db[lsa.Origin]; !ok || !slices.Equal(old.lsa.Up, lsa.Up) || !slices.Equal(old.lsa.Fallback, lsa.Fallback) {
 		e.eventLocked("received", networkID, lsa.Origin, "", lsa.Sequence)
 	}
@@ -409,6 +402,25 @@ func (n *network) isClient(node model.ID) bool {
 	}
 	d, ok := n.directoryEntry(node)
 	return ok && d.Client
+}
+
+// usableEdges keeps the edges of lsa that the configured topology gives its
+// origin: up first, then fallback edges that are not also up.
+func (n *network) usableEdges(lsa LSA) (up, fallback map[model.ID]bool) {
+	incident := n.incidentEdges(lsa.Origin)
+	up = map[model.ID]bool{}
+	for _, id := range lsa.Up {
+		if incident[id] {
+			up[id] = true
+		}
+	}
+	fallback = map[model.ID]bool{}
+	for _, id := range lsa.Fallback {
+		if incident[id] && !up[id] {
+			fallback[id] = true
+		}
+	}
+	return up, fallback
 }
 
 func (n *network) incidentEdges(origin model.ID) map[model.ID]bool {
