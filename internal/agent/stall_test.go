@@ -96,6 +96,7 @@ func TestTCPSessionSurvivesStalledHop(t *testing.T) {
 		s.Agents[1].Endpoints[0].URL = "tcp://" + proxy.port()
 		s.Agents[0].Endpoints = []model.Endpoint{}
 	})
+	debugSessions(t, agents)
 	var resetsBefore uint64
 	sessionExchange(t, devices, state, 2, 16<<20, 4<<20, func() {
 		waitFor(t, 5*time.Second, "a chain through B", func() bool { return relaying(agents[1]) > 0 })
@@ -120,6 +121,7 @@ func TestTCPSessionLeavesAStalledAttempt(t *testing.T) {
 		s.Agents[1].Endpoints[0].URL = "tcp://" + proxy.port()
 		s.Agents[0].Endpoints = []model.Endpoint{}
 	})
+	debugSessions(t, agents)
 	sessionExchange(t, devices, state, 2, 24<<20, 4<<20, func() {
 		waitFor(t, 5*time.Second, "a chain through B", func() bool { return relaying(agents[1]) > 0 })
 		paused := time.Now()

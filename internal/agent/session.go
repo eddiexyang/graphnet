@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"sync"
 	"time"
@@ -208,6 +209,9 @@ func (r *DataPlane) startIngress(ctx context.Context, request streamproxy.Reques
 		}
 		return hop, at, err
 	}, &r.sessions.counters)
+	if end != nil {
+		end.SetDebugAttrs("session", request.Conn, "role", "ingress", "from", request.From, "to", request.To)
+	}
 	return entry, key, end, err
 }
 
@@ -407,6 +411,7 @@ func (r *DataPlane) acceptEgress(parent, ctx context.Context, network, remote mo
 	}
 	r.sessions.mu.Unlock()
 	if entry == nil {
+		slog.Debug("TCP session unknown at egress", "session", key.conn, "reason", "no session", "gen", request.Gen, "tombstone", ended, "clean", tombstone.clean)
 		status := byte(streamproxy.StatusUnknown)
 		if tombstone.clean {
 			status = streamproxy.StatusEnded
@@ -421,6 +426,7 @@ func (r *DataPlane) acceptEgress(parent, ctx context.Context, network, remote mo
 			return
 		}
 		if entry.end == nil {
+			slog.Debug("TCP session unknown at egress", "session", key.conn, "reason", "server unreachable", "gen", request.Gen)
 			refuse(ctx, hop, streamproxy.StatusUnknown)
 			return
 		}
@@ -454,6 +460,7 @@ func (r *DataPlane) acceptEgress(parent, ctx context.Context, network, remote mo
 		return
 	}
 	entry.end = streamproxy.NewEgress(r.ctx, hop, func(gen uint32) { r.askReplay(key, gen) }, &r.sessions.counters)
+	entry.end.SetDebugAttrs("session", key.conn, "role", "egress", "from", request.From, "to", request.To)
 	close(entry.ready)
 	streamproxy.Relay(parent, entry.end, conn)
 	<-entry.end.Done()

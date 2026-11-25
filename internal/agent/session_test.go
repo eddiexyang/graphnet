@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"io"
+	"log/slog"
 	mrand "math/rand/v2"
 	"net"
 	"strings"
@@ -241,6 +242,7 @@ func TestTCPSessionMixedVersions(t *testing.T) {
 // reaches the other end exactly as sent.
 func TestTCPSessionEndsDuringReroute(t *testing.T) {
 	agents, devices, state := graphAgents(t, model.TCP, streamOptions{}, 4, 4)
+	debugSessions(t, agents)
 	address := state.Networks[0].Nodes[2].Address
 	listener, err := gonet.ListenTCP(devices[2].stack, tcpip.FullAddress{NIC: 1, Addr: tcpip.AddrFrom4(address.As4()), Port: 8091}, ipv4.ProtocolNumber)
 	if err != nil {
@@ -517,4 +519,42 @@ func TestTCPSessionStalledConnectionsDoNotBlockOthers(t *testing.T) {
 	if err := <-served; err != nil {
 		t.Fatal(err)
 	}
+}
+
+// debugSessions logs the session decisions while t runs and, if t fails,
+// every agent's sessions, so a failure on a CI runner explains itself.
+func debugSessions(t *testing.T, agents []*DataPlane) {
+	previous := slog.SetLogLoggerLevel(slog.LevelDebug)
+	t.Cleanup(func() {
+		slog.SetLogLoggerLevel(previous)
+		if !t.Failed() {
+			return
+		}
+		for i, agent := range agents {
+			if agent == nil {
+				continue
+			}
+			agent.sessions.mu.Lock()
+			t.Logf("agent %d: %d ingress, %d egress, %d ended, %d relays", i, len(agent.sessions.ingress), len(agent.sessions.egress), len(agent.sessions.ended), len(agent.sessions.relays))
+			id := func(key sessionKey) string { text, _ := key.conn.MarshalText(); return string(text) }
+			for key, entry := range agent.sessions.ingress {
+				state := "no end"
+				if entry.end != nil {
+					state = entry.end.DebugState()
+				}
+				t.Logf("agent %d ingress %s: %s", i, id(key), state)
+			}
+			for key, entry := range agent.sessions.egress {
+				state := "no end"
+				if entry.end != nil {
+					state = entry.end.DebugState()
+				}
+				t.Logf("agent %d egress %s: %s", i, id(key), state)
+			}
+			for key, tomb := range agent.sessions.ended {
+				t.Logf("agent %d ended %s at %s clean=%t", i, id(key), tomb.at.Format(time.RFC3339Nano), tomb.clean)
+			}
+			agent.sessions.mu.Unlock()
+		}
+	})
 }

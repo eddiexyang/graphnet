@@ -5,10 +5,14 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net"
 	"os"
+	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -477,6 +481,33 @@ type End struct {
 	done     bool
 	closed   bool
 	err      error
+
+	// debug identifies the end in debug logs, as the session ID and role.
+	debug []any
+}
+
+// SetDebugAttrs names this end in its debug logs.
+func (e *End) SetDebugAttrs(attrs ...any) {
+	e.mu.Lock()
+	e.debug = attrs
+	e.mu.Unlock()
+}
+
+func debugEnabled() bool { return slog.Default().Enabled(context.Background(), slog.LevelDebug) }
+
+// debugLocked logs a decision about the session at debug level.
+func (e *End) debugLocked(msg string, attrs ...any) {
+	if debugEnabled() {
+		slog.Debug(msg, append(append([]any{}, e.debug...), attrs...)...)
+	}
+}
+
+// DebugState describes the end for a test failure report.
+func (e *End) DebugState() string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return fmt.Sprintf("%v gen=%d done=%t err=%v eof=%t ended=%t read=%d hop=%t replacement=%t busy=%t closed=%t orphan=%s",
+		e.debug, e.gen, e.done, e.err, e.eof, e.ended, e.read, e.hop != nil, e.replacement != nil, e.busy, e.closed, e.orphan.Format(time.RFC3339Nano))
 }
 
 func newEnd(parent context.Context, counters *Counters) *End {
@@ -826,6 +857,7 @@ func (e *End) rebuild() {
 			e.mu.Unlock()
 			return
 		}
+		e.debugLocked("TCP session chain rebuild failed", "err", err, "gen", e.gen, "rerouted", rerouted)
 		if errors.Is(err, ErrUnknownSession) || errors.Is(err, ErrLegacy) || errors.Is(err, errNoPath) || errors.Is(err, ErrSessionReset) {
 			e.finishLocked(err)
 			e.busy = false
@@ -978,6 +1010,10 @@ func (e *End) errLocked() error {
 func (e *End) finishLocked(err error) {
 	if e.done {
 		return
+	}
+	if debugEnabled() {
+		_, file, line, _ := runtime.Caller(1)
+		e.debugLocked("TCP session end finished", "err", err, "gen", e.gen, "eof", e.eof, "ended", e.ended, "read", e.read, "at", fmt.Sprintf("%s:%d", filepath.Base(file), line))
 	}
 	e.done, e.err = true, err
 	if e.hop != nil && err != nil {
