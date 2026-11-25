@@ -328,6 +328,23 @@ func (r *DataPlane) OpenEmbeddedTCP(ctx context.Context, network model.ID, from,
 		return nil, forwarding.ErrSource
 	}
 	next, local, err := state.router.TCPNextHop(network, from, to)
+	// A route can exist before the Link to its next hop is up, and briefly
+	// disappear while link state converges. Until a Link decides the
+	// carriage, a SYN sent as packets would only be lost and retransmitted a
+	// second later: wait for streams or a packet-only Link.
+	for wait := 10 * time.Millisecond; errors.Is(err, forwarding.ErrUnreachable) || err == nil && !local && !state.mesh.StreamCarrier(network, next) && !state.mesh.PacketsOnly(network, next); wait = min(2*wait, embeddedRetryMin) {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-r.ctx.Done():
+			return nil, net.ErrClosed
+		case <-time.After(wait):
+		}
+		if state = r.state.Load(); state == nil {
+			return nil, net.ErrClosed
+		}
+		next, local, err = state.router.TCPNextHop(network, from, to)
+	}
 	if err != nil || local || !state.mesh.StreamCarrier(network, next) {
 		return nil, nil
 	}
