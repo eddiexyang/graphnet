@@ -41,6 +41,11 @@ func (l LSA) maxAge() time.Duration {
 func (n *network) supportsSync() bool {
 	for _, peer := range n.syncMembers {
 		en, ok := n.db[peer]
+		if !ok && n.isClient(peer) {
+			// An offline client leaf carries nothing for the component; it
+			// gets the database again when it returns.
+			continue
+		}
 		if !ok || !en.lsa.Sync {
 			return false
 		}

@@ -10,6 +10,34 @@ import (
 	"github.com/eddiexyang/graphnet/internal/testutil"
 )
 
+// clientLab starts every node with D as a client leaf, except those in skip.
+func clientLab(t *testing.T, skip ...model.ID) *lab {
+	l := newLab(t, nodeA, nodeB, nodeC, nodeD)
+	l.state.Networks[0].Nodes[3].Client = true
+	skipped := map[model.ID]bool{}
+	for _, id := range skip {
+		skipped[id] = true
+	}
+	for _, node := range l.state.Networks[0].Nodes {
+		if !skipped[node.ID] {
+			l.start(node)
+		}
+	}
+	return l
+}
+
+// An offline client leaf does not hold its component on the legacy cadence.
+func TestOfflineClientKeepsComponentOnSync(t *testing.T) {
+	l := clientLab(t, nodeD)
+	l.run(2 * time.Second)
+	netID := l.state.Networks[0].ID
+	for _, id := range []model.ID{nodeA, nodeB, nodeC} {
+		if !l.engines[id].networks[netID].supportsSync() {
+			t.Fatalf("%s fell back to the legacy cadence for an offline client", id)
+		}
+	}
+}
+
 // An edge named by an advertisement that arrived before the revision adding
 // it is usable as soon as that revision is configured.
 func TestConfigureRefiltersRetainedAdvertisements(t *testing.T) {
