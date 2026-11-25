@@ -37,6 +37,8 @@ type clientNetwork struct {
 	db       *store.Store
 	ca       *pki.Authority
 	port     string
+	// accepted counts connections to the controller.
+	accepted *atomic.Int64
 }
 
 func startClientNetwork(t *testing.T, ctx context.Context, clientKey ed25519.PrivateKey, initialKey ed25519.PublicKey, carrier model.Transport) *clientNetwork {
@@ -110,7 +112,8 @@ func startClientNetwork(t *testing.T, ctx context.Context, clientKey ed25519.Pri
 	if err != nil {
 		t.Fatal(err)
 	}
-	tunnel := controltransport.NewServer(rawListener, server, tlsConfig)
+	cn.accepted = new(atomic.Int64)
+	tunnel := controltransport.NewServer(countingListener{rawListener, cn.accepted}, server, tlsConfig)
 	go tunnel.Serve()
 	t.Cleanup(func() {
 		tunnel.Close()
@@ -437,3 +440,50 @@ func TestUnifiedEphemeralPortAllocationAcrossStreamAndPacketTCP(t *testing.T) {
 		t.Fatal("releasing packet-mode port released stream-mode port")
 	}
 }
+
+type countingListener struct {
+	net.Listener
+	accepted *atomic.Int64
+}
+
+func (l countingListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err == nil {
+		l.accepted.Add(1)
+	}
+	return conn, err
+}
+
+// A client behind an HTTPS gateway reuses the connection that registered it
+// for its control session's requests. The control WebSocket itself needs its
+// own: net/http keeps upgrade requests in a separate idle pool.
+func TestClientControlReusesRegistrationConnection(t *testing.T) {
+	_, clientKey, _ := ed25519.GenerateKey(rand.Reader)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cn := startClientNetwork(t, ctx, clientKey, clientKey.Public().(ed25519.PublicKey), model.TCP)
+	cn.serveEcho(t, 2, 7)
+	c, err := Start(ctx, Config{
+		Server:     "https://controller.graphnet.test:" + cn.port,
+		CA:         cn.ca.PEM,
+		PrivateKey: clientKey,
+		Lookup: func(context.Context, string, string) ([]netip.Addr, error) {
+			return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	dialCtx, stop := context.WithTimeout(ctx, 20*time.Second)
+	conn, err := c.DialTCP(dialCtx, netip.AddrPortFrom(cn.state.Networks[0].Nodes[2].Address, 7))
+	stop()
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.Close()
+	if got := cn.accepted.Load(); got > 2 {
+		t.Fatalf("client opened %d connections to the controller, want 2", got)
+	}
+}
+

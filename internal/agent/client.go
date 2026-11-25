@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -45,6 +46,10 @@ type Options struct {
 	GatewayRoots *x509.CertPool
 	Version      string
 	Logger       *slog.Logger
+
+	// CA is the PEM behind Roots, when it is a pinned controller CA. It lets
+	// the control session reuse the connection that registered the Agent.
+	CA []byte
 }
 
 type Client struct {
@@ -66,6 +71,10 @@ type Client struct {
 	pendingUpdate       *model.UpdateRequest
 	fallbackTried       bool // Run-only state
 	fallbackRunning     bool
+
+	// transportKey identifies what transport was built from; a control
+	// target that would build the same one reuses it and its connections.
+	transportKey string
 }
 
 func serverURL(raw string) (string, error) {
@@ -142,7 +151,15 @@ func NewClient(cache *Cache, runtime Runtime, options Options) (*Client, error) 
 		// saved by an earlier process. Successful connections retain normal affinity.
 		last = ""
 	}
-	return &Client{configuredServer: configuredServer, lastTarget: last, failedTargets: map[string]bool{}, cache: cache, reconcile: NewReconciler(cache, runtime), options: options, server: server, http: client, transport: transport, endpointsChanged: make(chan struct{}, 1)}, nil
+	key := ""
+	if tunnelTransport(options.ServerTransport) {
+		ca := options.CA
+		if existing != nil && len(existing.CA) > 0 {
+			ca = existing.CA
+		}
+		key = transportKey(options.ServerTransport, server, "", true, ca, nil)
+	}
+	return &Client{configuredServer: configuredServer, lastTarget: last, failedTargets: map[string]bool{}, cache: cache, reconcile: NewReconciler(cache, runtime), options: options, server: server, http: client, transport: transport, transportKey: key, endpointsChanged: make(chan struct{}, 1)}, nil
 }
 func (c *Client) Close() { c.transport.CloseIdleConnections() }
 
@@ -712,10 +729,28 @@ func (c *Client) selectTarget() (controlTarget, error) {
 		roots = x509.NewCertPool()
 		roots.AppendCertsFromPEM(reg.CA)
 	}
-	c.transport.CloseIdleConnections()
 	c.signer = nil
+	gateway := selected.transport == "https" || selected.transport == "wss" && selected.origin == c.configuredServer
+	ca := reg.CA
+	if len(ca) == 0 {
+		ca = c.options.CA
+	}
+	key := transportKey(selected.transport, selected.origin, selected.tlsName, gateway, ca, certificates)
+	if key != "" && key == c.transportKey {
+		// The same entrance, carrier and identities as the transport that
+		// registered: keep its connection instead of opening another tunnel.
+		c.transport.TLSHandshakeTimeout, c.transport.ResponseHeaderTimeout, c.transport.MaxIdleConnsPerHost = 3*time.Second, 4*time.Second, 2
+		if reg.KeyOnly() {
+			c.signer = &challengeSigner{id: reg.AgentID, key: c.cache.PrivateKey()}
+		}
+		c.http.Transport = c.roundTripper(c.transport)
+		c.server = selected.origin
+		return *selected, nil
+	}
+	c.transport.CloseIdleConnections()
+	c.transportKey = key
 	dial := controltransport.DialContext(selected.transport, roots, selected.tlsName)
-	if selected.transport == "https" || selected.transport == "wss" && selected.origin == c.configuredServer {
+	if gateway {
 		// The configured entrance is a gateway: the outer TLS is the
 		// gateway's own certificate, and the controller is verified above
 		// the tunnel by its pinned CA below.
@@ -736,4 +771,23 @@ func (c *Client) selectTarget() (controlTarget, error) {
 	c.http.Transport = c.roundTripper(c.transport)
 	c.server = selected.origin
 	return *selected, nil
+}
+
+// transportKey names the inputs of a control transport, or "" when the CA
+// behind its roots is not known, which never matches.
+func transportKey(kind, origin, tlsName string, gateway bool, ca []byte, certificates []tls.Certificate) string {
+	if len(ca) == 0 {
+		return ""
+	}
+	h := sha256.New()
+	for _, field := range []string{kind, origin, tlsName, strconv.FormatBool(gateway), string(ca)} {
+		h.Write([]byte(field))
+		h.Write([]byte{0})
+	}
+	for _, cert := range certificates {
+		for _, der := range cert.Certificate {
+			h.Write(der)
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }

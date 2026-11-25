@@ -57,7 +57,7 @@ func (s *challengeSigner) challenge(orig *http.Request) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("agent challenge: %w", err)
 	}
-	defer resp.Body.Close()
+	defer closeDrained(resp.Body)
 	if resp.StatusCode != 200 {
 		return "", fmt.Errorf("agent challenge: HTTP %d", resp.StatusCode)
 	}
@@ -71,4 +71,12 @@ func (s *challengeSigner) challenge(orig *http.Request) (string, error) {
 		return "", errors.New("agent challenge: empty challenge")
 	}
 	return body.Challenge, nil
+}
+
+// closeDrained reads what a decoder left of a response, such as the newline
+// after a JSON value, before closing it: a body closed unread costs the
+// connection, and a gateway tunnel then has to be built again.
+func closeDrained(body io.ReadCloser) {
+	_, _ = io.Copy(io.Discard, io.LimitReader(body, 4096))
+	body.Close()
 }

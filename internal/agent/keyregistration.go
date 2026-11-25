@@ -28,7 +28,7 @@ func (c *Client) keyRegistration(ctx context.Context) (*Registration, error) {
 	if err != nil {
 		return nil, &unreachableError{fmt.Errorf("register by public key: %w", err)}
 	}
-	defer resp.Body.Close()
+	defer closeDrained(resp.Body)
 	if gatewayFailure(resp.StatusCode) {
 		return nil, &unreachableError{fmt.Errorf("register by public key: controller unavailable: HTTP %d", resp.StatusCode)}
 	}
