@@ -124,3 +124,43 @@ func ipChecksum(raw []byte) uint16 {
 	}
 	return ^uint16(sum)
 }
+
+// TCPSeq returns the sequence number of a validated TCP packet.
+func TCPSeq(raw []byte) (uint32, bool) {
+	offset := tcpOffset(raw)
+	if offset < 0 || offset+8 > len(raw) {
+		return 0, false
+	}
+	return binary.BigEndian.Uint32(raw[offset+4 : offset+8]), true
+}
+
+// SYNHeader rebuilds the IP and TCP headers of a SYN from from to to, as an
+// ICMP error quotes them, for a hop that has the connection but not the
+// packet.
+func SYNHeader(from, to netip.AddrPort, seq uint32, hopLimit uint8) []byte {
+	tcp := make([]byte, 20)
+	binary.BigEndian.PutUint16(tcp[0:2], from.Port())
+	binary.BigEndian.PutUint16(tcp[2:4], to.Port())
+	binary.BigEndian.PutUint32(tcp[4:8], seq)
+	tcp[12] = 5 << 4
+	tcp[13] = TCPSyn
+	if from.Addr().Is4() {
+		ip := make([]byte, 20, 40)
+		ip[0] = 0x45
+		binary.BigEndian.PutUint16(ip[2:4], 40)
+		ip[8], ip[9] = hopLimit, 6
+		src, dst := from.Addr().As4(), to.Addr().As4()
+		copy(ip[12:16], src[:])
+		copy(ip[16:20], dst[:])
+		binary.BigEndian.PutUint16(ip[10:12], ipChecksum(ip))
+		return append(ip, tcp...)
+	}
+	ip := make([]byte, 40, 60)
+	ip[0] = 0x60
+	binary.BigEndian.PutUint16(ip[4:6], 20)
+	ip[6], ip[7] = 6, hopLimit
+	src, dst := from.Addr().As16(), to.Addr().As16()
+	copy(ip[8:24], src[:])
+	copy(ip[24:40], dst[:])
+	return append(ip, tcp...)
+}

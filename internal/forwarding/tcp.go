@@ -119,7 +119,10 @@ func (r *Router) AdmitsLocal(networkID model.ID, ip netip.Addr) bool {
 	return n.admits(n.byAddress[n.self.Address], ip)
 }
 
-func (r *Router) TCPRequest(networkID model.ID, from, to netip.AddrPort) (streamproxy.Request, error) {
+// TCPRequest describes a connection entering a stream here. hops is what the
+// first relay may still spend, as the IP hop limit its SYN would carry there;
+// zero uses the default for a connection without a SYN (an embedded dial).
+func (r *Router) TCPRequest(networkID model.ID, from, to netip.AddrPort, hops uint8, seq uint32) (streamproxy.Request, error) {
 	n := r.state.Load().networks[networkID]
 	if n == nil {
 		return streamproxy.Request{}, ErrNetwork
@@ -138,8 +141,22 @@ func (r *Router) TCPRequest(networkID model.ID, from, to netip.AddrPort) (stream
 	if err != nil {
 		return streamproxy.Request{}, err
 	}
-	request := streamproxy.Request{Network: networkID, Source: source.id, Destination: dest.id, From: from, To: to, Hops: packet.DefaultHopLimit}
+	if hops == 0 {
+		hops = packet.DefaultHopLimit
+	}
+	request := streamproxy.Request{Network: networkID, Source: source.id, Destination: dest.id, From: from, To: to, Hops: hops, Seq: seq}
 	return request, request.Validate()
+}
+
+// TCPTimeExceeded answers the source of a stream whose hop limit ended here
+// with ICMP Time Exceeded from this Node, quoting its SYN, as a router answers
+// a packet whose TTL ends.
+func (r *Router) TCPTimeExceeded(ctx context.Context, request streamproxy.Request) error {
+	n := r.state.Load().networks[request.Network]
+	if n == nil {
+		return ErrNetwork
+	}
+	return r.timeExceeded(ctx, n, packet.SYNHeader(request.From, request.To, request.Seq, 1))
 }
 
 // TCPRoute uses the same weighted/live table and address ownership as datagrams.

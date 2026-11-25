@@ -35,6 +35,10 @@ type flowKey struct{ client, server netip.AddrPort }
 type flowState struct {
 	established bool
 	since       time.Time
+	// hops and seq describe a captured SYN: the hop limit its stream starts
+	// with and the sequence number an ICMP error would quote.
+	hops uint8
+	seq  uint32
 }
 
 // tcpFlows lists connections the local TCP stack owns. Their packets go to the
@@ -65,11 +69,34 @@ func (f *tcpFlows) add(client, server netip.AddrPort, established bool) {
 		}
 	}
 	key := flowKey{client, server}
-	if s, ok := f.flows[key]; ok && s.established && !established {
+	previous, ok := f.flows[key]
+	if ok && previous.established && !established {
 		return
 	}
-	f.flows[key] = flowState{established, now}
+	// The stack accepting a captured SYN keeps what the SYN carried.
+	f.flows[key] = flowState{established: established, since: now, hops: previous.hops, seq: previous.seq}
 }
+
+// addSYN records a captured SYN, pending until the stack accepts it.
+func (f *tcpFlows) addSYN(client, server netip.AddrPort, hops uint8, seq uint32) {
+	f.add(client, server, false)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if s, ok := f.flows[flowKey{client, server}]; ok && !s.established {
+		s.hops, s.seq = hops, seq
+		f.flows[flowKey{client, server}] = s
+	}
+}
+
+// syn returns the hop limit and sequence number of the SYN that opened a
+// connection, or zeros when none was captured.
+func (f *tcpFlows) syn(client, server netip.AddrPort) (uint8, uint32) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s := f.flows[flowKey{client, server}]
+	return s.hops, s.seq
+}
+
 func (f *tcpFlows) remove(client, server netip.AddrPort) {
 	f.mu.Lock()
 	delete(f.flows, flowKey{client, server})
@@ -90,6 +117,7 @@ func (f *tcpFlows) has(source, destination netip.AddrPort) bool {
 // only when the Edge toward its destination carries streams; otherwise its
 // packets are forwarded as they are. next is empty when not yet routed.
 func (r *DataPlane) captureTCP(state *runtimeState, network model.ID, raw []byte, next model.ID) bool {
+	fromTUN := next == ""
 	tcp := state.tcp[network]
 	if tcp == nil {
 		return false
@@ -114,7 +142,15 @@ func (r *DataPlane) captureTCP(state *runtimeState, network model.ID, raw []byte
 	if !state.mesh.StreamCarrier(network, next) {
 		return false
 	}
-	tcp.flows.add(source, destination, false)
+	// A SYN from the local TUN is at its source, which spends no hop in the
+	// packet path; a transit SYN already spent this Node's. Either way the
+	// stream carries the hop limit the next relay would see.
+	hops := packet.IPHopLimit(raw)
+	if fromTUN {
+		hops = uint8(min(int(hops)+1, 255))
+	}
+	seq, _ := packet.TCPSeq(raw)
+	tcp.flows.addSYN(source, destination, hops, seq)
 	return true
 }
 
@@ -186,7 +222,8 @@ func (r *DataPlane) newTCP(network model.ID, fingerprint string, mtu int, offloa
 		if state == nil || state.tcp[network] == nil || state.tcp[network].engine != engine {
 			return nil, net.ErrClosed
 		}
-		request, err := state.router.TCPRequest(network, from, to)
+		hops, seq := state.tcp[network].flows.syn(from, to)
+		request, err := state.router.TCPRequest(network, from, to, hops, seq)
 		if err != nil {
 			if noRoute(err) {
 				err = fmt.Errorf("%w: %w", streamproxy.ErrNoRoute, err)
@@ -294,7 +331,7 @@ func (r *DataPlane) OpenEmbeddedTCP(ctx context.Context, network model.ID, from,
 	if err != nil || local || !state.mesh.StreamCarrier(network, next) {
 		return nil, nil
 	}
-	request, err := state.router.TCPRequest(network, from, to)
+	request, err := state.router.TCPRequest(network, from, to, 0, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -344,7 +381,7 @@ func (r *DataPlane) openTCP(ctx context.Context, request streamproxy.Request, in
 	}
 	next, local, err := state.router.TCPRoute(request, ingress)
 	if err != nil {
-		return nil, err
+		return nil, r.hopLimit(ctx, state, request, err)
 	}
 	if !local {
 		waitStreams(ctx, state, request.Network, next)
@@ -381,7 +418,7 @@ func (r *DataPlane) openTCP(ctx context.Context, request streamproxy.Request, in
 			return err
 		}
 		if response[0] != 0 {
-			return errors.New("TCP stream target refused")
+			return streamproxy.ResponseError(response[0])
 		}
 		return nil
 	})
@@ -523,7 +560,11 @@ func (r *DataPlane) acceptTCP(parent context.Context, network, remote model.ID, 
 		}
 		target, err = r.openTCP(ctx, request, remote)
 		if err != nil {
-			s.Write([]byte{1})
+			status := byte(streamproxy.StatusRefused)
+			if errors.Is(err, streamproxy.ErrHopLimit) {
+				status = streamproxy.StatusHopLimit
+			}
+			s.Write([]byte{status})
 			return err
 		}
 		_, err = s.Write([]byte{0})
@@ -540,4 +581,14 @@ func (r *DataPlane) acceptTCP(parent context.Context, network, remote model.ID, 
 		return
 	}
 	streamproxy.Relay(parent, s, target)
+}
+
+// hopLimit answers the source of a stream whose hop limit ended at this relay
+// with ICMP Time Exceeded, and reports it as ErrHopLimit; other errors pass.
+func (r *DataPlane) hopLimit(ctx context.Context, state *runtimeState, request streamproxy.Request, err error) error {
+	if !errors.Is(err, packet.ErrHopLimit) {
+		return err
+	}
+	_ = state.router.TCPTimeExceeded(ctx, request)
+	return streamproxy.ErrHopLimit
 }

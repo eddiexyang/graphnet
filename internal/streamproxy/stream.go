@@ -26,6 +26,9 @@ type Request struct {
 	From        netip.AddrPort `json:"from"`
 	To          netip.AddrPort `json:"to"`
 	Hops        uint8          `json:"hops"`
+	// Seq is the SYN's sequence number, which an ICMP error quotes when a hop
+	// ends the connection's hop limit.
+	Seq uint32 `json:"seq,omitempty"`
 	// A chain of a resumable session names the session and its generation;
 	// its downstream bytes start at Down and its upstream bytes at Up. See
 	// session.go.

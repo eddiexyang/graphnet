@@ -32,7 +32,7 @@ func TestTCPStreamAdmissionAndRoutes(t *testing.T) {
 		routers[node.ID] = r
 	}
 	a, b, c := n.Nodes[0].ID, n.Nodes[1].ID, n.Nodes[2].ID
-	request, err := routers[a].TCPRequest(n.ID, netip.MustParseAddrPort("10.42.0.1:34567"), netip.MustParseAddrPort("10.42.0.3:443"))
+	request, err := routers[a].TCPRequest(n.ID, netip.MustParseAddrPort("10.42.0.1:34567"), netip.MustParseAddrPort("10.42.0.3:443"), 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

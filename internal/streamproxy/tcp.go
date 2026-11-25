@@ -241,7 +241,9 @@ func (e *Engine) forward(request *tcp.ForwarderRequest) {
 	remote, err := e.open(ctx, from, to)
 	cancel()
 	if err != nil {
-		request.Complete(!errors.Is(err, ErrNoRoute))
+		// A SYN without a route or out of hops is dropped, not reset: the
+		// client retransmits, or a hop already sent it ICMP Time Exceeded.
+		request.Complete(!errors.Is(err, ErrNoRoute) && !errors.Is(err, ErrHopLimit))
 		return
 	}
 	defer remote.Close()

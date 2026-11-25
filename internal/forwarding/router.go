@@ -591,14 +591,15 @@ func (r *Router) fromPeer(ctx context.Context, peerID model.ID, frame []byte, de
 	if nextHop == peerID {
 		return fmt.Errorf("route would return packet to ingress neighbor")
 	}
+	// The hop limit ends here before a stream could carry the packet on.
+	if packet.IPHopLimit(raw) <= 1 {
+		return r.timeExceeded(ctx, n, raw)
+	}
 	if intercept := r.tcpIntercept.Load(); intercept != nil && packet.IsTCP(raw) && (*intercept)(n.id, raw, nextHop) {
 		return nil
 	}
 	if packet.IsTCP(raw) && r.carriesTCP(n.id, nextHop) {
 		return r.refuseTCP(ctx, n, raw, source, destination)
-	}
-	if packet.IPHopLimit(raw) <= 1 {
-		return r.timeExceeded(ctx, n, raw)
 	}
 	if forward != nil {
 		frame[3]--

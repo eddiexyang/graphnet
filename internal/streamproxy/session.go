@@ -58,12 +58,19 @@ const (
 	// StatusEnded: the egress ended the session after each end delivered the
 	// other's end, so the asking end lacks only that news.
 	StatusEnded = 7
+	// StatusHopLimit: a hop exhausted the SYN's hop limit and sent ICMP Time
+	// Exceeded to the source; the SYN is dropped, as a router drops it.
+	StatusHopLimit = 8
 )
 
 var ErrLegacy = errors.New("a hop does not support resumable TCP")
 var ErrUnknownSession = errors.New("egress has no such TCP session")
 var ErrStaleGen = errors.New("TCP session generation superseded")
 var ErrSessionEnded = errors.New("egress ended the TCP session")
+
+// ErrHopLimit is a connection whose SYN ran out of hops on the way; the hop
+// answered the source with ICMP Time Exceeded.
+var ErrHopLimit = errors.New("TCP connection exceeded its hop limit")
 
 // ErrNoRoute is a connection that has no path for now. As for a packet with
 // no route, its SYN is dropped rather than answered, so the client retries.
@@ -104,6 +111,8 @@ func ResponseError(status byte) error {
 		return ErrNoRoute
 	case StatusEnded:
 		return ErrSessionEnded
+	case StatusHopLimit:
+		return ErrHopLimit
 	default:
 		return errors.New("TCP stream target refused")
 	}

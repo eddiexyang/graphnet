@@ -312,6 +312,8 @@ func chainStatus(err error) byte {
 		return streamproxy.StatusUnknown
 	case errors.Is(err, streamproxy.ErrSessionEnded):
 		return streamproxy.StatusEnded
+	case errors.Is(err, streamproxy.ErrHopLimit):
+		return streamproxy.StatusHopLimit
 	default:
 		return streamproxy.StatusRefused
 	}
@@ -344,7 +346,7 @@ func (r *DataPlane) acceptChain(parent, ctx context.Context, network, remote mod
 	}
 	_, local, err := state.router.TCPRoute(request, remote)
 	if err != nil {
-		refuse(ctx, s, chainStatus(err))
+		refuse(ctx, s, chainStatus(r.hopLimit(ctx, state, request, err)))
 		return
 	}
 	if local {
