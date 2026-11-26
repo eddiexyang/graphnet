@@ -459,11 +459,15 @@ func (r *DataPlane) acceptEgress(parent, ctx context.Context, network, remote mo
 		conn.Close()
 		return
 	}
-	entry.end = streamproxy.NewEgress(r.ctx, hop, func(gen uint32) { r.askReplay(key, gen) }, &r.sessions.counters)
-	entry.end.SetDebugAttrs("session", key.conn, "role", "egress", "from", request.From, "to", request.To)
+	end := streamproxy.NewEgress(r.ctx, hop, func(gen uint32) { r.askReplay(key, gen) }, &r.sessions.counters)
+	end.SetDebugAttrs("session", key.conn, "role", "egress", "from", request.From, "to", request.To)
+	// The entry is already published: rerouteSessions reads end under the lock.
+	r.sessions.mu.Lock()
+	entry.end = end
+	r.sessions.mu.Unlock()
 	close(entry.ready)
-	streamproxy.Relay(parent, entry.end, conn)
-	<-entry.end.Done()
+	streamproxy.Relay(parent, end, conn)
+	<-end.Done()
 }
 
 func (r *DataPlane) endEgress(key sessionKey, entry *egressSession) {
