@@ -234,23 +234,55 @@ func (m *mux) newStreamLocked(id uint64, windowed bool) *muxStream {
 	return s
 }
 
+func (m *mux) edgeActive() *link.Link {
+	if m.g == nil || m.g.edge == nil {
+		return nil
+	}
+	return m.g.edge.Active()
+}
+
+// preferredActiveLocked returns the Edge's active Link when it is healthy and
+// ready for streams. It returns nil while the Edge is on a non-stream Link
+// (such as UDP), mid-switch, or holding an unhealthy Link, and avoids pulling
+// streams back onto an expiring Link once a fresh healthy Link is in use.
+func (m *mux) preferredActiveLocked(active *link.Link) *link.Link {
+	if active == nil || !m.ready[active] {
+		return nil
+	}
+	select {
+	case <-active.Done():
+		return nil
+	default:
+	}
+	if !active.Healthy() || active.RenewalDue() {
+		return nil
+	}
+	return active
+}
+
 // StreamsReady is called once per Link, possibly with the group lock held.
 // A Link only becomes current once Healthy() confirms liveness and size probes.
 func (m *mux) StreamsReady(l *link.Link) {
+	active := m.edgeActive()
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
 		return
 	}
 	m.ready[l] = true
-	switched := false
-	if l.Healthy() && (m.current == nil || !m.current.Healthy()) {
+	var wake *link.Link
+	if pref := m.preferredActiveLocked(active); pref != nil {
+		if m.current != pref {
+			m.switchLocked(pref)
+			wake = pref
+		}
+	} else if l.Healthy() && (m.current == nil || !m.current.Healthy()) {
 		m.switchLocked(l)
-		switched = true
+		wake = l
 	}
 	m.mu.Unlock()
-	if switched {
-		l.WakeStreams()
+	if wake != nil {
+		wake.WakeStreams()
 	}
 	go func() {
 		<-l.Done()
@@ -260,15 +292,23 @@ func (m *mux) StreamsReady(l *link.Link) {
 
 // LinkHealthy is called when a stream-capable Link becomes healthy or recovers.
 func (m *mux) LinkHealthy(l *link.Link) {
+	active := m.edgeActive()
 	m.mu.Lock()
-	switched := false
-	if !m.closed && m.ready[l] && l.Healthy() && (m.current == nil || !m.current.Healthy()) {
-		m.switchLocked(l)
-		switched = true
+	var wake *link.Link
+	if !m.closed {
+		if pref := m.preferredActiveLocked(active); pref != nil {
+			if m.current != pref {
+				m.switchLocked(pref)
+				wake = pref
+			}
+		} else if m.ready[l] && l.Healthy() && (m.current == nil || !m.current.Healthy()) {
+			m.switchLocked(l)
+			wake = l
+		}
 	}
 	m.mu.Unlock()
-	if switched {
-		l.WakeStreams()
+	if wake != nil {
+		wake.WakeStreams()
 	}
 	if m.g != nil {
 		m.g.wakeSchedule()
@@ -276,12 +316,16 @@ func (m *mux) LinkHealthy(l *link.Link) {
 }
 
 func (m *mux) linkDone(l *link.Link) {
+	active := m.edgeActive()
 	m.mu.Lock()
 	delete(m.ready, l)
 	var next *link.Link
 	if m.current == l {
 		m.current = nil
-		if next = m.bestLocked(); next != nil {
+		if pref := m.preferredActiveLocked(active); pref != nil {
+			m.switchLocked(pref)
+			next = pref
+		} else if next = m.bestLocked(); next != nil {
 			m.switchLocked(next)
 		} else {
 			m.lostSince = time.Now()
@@ -338,12 +382,19 @@ func (m *mux) streamCount() int {
 	return len(m.streams)
 }
 
-// maintain runs on the Edge scheduler. A Link stays in use while healthy and
-// not due for renewal, so streams do not move between Links needlessly.
+// maintain runs on the Edge scheduler. Streams follow the Edge's active Link
+// whenever it is healthy and stream-ready, and fall back immediately to another
+// healthy Link if the active Link fails or cannot carry streams.
 func (m *mux) maintain() {
+	active := m.edgeActive()
 	m.mu.Lock()
 	var wake *link.Link
-	if m.current == nil || !m.current.Healthy() || m.current.RenewalDue() {
+	if pref := m.preferredActiveLocked(active); pref != nil {
+		if m.current != pref {
+			m.switchLocked(pref)
+			wake = pref
+		}
+	} else if m.current == nil || !m.current.Healthy() || m.current.RenewalDue() {
 		if best := m.bestLocked(); best != nil && best != m.current && (m.current == nil || !m.current.Healthy() || !best.RenewalDue()) {
 			m.switchLocked(best)
 			wake = best

@@ -1092,3 +1092,337 @@ func TestTCPBackedIgnoresUnhealthyBackupWhenUDPActive(t *testing.T) {
 		t.Fatal("unhealthy backup TCP link marked Edge tcpBacked while healthy UDP link is active")
 	}
 }
+
+type controllableChannel struct {
+	*memChannel
+	dropped  *atomic.Bool
+	renewDue *atomic.Bool
+}
+
+func (c *controllableChannel) Send(ctx context.Context, raw []byte) error {
+	if c.dropped != nil && c.dropped.Load() {
+		return nil
+	}
+	return c.memChannel.Send(ctx, raw)
+}
+
+func (c *controllableChannel) RenewalDue(time.Duration) bool {
+	return c.renewDue != nil && c.renewDue.Load()
+}
+
+type coordinatedMuxHarness struct {
+	ctx       context.Context
+	edgeA     *link.Edge
+	edgeB     *link.Edge
+	muxA      *mux
+	muxB      *mux
+	acceptedB chan *muxStream
+}
+
+func newCoordinatedMuxHarness(t *testing.T) *coordinatedMuxHarness {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	edgeA := link.NewCoordinatedEdge(testutil.ID(3), testutil.ID(4), "")
+	edgeB := link.NewCoordinatedEdge(testutil.ID(4), testutil.ID(3), "")
+	gA := &group{ctx: ctx, edge: edgeA, links: map[string]*link.Link{}}
+	gB := &group{ctx: ctx, edge: edgeB, links: map[string]*link.Link{}}
+	acceptedB := make(chan *muxStream, 16)
+	gA.mux = newMux(gA, true, func(s *muxStream) { s.Abort() })
+	gB.mux = newMux(gB, false, func(s *muxStream) { acceptedB <- s })
+	t.Cleanup(func() { gA.mux.close(); gB.mux.close() })
+	return &coordinatedMuxHarness{
+		ctx:       ctx,
+		edgeA:     edgeA,
+		edgeB:     edgeB,
+		muxA:      gA.mux,
+		muxB:      gB.mux,
+		acceptedB: acceptedB,
+	}
+}
+
+func (h *coordinatedMuxHarness) addStreamLink(t *testing.T, candidate string, transport model.Transport) (*link.Link, *link.Link, *controllableChannel, *controllableChannel) {
+	t.Helper()
+	caRaw, cbRaw := memChannelPair()
+	dropped := &atomic.Bool{}
+	renewDue := &atomic.Bool{}
+	ca := &controllableChannel{memChannel: caRaw, dropped: dropped, renewDue: renewDue}
+	cb := &controllableChannel{memChannel: cbRaw, dropped: dropped, renewDue: renewDue}
+	oa, ob := linkOptions, linkOptions
+	oa.Streams, oa.SizeProbe, oa.Resume = h.muxA, true, true
+	ob.Accepted, ob.Streams, ob.StreamHello, ob.SizeProbe, ob.SizeProbeHello, ob.Resume = true, h.muxB, true, true, true, true
+	la, err := link.New(h.ctx, ca, link.Info{NetworkID: testutil.ID(1), EdgeID: testutil.ID(2), PeerID: testutil.ID(4), CandidateID: candidate, Transport: transport}, testHeaders{}, oa)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lb, err := link.New(h.ctx, cb, link.Info{NetworkID: testutil.ID(1), EdgeID: testutil.ID(2), PeerID: testutil.ID(3), CandidateID: candidate, Transport: transport}, testHeaders{}, ob)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { la.Close(); lb.Close() })
+	h.edgeA.Add(la)
+	h.edgeB.Add(lb)
+	go func() {
+		for {
+			select {
+			case <-h.ctx.Done():
+				return
+			case m := <-la.Selections():
+				h.edgeA.HandleSelection(la, m)
+			case m := <-lb.Selections():
+				h.edgeB.HandleSelection(lb, m)
+			}
+		}
+	}()
+	return la, lb, ca, cb
+}
+
+func (h *coordinatedMuxHarness) tick() {
+	h.edgeA.Tick()
+	h.edgeB.Tick()
+	h.muxA.maintain()
+	h.muxB.maintain()
+}
+
+func muxCurrent(m *mux) *link.Link {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.current
+}
+
+func TestMuxFollowsEdgeActiveFailoverAndPreferredSwitch(t *testing.T) {
+	h := newCoordinatedMuxHarness(t)
+	h.edgeA.SetPreferred("cand-a")
+	h.edgeB.SetPreferred("cand-a")
+
+	la1, lb1, ca1, _ := h.addStreamLink(t, "cand-a", model.WSS)
+	la2, lb2, ca2, _ := h.addStreamLink(t, "cand-b", model.WSS)
+
+	waitFor(t, "both links healthy and cand-a active", func() bool {
+		h.tick()
+		return la1.Healthy() && lb1.Healthy() && la2.Healthy() && lb2.Healthy() &&
+			h.edgeA.Active() == la1 && h.edgeB.Active() == lb1 &&
+			muxCurrent(h.muxA) == la1 && muxCurrent(h.muxB) == lb1
+	})
+
+	// Start a live stream and blackhole Active link A mid-transfer.
+	sA, err := h.muxA.Open(h.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	part1 := bytes.Repeat([]byte("A"), 64<<10)
+	part2 := bytes.Repeat([]byte("B"), 128<<10)
+	if _, err := sA.Write(part1); err != nil {
+		t.Fatal(err)
+	}
+	var sB *muxStream
+	select {
+	case sB = <-h.acceptedB:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for peer stream")
+	}
+	got1 := make([]byte, len(part1))
+	if _, err := io.ReadFull(sB, got1); err != nil || !bytes.Equal(got1, part1) {
+		t.Fatalf("part1 mismatch: err=%v", err)
+	}
+
+	// Blackhole A while sending part2: mux must fail over losslessly to B and
+	// both ends must converge onto B.
+	ca1.dropped.Store(true)
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := sA.Write(part2)
+		writeDone <- err
+	}()
+	stopTick := make(chan struct{})
+	go func() {
+		tk := time.NewTicker(20 * time.Millisecond)
+		defer tk.Stop()
+		for {
+			select {
+			case <-stopTick:
+				return
+			case <-tk.C:
+				h.tick()
+			}
+		}
+	}()
+	defer close(stopTick)
+
+	got2 := make([]byte, len(part2))
+	if _, err := io.ReadFull(sB, got2); err != nil || !bytes.Equal(got2, part2) {
+		t.Fatalf("part2 failed across blackhole failover: err=%v", err)
+	}
+	if err := <-writeDone; err != nil {
+		t.Fatalf("write failed across failover: %v", err)
+	}
+	waitFor(t, "edge and mux converge on cand-b", func() bool {
+		return h.edgeA.Active() == la2 && h.edgeB.Active() == lb2 &&
+			muxCurrent(h.muxA) == la2 && muxCurrent(h.muxB) == lb2
+	})
+
+	// Bring up fresh cand-c and switch PreferredCandidate to it: both edge and
+	// mux must move off B onto C, and new traffic must flow on C (not Standby B).
+	la3, lb3, ca3, _ := h.addStreamLink(t, "cand-c", model.WSS)
+	waitFor(t, "cand-c healthy", func() bool { return la3.Healthy() && lb3.Healthy() })
+	h.edgeA.SetPreferred("cand-c")
+	h.edgeB.SetPreferred("cand-c")
+	waitFor(t, "edge and mux switch to preferred cand-c", func() bool {
+		return h.edgeA.Active() == la3 && h.edgeB.Active() == lb3 &&
+			muxCurrent(h.muxA) == la3 && muxCurrent(h.muxB) == lb3
+	})
+
+	bBefore := ca2.streamKinds.Load()
+	cBefore := ca3.streamKinds.Load()
+	part3 := bytes.Repeat([]byte("C"), 64<<10)
+	if _, err := sA.Write(part3); err != nil {
+		t.Fatal(err)
+	}
+	got3 := make([]byte, len(part3))
+	if _, err := io.ReadFull(sB, got3); err != nil || !bytes.Equal(got3, part3) {
+		t.Fatalf("part3 failed after preferred switch: err=%v", err)
+	}
+	if ca3.streamKinds.Load() <= cBefore {
+		t.Fatal("traffic did not flow on newly active preferred link C")
+	}
+	if ca2.streamKinds.Load() != bBefore {
+		t.Fatalf("standby link B sent %d stream frames after switch to C", ca2.streamKinds.Load()-bBefore)
+	}
+}
+
+func TestMuxRealignsAfterActiveTransientBlip(t *testing.T) {
+	h := newCoordinatedMuxHarness(t)
+	h.edgeA.SetPreferred("cand-a")
+	h.edgeB.SetPreferred("cand-a")
+
+	la1, lb1, ca1, _ := h.addStreamLink(t, "cand-a", model.WSS)
+	la2, lb2, ca2, _ := h.addStreamLink(t, "cand-b", model.WSS)
+
+	waitFor(t, "both healthy and cand-a active", func() bool {
+		h.tick()
+		return la1.Healthy() && lb1.Healthy() && la2.Healthy() && lb2.Healthy() &&
+			h.edgeA.Active() == la1 && h.edgeB.Active() == lb1 &&
+			muxCurrent(h.muxA) == la1 && muxCurrent(h.muxB) == lb1
+	})
+
+	// Simulate muxA drifting onto standby B (as happens after a transient blip
+	// on A or a StreamsReady race) while edgeA.Active() remains A.
+	h.muxA.mu.Lock()
+	h.muxA.switchLocked(la2)
+	h.muxA.mu.Unlock()
+	if muxCurrent(h.muxA) != la2 {
+		t.Fatal("expected muxA on standby B")
+	}
+
+	h.muxA.maintain()
+	if muxCurrent(h.muxA) != la1 {
+		t.Fatalf("muxA stayed on standby link instead of realigning to active link A")
+	}
+
+	// Verify subsequent stream bytes flow exclusively on active link A.
+	aBefore := ca1.streamKinds.Load()
+	bBefore := ca2.streamKinds.Load()
+	sA, err := h.muxA.Open(h.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte("R"), 32<<10)
+	if _, err := sA.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	var sB *muxStream
+	select {
+	case sB = <-h.acceptedB:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for peer stream")
+	}
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(sB, got); err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("payload mismatch: err=%v", err)
+	}
+	if ca1.streamKinds.Load() <= aBefore {
+		t.Fatal("realigned active link A carried no stream frames")
+	}
+	if ca2.streamKinds.Load() != bBefore {
+		t.Fatalf("standby link B carried %d stream frames after realignment", ca2.streamKinds.Load()-bBefore)
+	}
+}
+
+func TestMuxKeepsStreamLinkWhenUDPActive(t *testing.T) {
+	h := newCoordinatedMuxHarness(t)
+	h.edgeA.SetPreferred("cand-udp")
+	h.edgeB.SetPreferred("cand-udp")
+
+	udpA, udpB := memChannelPair()
+	uOpts := linkOptions
+	luA, err := link.New(h.ctx, udpA, link.Info{NetworkID: testutil.ID(1), EdgeID: testutil.ID(2), PeerID: testutil.ID(4), CandidateID: "cand-udp", Transport: model.UDP}, testHeaders{}, uOpts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	luB, err := link.New(h.ctx, udpB, link.Info{NetworkID: testutil.ID(1), EdgeID: testutil.ID(2), PeerID: testutil.ID(3), CandidateID: "cand-udp", Transport: model.UDP}, testHeaders{}, uOpts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { luA.Close(); luB.Close() })
+	h.edgeA.Add(luA)
+	h.edgeB.Add(luB)
+	go func() {
+		for {
+			select {
+			case <-h.ctx.Done():
+				return
+			case m := <-luA.Selections():
+				h.edgeA.HandleSelection(luA, m)
+			case m := <-luB.Selections():
+				h.edgeB.HandleSelection(luB, m)
+			}
+		}
+	}()
+
+	ltA, ltB, _, _ := h.addStreamLink(t, "cand-tcp", model.TCP)
+	waitFor(t, "udp active and tcp ready", func() bool {
+		h.tick()
+		return luA.Healthy() && luB.Healthy() && ltA.Healthy() && ltB.Healthy() &&
+			h.edgeA.Active() == luA && h.edgeB.Active() == luB &&
+			muxCurrent(h.muxA) == ltA && muxCurrent(h.muxB) == ltB
+	})
+
+	// Repeated maintain ticks must keep mux on the healthy TCP link while UDP is Active.
+	for range 5 {
+		h.tick()
+		if muxCurrent(h.muxA) != ltA || muxCurrent(h.muxB) != ltB {
+			t.Fatal("mux abandoned healthy stream link when UDP link was Active")
+		}
+	}
+}
+
+func TestMuxDoesNotPullBackToRenewingActive(t *testing.T) {
+	h := newCoordinatedMuxHarness(t)
+	h.edgeA.SetPreferred("cand-a")
+	h.edgeB.SetPreferred("cand-a")
+
+	la1, lb1, ca1, _ := h.addStreamLink(t, "cand-a", model.WSS)
+	la2, lb2, _, _ := h.addStreamLink(t, "cand-b", model.WSS)
+
+	waitFor(t, "cand-a active and both ready", func() bool {
+		h.tick()
+		return la1.Healthy() && lb1.Healthy() && la2.Healthy() && lb2.Healthy() &&
+			h.edgeA.Active() == la1 && h.edgeB.Active() == lb1 &&
+			muxCurrent(h.muxA) == la1 && muxCurrent(h.muxB) == lb1
+	})
+
+	// Mark active link A as RenewalDue: mux moves to fresh link B and must not
+	// be pulled back onto expiring A while edgeA.Active() is still A.
+	ca1.renewDue.Store(true)
+	h.muxA.maintain()
+	if muxCurrent(h.muxA) != la2 {
+		t.Fatal("muxA did not move off renewing link A to fresh link B")
+	}
+	if h.edgeA.Active() != la1 {
+		t.Fatal("expected edgeA.Active() to still be A before edge tick")
+	}
+	h.muxA.maintain()
+	if muxCurrent(h.muxA) != la2 {
+		t.Fatal("muxA pulled streams back onto renewing active link A")
+	}
+}

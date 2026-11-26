@@ -651,6 +651,7 @@ func (g *group) register(channel *peer.Channel, candidate link.Candidate, pathEx
 			select {
 			case message := <-l.Selections():
 				g.edge.HandleSelection(l, message)
+				g.wakeSchedule()
 			case message := <-l.Retirements():
 				g.handleRetirement(l, message)
 			case <-l.Done():
