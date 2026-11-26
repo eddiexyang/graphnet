@@ -81,7 +81,7 @@ func (p Packet) AppendBinary(dst []byte) ([]byte, error) {
 }
 
 // PutHeader writes a header for payloadLen bytes into out[:HeaderSize], with
-// zero Epoch, Flow and Sequence, which receivers do not use. Compact Links use
+// zero Epoch, Flow and Sequence, which receivers do not use. Links use
 // it to rebuild the header that the sender omitted.
 func PutHeader(out []byte, network, source, destination [16]byte, hopLimit uint8, payloadLen int) {
 	out = out[:HeaderSize]

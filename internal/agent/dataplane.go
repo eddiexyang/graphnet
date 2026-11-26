@@ -210,7 +210,7 @@ func (r *DataPlane) Apply(ctx context.Context, snapshot model.Snapshot) error {
 		if r.options.Embedded {
 			port = 0
 		}
-		next.mesh, err = mesh.NewWithOptions(r.ctx, r.identity, r.options.BindHost, port, r.receive, mesh.Options{
+		next.mesh, err = mesh.NewWithOptions(r.ctx, r.identity, r.options.BindHost, port, r.receiveBatch, headers{r}, mesh.Options{
 			QUIC: transport.QUICOptions{
 				MaxStreamReceiveWindow:     r.options.QUICStreamReceiveWindow,
 				MaxConnectionReceiveWindow: r.options.QUICConnectionReceiveWindow,
@@ -220,7 +220,7 @@ func (r *DataPlane) Apply(ctx context.Context, snapshot model.Snapshot) error {
 			OriginTLS:       r.options.OriginTLS,
 			WebSocketRoots:     r.options.WebSocketRoots,
 			PreferredTransport: r.options.PreferredTransport,
-		}, r.receiveBatch)
+		})
 		if err != nil {
 			return fmt.Errorf("listen for peers: %w", err)
 		}
@@ -229,7 +229,6 @@ func (r *DataPlane) Apply(ctx context.Context, snapshot model.Snapshot) error {
 			next.mesh.DisableResume()
 		}
 		next.mesh.EnableLinkState(r.linkStateHandler())
-		next.mesh.EnableCompact(compactor{r})
 		newMesh = true
 	}
 	forwardingSnapshot := carryLiveRoutes(snapshot, r.lastRoutes)
@@ -444,36 +443,14 @@ func (r *DataPlane) readTunnel(network model.ID, device *runtimeTunnel) {
 	}
 }
 
-// compactHeader expands compact Link frames against the active forwarding
-// table; frames arriving before the first table is published are dropped.
-// compactor maps compact frames to the active forwarding table.
-type compactor struct{ r *DataPlane }
+// headers rebuilds the packet headers of IP messages against the active
+// forwarding table; messages arriving before the first table is published are
+// dropped.
+type headers struct{ r *DataPlane }
 
-func (c compactor) Expand(header []byte, network [16]byte, hopLimit uint8, payload []byte) bool {
-	state := c.r.state.Load()
-	return state != nil && state.router.CompactHeader(header, network, hopLimit, payload)
-}
-
-func (c compactor) Index(network, node [16]byte) (uint16, bool) {
-	if state := c.r.state.Load(); state != nil {
-		return state.router.CompactIndex(network, node)
-	}
-	return 0, false
-}
-
-func (c compactor) Node(network [16]byte, index uint16) ([16]byte, bool) {
-	if state := c.r.state.Load(); state != nil {
-		return state.router.CompactNode(network, index)
-	}
-	return [16]byte{}, false
-}
-
-func (r *DataPlane) receive(ctx context.Context, remote model.ID, frame []byte) error {
-	state := r.state.Load()
-	if state == nil {
-		return errors.New("agent runtime is not configured")
-	}
-	return state.router.FromPeer(ctx, remote, frame)
+func (h headers) Rebuild(header []byte, network [16]byte, hopLimit uint8, payload []byte) bool {
+	state := h.r.state.Load()
+	return state != nil && state.router.RebuildHeader(header, network, hopLimit, payload)
 }
 func (r *DataPlane) deliver(ctx context.Context, network model.ID, raw []byte) error {
 	state := r.state.Load()

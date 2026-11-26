@@ -42,7 +42,7 @@ func TestAdvertisedSubnetForwarding(t *testing.T) {
 		snapshots[node.ID] = snapshot
 		r, err := forwarding.New(snapshot, func(ctx context.Context, network, next model.ID, frame []byte) error {
 			hops = append(hops, next)
-			return routers[next].FromPeer(ctx, node.ID, frame)
+			return fromPeer(routers[next], ctx, node.ID, frame)
 		}, func(_ context.Context, _ model.ID, _ []byte) error { delivered = node.ID; return nil })
 		if err != nil {
 			t.Fatal(err)
@@ -67,7 +67,7 @@ func TestAdvertisedSubnetForwarding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := routers[b].FromPeer(ctx, c, forged); !errors.Is(err, forwarding.ErrSource) {
+	if err := fromPeer(routers[b], ctx, c, forged); !errors.Is(err, forwarding.ErrSource) {
 		t.Fatalf("spoofed transit source admitted: %v", err)
 	}
 	snap := snapshots[a].Clone()

@@ -27,7 +27,8 @@ import (
 
 // Receive transfers a packet to the callback. The optional batch callback to
 // New borrows its buffers only until it returns; retaining them requires a copy.
-type Receive func(context.Context, model.ID, []byte) error
+// Receive takes ownership of every buffer a peer's Links deliver.
+type Receive func(context.Context, model.ID, []*packetbuf.Buffer) error
 type key struct{ network, peer model.ID }
 type policy struct {
 	network   model.ID
@@ -48,7 +49,7 @@ type Mesh struct {
 	streamHandler  StreamHandler
 	noResume       bool
 	linkState      atomic.Pointer[LinkStateHandler]
-	compact        link.Compactor
+	headers        link.Headers
 	extensionMu    sync.Mutex
 	extensionNext  time.Time
 	extensionSlots chan struct{}
@@ -73,7 +74,6 @@ type Mesh struct {
 	udp            *transport.UDP
 	quic           *transport.QUICHub
 	receive        Receive
-	receiveBatch   func(context.Context, model.ID, []*packetbuf.Buffer) error // owns the buffers
 	mu             sync.Mutex
 	groups         map[key]*group
 	slots          chan struct{}
@@ -107,13 +107,13 @@ type Options struct {
 	PreferredTransport model.Transport
 }
 
-func New(parent context.Context, identity ed25519.PrivateKey, host string, port uint16, receive Receive, batches ...func(context.Context, model.ID, []*packetbuf.Buffer) error) (*Mesh, error) {
-	return NewWithOptions(parent, identity, host, port, receive, Options{}, batches...)
+func New(parent context.Context, identity ed25519.PrivateKey, host string, port uint16, receive Receive, headers link.Headers) (*Mesh, error) {
+	return NewWithOptions(parent, identity, host, port, receive, headers, Options{})
 }
 
-func NewWithOptions(parent context.Context, identity ed25519.PrivateKey, host string, port uint16, receive Receive, opts Options, batches ...func(context.Context, model.ID, []*packetbuf.Buffer) error) (*Mesh, error) {
-	if len(identity) != ed25519.PrivateKeySize || receive == nil {
-		return nil, errors.New("mesh requires identity and packet receiver")
+func NewWithOptions(parent context.Context, identity ed25519.PrivateKey, host string, port uint16, receive Receive, headers link.Headers, opts Options) (*Mesh, error) {
+	if len(identity) != ed25519.PrivateKeySize || receive == nil || headers == nil {
+		return nil, errors.New("mesh requires identity, packet receiver and headers")
 	}
 	tlsConfig, err := transport.PeerServerTLS(identity)
 	if err != nil {
@@ -124,10 +124,7 @@ func NewWithOptions(parent context.Context, identity ed25519.PrivateKey, host st
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(parent)
-	m := &Mesh{sniffSlots: make(chan struct{}, 64), pending: map[net.Conn]bool{}, identity: bytes.Clone(identity), ctx: ctx, cancel: cancel, listener: listener, udp: udp, receive: receive, groups: map[key]*group{}, slots: make(chan struct{}, 8), punchSlots: make(chan struct{}, 16), acceptSlots: make(chan struct{}, 64), punchNotify: make(chan struct{}), streamWindow: opts.StreamWindow, preferredTransport: opts.PreferredTransport}
-	if len(batches) > 0 {
-		m.receiveBatch = batches[0]
-	}
+	m := &Mesh{sniffSlots: make(chan struct{}, 64), pending: map[net.Conn]bool{}, identity: bytes.Clone(identity), ctx: ctx, cancel: cancel, listener: listener, udp: udp, receive: receive, headers: headers, groups: map[key]*group{}, slots: make(chan struct{}, 8), punchSlots: make(chan struct{}, 16), acceptSlots: make(chan struct{}, 64), punchNotify: make(chan struct{}), streamWindow: opts.StreamWindow, preferredTransport: opts.PreferredTransport}
 	m.extensionSlots = make(chan struct{}, 4)
 	m.dns = newEndpointDNS()
 	m.tcp = listener
@@ -602,8 +599,6 @@ func linkTiming(detection time.Duration, caps linkCaps) (heartbeat, timeout time
 }
 
 func (g *group) register(channel *peer.Channel, candidate link.Candidate, pathExchange bool, caps linkCaps) {
-	// Mesh.Apply holds the mesh lock while updating groups.
-	compact := g.mesh.compactor()
 	g.mu.Lock()
 	if g.ctx.Err() != nil {
 		g.mu.Unlock()
@@ -620,7 +615,6 @@ func (g *group) register(channel *peer.Channel, candidate link.Candidate, pathEx
 	if options.Heartbeat == 0 {
 		options.Heartbeat, options.Timeout = linkTiming(cfg.detection, caps)
 	}
-	options.OwnedPackets = true
 	options.PathExchange = pathExchange
 	options.Accepted = caps.accepted
 	if caps.streams {
@@ -629,14 +623,13 @@ func (g *group) register(channel *peer.Channel, candidate link.Candidate, pathEx
 	if caps.linkState {
 		options.LinkState, options.LinkStateHello = g, caps.linkStateHello
 	}
-	options.Compact = compact
 	options.SizeProbe, options.SizeProbeHello = caps.sizeProbe, caps.sizeProbeHello
 	options.Resume = caps.resume
 	options.Windows = caps.windows
 	if h := g.mesh.linkStateHandler(); h != nil {
 		options.Failed = h.LinkFailed
 	}
-	l, err := link.New(g.ctx, channel, link.Info{NetworkID: cfg.network, EdgeID: cfg.peer.Edge.ID, PeerID: cfg.peer.Node.ID, CandidateID: candidate.ID, Transport: candidate.Endpoint.Transport}, options)
+	l, err := link.New(g.ctx, channel, link.Info{NetworkID: cfg.network, EdgeID: cfg.peer.Edge.ID, PeerID: cfg.peer.Node.ID, CandidateID: candidate.ID, Transport: candidate.Endpoint.Transport}, g.mesh.headers, options)
 	if err != nil {
 		g.mu.Unlock()
 		channel.Close()
@@ -684,16 +677,8 @@ func (g *group) register(channel *peer.Channel, candidate link.Candidate, pathEx
 			if err != nil {
 				return
 			}
-			if g.mesh.receiveBatch != nil {
-				// The receiver forwards transit frames in these buffers.
-				g.mesh.receiveBatch(g.ctx, cfg.peer.Node.ID, owners[:count])
-				clear(owners[:count])
-				continue
-			}
-			for _, b := range owners[:count] {
-				g.mesh.receive(g.ctx, cfg.peer.Node.ID, bytes.Clone(b.Data))
-			}
-			packetbuf.ReleaseAll(owners[:count])
+			// The receiver forwards transit frames in these buffers.
+			g.mesh.receive(g.ctx, cfg.peer.Node.ID, owners[:count])
 			clear(owners[:count])
 		}
 	}()

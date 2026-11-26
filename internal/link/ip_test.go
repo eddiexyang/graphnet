@@ -47,6 +47,13 @@ func (c *pipeChannel) Send(ctx context.Context, b []byte) error {
 		return ctx.Err()
 	}
 }
+func (c *pipeChannel) ReceiveOwnedBatch(ctx context.Context) ([]*packetbuf.Buffer, error) {
+	b, err := c.Receive(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return []*packetbuf.Buffer{packetbuf.Wrap(b)}, nil
+}
 func (c *pipeChannel) Receive(ctx context.Context) ([]byte, error) {
 	select {
 	case b := <-c.in:
@@ -59,38 +66,35 @@ func (c *pipeChannel) Receive(ctx context.Context) ([]byte, error) {
 }
 
 // dataSent returns the data messages this end has sent, by kind.
-func (c *pipeChannel) dataSent() (full, compact [][]byte) {
+func (c *pipeChannel) dataSent() (full, ip [][]byte) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, b := range c.sent {
 		switch b[0] {
 		case dataMessage:
 			full = append(full, b)
-		case compactDataMessage:
-			compact = append(compact, b)
+		case ipMessage:
+			ip = append(ip, b)
 		}
 	}
-	return full, compact
+	return full, ip
 }
 
 const (
-	compactNetwork = model.ID("11111111111111111111111111111111")
-	compactSource  = model.ID("22222222222222222222222222222222")
-	compactDest    = model.ID("33333333333333333333333333333333")
+	testNetwork = model.ID("11111111111111111111111111111111")
+	testSource  = model.ID("22222222222222222222222222222222")
+	testDest    = model.ID("33333333333333333333333333333333")
 )
 
-// compactTest rebuilds the fixed test addresses unless the payload is marked
-// unroutable with a leading 0xff, and indexes the source as 1 and the
-// destination as 2; routable false knows no indexes.
-type compactTest struct{ unroutable bool }
+// testHeaders rebuilds the fixed test addresses unless the payload is marked
+// unroutable with a leading 0xff.
+type testHeaders struct{}
 
-var compactTestHeader = compactTest{}
-
-func (c compactTest) Expand(header []byte, network [16]byte, hop uint8, payload []byte) bool {
-	if c.unroutable || payload[0] == 0xff {
+func (testHeaders) Rebuild(header []byte, network [16]byte, hop uint8, payload []byte) bool {
+	if payload[0] == 0xff {
 		return false
 	}
-	frame, _ := (packet.Packet{Header: packet.Header{Network: compactNetwork, Source: compactSource, Destination: compactDest, HopLimit: hop}, Payload: payload}).MarshalBinary()
+	frame, _ := (packet.Packet{Header: packet.Header{Network: testNetwork, Source: testSource, Destination: testDest, HopLimit: hop}, Payload: payload}).MarshalBinary()
 	if [16]byte(frame[8:24]) != network {
 		return false
 	}
@@ -98,40 +102,24 @@ func (c compactTest) Expand(header []byte, network [16]byte, hop uint8, payload 
 	return true
 }
 
-func (c compactTest) Index(network, node [16]byte) (uint16, bool) {
-	for i, id := range []model.ID{compactSource, compactDest} {
-		if !c.unroutable && node == wire(id) && network == wire(compactNetwork) {
-			return uint16(i + 1), true
-		}
-	}
-	return 0, false
-}
-
-func (c compactTest) Node(network [16]byte, index uint16) ([16]byte, bool) {
-	if c.unroutable || network != wire(compactNetwork) || index < 1 || index > 2 {
-		return [16]byte{}, false
-	}
-	return wire([]model.ID{compactSource, compactDest}[index-1]), true
-}
-
 func wire(id model.ID) (out [16]byte) {
 	frame, _ := (packet.Packet{Header: packet.Header{Network: id, Source: id, Destination: id, HopLimit: 1}, Payload: []byte{0}}).MarshalBinary()
 	return [16]byte(frame[8:24])
 }
 
-func compactTestFrame(t *testing.T, payload []byte) []byte {
+func testFrame(t *testing.T, payload []byte) []byte {
 	t.Helper()
-	frame, err := (packet.Packet{Header: packet.Header{Network: compactNetwork, Source: compactSource, Destination: compactDest, HopLimit: 9, Epoch: 7, Flow: 5, Sequence: 3}, Payload: payload}).MarshalBinary()
+	frame, err := (packet.Packet{Header: packet.Header{Network: testNetwork, Source: testSource, Destination: testDest, HopLimit: 9, Epoch: 7, Flow: 5, Sequence: 3}, Payload: payload}).MarshalBinary()
 	if err != nil {
 		t.Fatal(err)
 	}
 	return frame
 }
 
-func newCompactTestLink(t *testing.T, channel Channel, options Options) *Link {
+func newTestLink(t *testing.T, channel Channel, options Options) *Link {
 	t.Helper()
-	info := Info{NetworkID: compactNetwork, EdgeID: compactSource, PeerID: compactDest, CandidateID: "candidate", Transport: model.TCP}
-	l, err := New(context.Background(), channel, info, options)
+	info := Info{NetworkID: testNetwork, EdgeID: testSource, PeerID: testDest, CandidateID: "candidate", Transport: model.TCP}
+	l, err := New(context.Background(), channel, info, testHeaders{}, options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,13 +129,14 @@ func newCompactTestLink(t *testing.T, channel Channel, options Options) *Link {
 
 func receiveFrame(t *testing.T, l *Link) []byte {
 	t.Helper()
-	select {
-	case frame := <-l.Packets():
-		return frame
-	case <-time.After(5 * time.Second):
-		t.Fatal("frame not delivered")
-		return nil
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var owners [1]*packetbuf.Buffer
+	if _, err := l.ReadOwnedBatch(ctx, owners[:]); err != nil {
+		t.Fatalf("frame not delivered: %v", err)
 	}
+	defer owners[0].Release()
+	return bytes.Clone(owners[0].Data)
 }
 
 // Rebuilt frames keep every routing field; Epoch, Flow and Sequence, which
@@ -158,14 +147,14 @@ func wantRebuilt(sent []byte) []byte {
 	return want
 }
 
-func TestCompactFraming(t *testing.T) {
+func TestIPFraming(t *testing.T) {
 	payload := []byte{0x45, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}
-	frame := compactTestFrame(t, payload)
+	frame := testFrame(t, payload)
 
 	t.Run("both", func(t *testing.T) {
 		dialerEnd, acceptorEnd := pipePair()
-		dialer := newCompactTestLink(t, dialerEnd, Options{Compact: compactTestHeader})
-		acceptor := newCompactTestLink(t, acceptorEnd, Options{Compact: compactTestHeader})
+		dialer := newTestLink(t, dialerEnd, Options{})
+		acceptor := newTestLink(t, acceptorEnd, Options{})
 		if err := acceptor.Send(context.Background(), frame); err != nil {
 			t.Fatal(err)
 		}
@@ -179,21 +168,21 @@ func TestCompactFraming(t *testing.T) {
 			t.Fatalf("acceptor received %x", got)
 		}
 		for name, end := range map[string]*pipeChannel{"dialer": dialerEnd, "acceptor": acceptorEnd} {
-			full, compact := end.dataSent()
-			if len(full) != 0 || len(compact) != 1 || !bytes.Equal(compact[0], append([]byte{compactDataMessage, 9}, payload...)) {
-				t.Fatalf("%s sent full=%x compact=%x", name, full, compact)
+			full, ip := end.dataSent()
+			if len(full) != 0 || len(ip) != 1 || !bytes.Equal(ip[0], append([]byte{ipMessage, 9}, payload...)) {
+				t.Fatalf("%s sent full=%x ip=%x", name, full, ip)
 			}
 		}
 		if dialer.tx.Load() != uint64(len(frame)) || acceptor.rx.Load() != uint64(len(frame)) {
-			t.Fatal("compact frames not counted as their full size")
+			t.Fatal("IP messages not counted as their full frame size")
 		}
 	})
 
 	t.Run("unroutable", func(t *testing.T) {
 		local, remote := pipePair()
-		l := newCompactTestLink(t, local, Options{Compact: compactTestHeader})
-		remote.Send(context.Background(), append([]byte{compactDataMessage, 9, 0xff}, payload...))
-		remote.Send(context.Background(), append([]byte{compactDataMessage, 9}, payload...))
+		l := newTestLink(t, local, Options{})
+		remote.Send(context.Background(), append([]byte{ipMessage, 9, 0xff}, payload...))
+		remote.Send(context.Background(), append([]byte{ipMessage, 9}, payload...))
 		if got := receiveFrame(t, l); !bytes.Equal(got, wantRebuilt(frame)) {
 			t.Fatalf("received %x", got)
 		}
@@ -201,15 +190,27 @@ func TestCompactFraming(t *testing.T) {
 			t.Fatalf("dropped = %d", l.dropped.Load())
 		}
 	})
+
+	// IP packets arrive only as IP messages; a data message carrying one
+	// closes the Link.
+	t.Run("full header IP", func(t *testing.T) {
+		local, remote := pipePair()
+		l := newTestLink(t, local, Options{})
+		remote.Send(context.Background(), append([]byte{dataMessage}, frame...))
+		select {
+		case <-l.Done():
+		case <-time.After(5 * time.Second):
+			t.Fatal("Link kept a data message carrying an IP packet")
+		}
+	})
 }
 
-// Owned frames from the router are compacted in place, without a copy.
-func TestCompactOwnedFramesInPlace(t *testing.T) {
+// Owned frames from the router become IP messages in place, without a copy.
+func TestIPOwnedFramesInPlace(t *testing.T) {
 	l := &Link{ctx: context.Background(), info: Info{Transport: model.UDP}, dataReady: make(chan struct{}, 1)}
 	l.dataGeneration.Store(1)
-	l.options.Compact = compactTestHeader
 	payload := []byte{0x45, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}
-	frame := compactTestFrame(t, payload)
+	frame := testFrame(t, payload)
 	headroom := packetbuf.GetHeadroom(len(frame), 1)
 	copy(headroom.Data, frame)
 	plain := packetbuf.Wrap(bytes.Clone(frame))
@@ -217,7 +218,7 @@ func TestCompactOwnedFramesInPlace(t *testing.T) {
 	if err := l.SendOwnedBatch(context.Background(), []*packetbuf.Buffer{headroom, plain}); err != nil {
 		t.Fatal(err)
 	}
-	want := append([]byte{compactDataMessage, 9}, payload...)
+	want := append([]byte{ipMessage, 9}, payload...)
 	for i := range 2 {
 		queued := l.takeData()
 		if !bytes.Equal(queued.raw, want) || &queued.raw[2] != storage[i] {
@@ -226,7 +227,7 @@ func TestCompactOwnedFramesInPlace(t *testing.T) {
 		queued.buffer.Release()
 	}
 	if l.dataBytes != 0 {
-		t.Fatal("compact frames leaked byte budget")
+		t.Fatal("IP messages leaked byte budget")
 	}
 }
 
@@ -241,7 +242,7 @@ func TestTCPBackedLinkRefusesTCPPackets(t *testing.T) {
 	for transport, want := range map[model.Transport]uint64{model.TCP: 1, model.UDP: 0} {
 		l := &Link{ctx: context.Background(), info: Info{Transport: transport}, dataReady: make(chan struct{}, 1)}
 		l.dataGeneration.Store(1)
-		err := l.SendBatch(context.Background(), [][]byte{compactTestFrame(t, tcp), compactTestFrame(t, udp)})
+		err := l.SendBatch(context.Background(), [][]byte{testFrame(t, tcp), testFrame(t, udp)})
 		if want == 1 && !errors.Is(err, ErrTCPOverTCP) || want == 0 && err != nil {
 			t.Fatalf("%s Link: %v", transport, err)
 		}

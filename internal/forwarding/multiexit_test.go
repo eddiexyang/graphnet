@@ -30,7 +30,7 @@ func newExitNetwork(t *testing.T, state model.State) *exitNetwork {
 			t.Fatal(err)
 		}
 		r, err := forwarding.New(snapshot, func(ctx context.Context, network, next model.ID, frame []byte) error {
-			return x.routers[next].FromPeer(ctx, node.ID, frame)
+			return fromPeer(x.routers[next], ctx, node.ID, frame)
 		}, func(context.Context, model.ID, []byte) error { x.exitNode = node.ID; return nil })
 		if err != nil {
 			t.Fatal(err)

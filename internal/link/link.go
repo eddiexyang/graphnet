@@ -35,9 +35,9 @@ const (
 	linkStateHelloMessage = 13
 	linkStateMessage      = 14
 	linkStateQueue        = 256
-	// Compact data omits the packet header: [compactDataMessage][hop
-	// limit][IP packet]. The receiver rebuilds it.
-	compactDataMessage = 16
+	// IP data: [ipMessage][hop limit][IP packet]. The receiver rebuilds the
+	// packet header from its forwarding table; see Headers.
+	ipMessage = 16
 	// The acceptor confirms resumable TCP sessions offered in the
 	// introduction; see Options.Resume.
 	resumeHelloMessage = 20
@@ -68,7 +68,8 @@ var ErrUnavailable = errors.New("edge has no healthy link")
 type Channel interface {
 	ID() string
 	Send(context.Context, []byte) error
-	Receive(context.Context) ([]byte, error)
+	// ReceiveOwnedBatch transfers ownership of every returned buffer.
+	ReceiveOwnedBatch(context.Context) ([]*packetbuf.Buffer, error)
 	Close() error
 	RemoteAddr() net.Addr
 	NeedsRekey() bool
@@ -89,9 +90,6 @@ type Options struct {
 	Accepted bool
 	// PathExchange is enabled by the authenticated introduction capability.
 	PathExchange bool
-	// OwnedPackets opts into explicit packet ownership. Consumers must release
-	// every buffer received from ReadOwnedBatch; the legacy Packets API is unused.
-	OwnedPackets bool
 	// Streams carries byte streams on this Link when both sides support them.
 	// The accepting side sets StreamHello and announces support; the dialing
 	// side enables streams when that announcement arrives.
@@ -108,9 +106,6 @@ type Options struct {
 	// the accepting side, as for streams. Any transport may carry them.
 	LinkState      LinkStateHandler
 	LinkStateHello bool
-	// Compact rebuilds packet headers that frames omit. A Link without it
-	// sends whole headers, as tests do.
-	Compact Compactor
 	// SizeProbe holds the Link back from traffic until a full-size probe is
 	// answered; see sizeprobe.go. SizeProbeHello is set by the accepting side.
 	SizeProbe      bool
@@ -120,15 +115,12 @@ type Options struct {
 	Failed func()
 }
 
-// Compactor maps what compact frames omit to the active forwarding table.
-type Compactor interface {
-	// Expand writes the omitted packet header into header[:packet.HeaderSize]
-	// for payload, or reports that its addresses have no admitted owners.
-	Expand(header []byte, network [16]byte, hopLimit uint8, payload []byte) bool
-	// Index returns the wire index of a network's Node.
-	Index(network, node [16]byte) (uint16, bool)
-	// Node returns the Node of a network's wire index.
-	Node(network [16]byte, index uint16) ([16]byte, bool)
+// Headers rebuilds the packet header an IP message does not carry from the
+// active forwarding table.
+type Headers interface {
+	// Rebuild writes the packet header into header[:packet.HeaderSize] for
+	// payload, or reports that its addresses have no admitted owners.
+	Rebuild(header []byte, network [16]byte, hopLimit uint8, payload []byte) bool
 }
 
 // LinkStateHandler receives advertisements; payload is only valid during the call.
@@ -168,6 +160,7 @@ type Link struct {
 	channel                       Channel
 	info                          Info
 	options                       Options
+	headers                       Headers
 	ctx                           context.Context
 	cancel                        context.CancelFunc
 	stopOnce                      sync.Once
@@ -197,7 +190,6 @@ type Link struct {
 	keep         atomic.Pointer[func() bool]
 	held         bool
 	control      chan []byte
-	packets      chan []byte
 	ownedPackets *packetbuf.Queue
 	queueMu      sync.Mutex
 	mu           sync.Mutex
@@ -251,12 +243,12 @@ func validTiming(heartbeat, timeout time.Duration) error {
 	return nil
 }
 
-func New(parent context.Context, channel Channel, info Info, options Options) (*Link, error) {
+func New(parent context.Context, channel Channel, info Info, headers Headers, options Options) (*Link, error) {
 	options = options.defaults()
 	if err := validTiming(options.Heartbeat, options.Timeout); err != nil {
 		return nil, err
 	}
-	if channel == nil || channel.ID() == "" || info.CandidateID == "" || !info.Transport.Valid() {
+	if channel == nil || headers == nil || channel.ID() == "" || info.CandidateID == "" || !info.Transport.Valid() {
 		return nil, errors.New("invalid link identity")
 	}
 	for _, id := range []model.ID{info.NetworkID, info.EdgeID, info.PeerID} {
@@ -265,16 +257,11 @@ func New(parent context.Context, channel Channel, info Info, options Options) (*
 		}
 	}
 	ctx, cancel := context.WithCancel(parent)
-	l := &Link{channel: channel, info: info, options: options, ctx: ctx, cancel: cancel, done: make(chan struct{}), dataReady: make(chan struct{}, 1), retime: make(chan struct{}, 1), selection: make(chan Selection, 8), control: make(chan []byte, 8), packets: make(chan []byte, queueSize), pending: map[uint64]time.Time{}, started: time.Now()}
+	l := &Link{channel: channel, info: info, options: options, headers: headers, ctx: ctx, cancel: cancel, done: make(chan struct{}), dataReady: make(chan struct{}, 1), retime: make(chan struct{}, 1), selection: make(chan Selection, 8), control: make(chan []byte, 8), ownedPackets: packetbuf.NewQueue(queueSize), pending: map[uint64]time.Time{}, started: time.Now()}
 	l.pathEnabled = options.PathExchange
 	l.retirements = make(chan Retirement, 8)
 	l.streamWake = make(chan struct{}, 1)
 	l.linkStateOut = make(chan []byte, linkStateQueue)
-	if _, ok := channel.(interface {
-		ReceiveOwnedBatch(context.Context) ([]*packetbuf.Buffer, error)
-	}); ok && options.OwnedPackets {
-		l.ownedPackets = packetbuf.NewQueue(queueSize)
-	}
 	l.dataGeneration.Store(1)
 	// The size-probe hello must precede every other message; see sizeprobe.go.
 	l.initSizeProbe()
@@ -299,11 +286,9 @@ func New(parent context.Context, channel Channel, info Info, options Options) (*
 		l.control <- []byte{linkStateHelloMessage, 1}
 		l.linkStateReady.Store(true)
 	}
-	if options.Compact != nil {
-		if _, err := hex.Decode(l.networkWire[:], []byte(info.NetworkID)); err != nil {
-			cancel()
-			return nil, err
-		}
+	if _, err := hex.Decode(l.networkWire[:], []byte(info.NetworkID)); err != nil {
+		cancel()
+		return nil, err
 	}
 	l.wg.Add(3)
 	go l.readLoop()
@@ -317,10 +302,7 @@ func New(parent context.Context, channel Channel, info Info, options Options) (*
 	}
 	go func() {
 		l.wg.Wait()
-		close(l.packets)
-		if l.ownedPackets != nil {
-			l.ownedPackets.Close()
-		}
+		l.ownedPackets.Close()
 		close(l.done)
 	}()
 	return l, nil
@@ -406,10 +388,9 @@ func (l *Link) WakeStreams() {
 	default:
 	}
 }
-func (l *Link) Info() Info             { return l.info }
-func (l *Link) Packets() <-chan []byte { return l.packets }
-func (l *Link) Done() <-chan struct{}  { return l.done }
-func (l *Link) Created() time.Time { return l.channel.Created() }
+func (l *Link) Info() Info            { return l.info }
+func (l *Link) Done() <-chan struct{} { return l.done }
+func (l *Link) Created() time.Time    { return l.channel.Created() }
 func (l *Link) RenewalDue() bool {
 	if r, ok := l.channel.(interface{ RenewalDue(time.Duration) bool }); ok {
 		return r.RenewalDue(l.options.RenewAfter)
@@ -425,9 +406,6 @@ func (l *Link) Close() error {
 	return nil
 }
 func (l *Link) ReadOwnedBatch(ctx context.Context, dst []*packetbuf.Buffer) (int, error) {
-	if l.ownedPackets == nil {
-		return 0, errors.New("owned packet receive is not enabled")
-	}
 	return l.ownedPackets.Read(ctx, dst)
 }
 func (l *Link) Send(ctx context.Context, frame []byte) error {
@@ -493,12 +471,16 @@ func (l *Link) enqueue(ctx context.Context, frames [][]byte, owners []*packetbuf
 			refused, consumed = refused+1, i+1
 			continue
 		}
-		if tcpBacked && l.dataBytes+len(frame)+1 > tcpQueueBytes {
+		size := len(frame) + 1
+		if frame[6] == packet.KindIP {
+			size = len(frame) - packet.HeaderSize + 2
+		}
+		if tcpBacked && l.dataBytes+size > tcpQueueBytes {
 			break
 		}
 		var buffer *packetbuf.Buffer
-		if l.options.Compact != nil && frame[6] == packet.KindIP {
-			buffer = compactFrame(frame, owners, i)
+		if frame[6] == packet.KindIP {
+			buffer = ipFrame(frame, owners, i)
 		} else if owners != nil && owners[i].PrependByte(dataMessage) {
 			buffer = owners[i]
 		} else {
@@ -527,18 +509,18 @@ func (l *Link) enqueue(ctx context.Context, frames [][]byte, owners []*packetbuf
 	return nil
 }
 
-// compactFrame replaces the packet header with the two-byte compact prefix,
-// in place for an owned buffer; frame[3] is the overlay hop limit.
-func compactFrame(frame []byte, owners []*packetbuf.Buffer, i int) *packetbuf.Buffer {
+// ipFrame replaces the packet header with the two-byte IP message prefix, in
+// place for an owned buffer; frame[3] is the overlay hop limit.
+func ipFrame(frame []byte, owners []*packetbuf.Buffer, i int) *packetbuf.Buffer {
 	if owners != nil {
 		buffer := owners[i]
-		buffer.Data[packet.HeaderSize-2] = compactDataMessage
+		buffer.Data[packet.HeaderSize-2] = ipMessage
 		buffer.Data[packet.HeaderSize-1] = frame[3]
 		buffer.Data = buffer.Data[packet.HeaderSize-2:]
 		return buffer
 	}
 	buffer := packetbuf.Get(len(frame) - packet.HeaderSize + 2)
-	buffer.Data[0], buffer.Data[1] = compactDataMessage, frame[3]
+	buffer.Data[0], buffer.Data[1] = ipMessage, frame[3]
 	copy(buffer.Data[2:], frame[packet.HeaderSize:])
 	return buffer
 }
@@ -688,9 +670,6 @@ func (l *Link) Stats() model.LinkStatus {
 	return model.LinkStatus{NetworkID: l.info.NetworkID, EdgeID: l.info.EdgeID, LinkID: l.ID(), CandidateID: l.info.CandidateID, Transport: l.info.Transport, Local: local, ObservedLocal: l.observedLocal, Remote: l.channel.RemoteAddr().String(), Healthy: healthy, Unhealthy: !healthy && l.unhealthyLocked(), RTTMillis: float64(l.rtt) / float64(time.Millisecond), Loss: loss, RXBytes: l.rx.Load(), TXBytes: l.tx.Load(), Dropped: l.dropped.Load(), TCPPackets: l.tcpPackets.Load()}
 }
 func (l *Link) readLoop() {
-	owned, owning := l.channel.(interface {
-		ReceiveOwnedBatch(context.Context) ([]*packetbuf.Buffer, error)
-	})
 	var ownedPending []*packetbuf.Buffer
 	var current *packetbuf.Buffer
 	var ready [packetbuf.BatchSize]*packetbuf.Buffer
@@ -703,45 +682,23 @@ func (l *Link) readLoop() {
 		clear(ready[:count])
 		count = 0
 	}
-	owning = owning && l.ownedPackets != nil
-	batch, batching := l.channel.(interface {
-		ReceiveBatch(context.Context) ([][]byte, error)
-	})
-	var pending [][]byte
 	defer l.wg.Done()
 	defer func() { current.Release(); packetbuf.ReleaseAll(ownedPending); packetbuf.ReleaseAll(ready[:count]) }()
 	defer l.stop()
 	for {
-		var raw []byte
-		var err error
 		current.Release()
 		current = nil
-		if owning {
-			if len(ownedPending) == 0 {
-				flush()
-				ownedPending, err = owned.ReceiveOwnedBatch(l.ctx)
-			}
+		if len(ownedPending) == 0 {
+			flush()
+			var err error
+			ownedPending, err = l.channel.ReceiveOwnedBatch(l.ctx)
 			if err != nil || len(ownedPending) == 0 {
 				return
 			}
-			current, ownedPending[0] = ownedPending[0], nil
-			ownedPending = ownedPending[1:]
-			raw = current.Data
-		} else if batching {
-			if len(pending) == 0 {
-				pending, err = batch.ReceiveBatch(l.ctx)
-			}
-			if err != nil || len(pending) == 0 {
-				return
-			}
-			raw, pending[0] = pending[0], nil
-			pending = pending[1:]
-		} else {
-			raw, err = l.channel.Receive(l.ctx)
 		}
-		if err != nil {
-			return
-		}
+		current, ownedPending[0] = ownedPending[0], nil
+		ownedPending = ownedPending[1:]
+		raw := current.Data
 		if len(raw) == 0 {
 			return
 		}
@@ -751,56 +708,33 @@ func (l *Link) readLoop() {
 				return
 			}
 		case dataMessage:
-			if len(raw) <= packet.HeaderSize+1 || len(raw) > packet.MaxFrame+1 {
+			// IP packets only arrive as ipMessage.
+			if len(raw) <= packet.HeaderSize+1 || len(raw) > packet.MaxFrame+1 || raw[1+6] == packet.KindIP {
 				return
 			}
 			l.rx.Add(uint64(len(raw) - 1))
-			if current != nil {
-				current.Data = raw
-				current.Advance(1)
-				ready[count], current = current, nil
-				count++
-				if count == len(ready) {
-					flush()
-				}
-			} else {
-				select {
-				case l.packets <- raw[1:]:
-				default:
-					l.dropped.Add(1)
-				}
+			current.Advance(1)
+			ready[count], current = current, nil
+			count++
+			if count == len(ready) {
+				flush()
 			}
-		case compactDataMessage:
-			if l.options.Compact == nil || len(raw) <= 2 || len(raw)-2 > packet.MaxPayload {
+		case ipMessage:
+			if len(raw) <= 2 || len(raw)-2 > packet.MaxPayload {
 				return
 			}
-			// Owned receivers release pooled buffers; packets channel readers keep
-			// their frames, which therefore need their own allocation.
-			var buffer *packetbuf.Buffer
-			if owning {
-				buffer = packetbuf.Get(packet.HeaderSize + len(raw) - 2)
-			} else {
-				buffer = packetbuf.Wrap(make([]byte, packet.HeaderSize+len(raw)-2))
-			}
-			if !l.options.Compact.Expand(buffer.Data[:packet.HeaderSize], l.networkWire, raw[1], raw[2:]) {
+			buffer := packetbuf.Get(packet.HeaderSize + len(raw) - 2)
+			if !l.headers.Rebuild(buffer.Data[:packet.HeaderSize], l.networkWire, raw[1], raw[2:]) {
 				buffer.Release()
 				l.dropped.Add(1)
 				continue
 			}
 			copy(buffer.Data[packet.HeaderSize:], raw[2:])
 			l.rx.Add(uint64(len(buffer.Data)))
-			if owning {
-				ready[count] = buffer
-				count++
-				if count == len(ready) {
-					flush()
-				}
-				continue
-			}
-			select {
-			case l.packets <- buffer.Data:
-			default:
-				l.dropped.Add(1)
+			ready[count] = buffer
+			count++
+			if count == len(ready) {
+				flush()
 			}
 		case streamHelloMessage:
 			if len(raw) != 2 || l.options.Streams == nil || l.options.StreamHello || !l.tcpBacked() {
@@ -987,7 +921,7 @@ func (l *Link) writeLoop() {
 			switch {
 			case raw[0] == dataMessage, raw[0] == streamMessage:
 				l.tx.Add(uint64(len(raw) - 1))
-			case raw[0] == compactDataMessage:
+			case raw[0] == ipMessage:
 				l.tx.Add(uint64(len(raw) - 2 + packet.HeaderSize))
 			}
 			messages[i] = nil

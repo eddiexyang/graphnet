@@ -197,7 +197,7 @@ func TestLinkClosesAtHealthDeadline(t *testing.T) {
 			}
 		}
 	}()
-	l := newCompactTestLink(t, a, options)
+	l := newTestLink(t, a, options)
 	deadline := time.Now().Add(3 * time.Second)
 	for !l.Healthy() && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
@@ -248,12 +248,12 @@ func TestOnlySelectedLinkForwardsWhenHeartbeatsTimeOut(t *testing.T) {
 						return
 					}
 				}
-			case dataMessage:
-				received <- raw[1:]
+			case ipMessage:
+				received <- raw
 			}
 		}
 	}()
-	l := newCompactTestLink(t, a, Options{Heartbeat: 50 * time.Millisecond, Timeout: 250 * time.Millisecond})
+	l := newTestLink(t, a, Options{Heartbeat: 50 * time.Millisecond, Timeout: 250 * time.Millisecond})
 	e := newEdge("")
 	e.Add(l)
 	waitFor := func(condition func() bool, what string) {
@@ -274,14 +274,15 @@ func TestOnlySelectedLinkForwardsWhenHeartbeatsTimeOut(t *testing.T) {
 	}, "initial link selection")
 	mute.Store(true)
 	waitFor(l.Held, "heartbeat timeout")
-	frame := compactTestFrame(t, []byte{0x45, 1, 2})
+	payload := []byte{0x45, 1, 2}
+	frame := testFrame(t, payload)
 	if err := e.Send(ctx, frame); err != nil {
 		t.Fatalf("send over the only Link after its timeout: %v", err)
 	}
 	select {
 	case got := <-received:
-		if !bytes.Equal(got, frame) {
-			t.Fatalf("received frame %x, want %x", got, frame)
+		if want := append([]byte{ipMessage, frame[3]}, payload...); !bytes.Equal(got, want) {
+			t.Fatalf("received message %x, want %x", got, want)
 		}
 	case <-ctx.Done():
 		t.Fatal("held Link did not forward the frame")
@@ -295,10 +296,10 @@ func TestOnlySelectedLinkForwardsWhenHeartbeatsTimeOut(t *testing.T) {
 func TestAcceptedLinkConfirmedByDialer(t *testing.T) {
 	options := Options{Heartbeat: 100 * time.Millisecond, Timeout: 300 * time.Millisecond}
 	a, b := pipePair()
-	dialer := newCompactTestLink(t, a, options)
+	dialer := newTestLink(t, a, options)
 	accepted := options
 	accepted.Accepted = true
-	acceptor := newCompactTestLink(t, b, accepted)
+	acceptor := newTestLink(t, b, accepted)
 	deadline := time.Now().Add(3 * time.Second)
 	for !(dialer.Healthy() && acceptor.Healthy()) && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)

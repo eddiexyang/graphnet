@@ -28,7 +28,6 @@ type introduction struct {
 	TCPStreams bool `json:"tcp_streams,omitempty"`
 	// LinkState offers link-state advertisements on this Link.
 	LinkState bool `json:"link_state,omitempty"`
-	// CompactData offers data frames without the packet header.
 	// SizeProbe offers full-size probes before the Link carries traffic.
 	SizeProbe bool `json:"size_probe,omitempty"`
 	// TCPResume offers resumable TCP sessions, on streams or a carrier TCP.

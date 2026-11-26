@@ -48,7 +48,7 @@ func TestTransportChangeDrains(t *testing.T) {
 					channels[0].peer, channels[1].peer = channels[1], channels[0]
 					var local *link.Link
 					for i, c := range channels {
-						l, err := link.New(ctx, c, link.Info{NetworkID: id(3), EdgeID: id(4), PeerID: id(2 - i), CandidateID: string(id(100 + n)), Transport: transport}, link.Options{Heartbeat: 100 * time.Millisecond, Timeout: 500 * time.Millisecond})
+						l, err := link.New(ctx, c, link.Info{NetworkID: id(3), EdgeID: id(4), PeerID: id(2 - i), CandidateID: string(id(100 + n)), Transport: transport}, testHeaders{}, link.Options{Heartbeat: 100 * time.Millisecond, Timeout: 500 * time.Millisecond})
 						if err != nil {
 							t.Fatal(err)
 						}

@@ -39,18 +39,15 @@ func TestClientNeighborCannotClaimAnotherSource(t *testing.T) {
 			return raw
 		}
 		spoofed := frame(b, 0, ipv4("10.42.0.2", "10.42.0.3"))
-		err = c.FromPeer(context.Background(), d.ID, spoofed)
+		err = fromPeer(c, context.Background(), d.ID, spoofed)
 		if client && !errors.Is(err, forwarding.ErrSource) || !client && err != nil {
 			t.Fatalf("client=%t: frame from D claiming B: %v", client, err)
 		}
-		if err := c.FromPeerBatch(context.Background(), d.ID, [][]byte{spoofed}); client && !errors.Is(err, forwarding.ErrSource) {
-			t.Fatalf("batch frame from client D claiming B: %v", err)
-		}
 		replay := frame(b, packet.KindSessionReplay, make([]byte, 20))
-		if err := c.FromPeer(context.Background(), d.ID, replay); client && !errors.Is(err, forwarding.ErrSource) {
+		if err := fromPeer(c, context.Background(), d.ID, replay); client && !errors.Is(err, forwarding.ErrSource) {
 			t.Fatalf("session replay from client D claiming B: %v", err)
 		}
-		if err := c.FromPeer(context.Background(), d.ID, frame(d, 0, ipv4("10.42.0.4", "10.42.0.3"))); err != nil {
+		if err := fromPeer(c, context.Background(), d.ID, frame(d, 0, ipv4("10.42.0.4", "10.42.0.3"))); err != nil {
 			t.Fatalf("client=%t: D's own frame: %v", client, err)
 		}
 		request := forwardingRequest(n.ID, b.ID, cID.ID, "10.42.0.2:40000", "10.42.0.3:443")
@@ -61,7 +58,7 @@ func TestClientNeighborCannotClaimAnotherSource(t *testing.T) {
 		if _, local, err := c.TCPRoute(own, d.ID); err != nil || !local {
 			t.Fatalf("client=%t: D's own stream: %v %v", client, local, err)
 		}
-		if want := map[bool]int{false: 3, true: 1}[client]; delivered != want {
+		if want := map[bool]int{false: 2, true: 1}[client]; delivered != want {
 			t.Fatalf("client=%t: delivered %d frames, want %d", client, delivered, want)
 		}
 	}

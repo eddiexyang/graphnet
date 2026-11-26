@@ -10,8 +10,14 @@ import (
 
 	"github.com/eddiexyang/graphnet/internal/mesh"
 	"github.com/eddiexyang/graphnet/internal/model"
+	"github.com/eddiexyang/graphnet/internal/packetbuf"
 	"github.com/eddiexyang/graphnet/internal/testutil"
 )
+
+// noHeaders rebuilds no packet header: these tests carry no IP messages.
+type noHeaders struct{}
+
+func (noHeaders) Rebuild([]byte, [16]byte, uint8, []byte) bool { return false }
 
 func newPreferredFixture(t *testing.T, seedOffset byte, pref model.Transport) (*mesh.Mesh, *mesh.Mesh, func(rev uint64, peerEps []model.Endpoint) model.Snapshot, []model.Endpoint) {
 	t.Helper()
@@ -21,15 +27,18 @@ func newPreferredFixture(t *testing.T, seedOffset byte, pref model.Transport) (*
 	var seedA, seedB [ed25519.SeedSize]byte
 	seedA[0], seedB[0] = seedOffset, seedOffset+1
 	keyA, keyB := ed25519.NewKeyFromSeed(seedA[:]), ed25519.NewKeyFromSeed(seedB[:])
-	nop := func(context.Context, model.ID, []byte) error { return nil }
+	nop := func(_ context.Context, _ model.ID, owners []*packetbuf.Buffer) error {
+		packetbuf.ReleaseAll(owners)
+		return nil
+	}
 
-	meshA, err := mesh.NewWithOptions(ctx, keyA, "127.0.0.1", 0, nop, mesh.Options{})
+	meshA, err := mesh.NewWithOptions(ctx, keyA, "127.0.0.1", 0, nop, noHeaders{}, mesh.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = meshA.Close() })
 
-	meshB, err := mesh.NewWithOptions(ctx, keyB, "127.0.0.1", 0, nop, mesh.Options{
+	meshB, err := mesh.NewWithOptions(ctx, keyB, "127.0.0.1", 0, nop, noHeaders{}, mesh.Options{
 		PreferredTransport: pref,
 	})
 	if err != nil {

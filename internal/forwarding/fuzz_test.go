@@ -30,10 +30,10 @@ func FuzzFromPeer(f *testing.F) {
 	frame, _ := (packet.Packet{Header: packet.Header{Network: n.ID, Source: n.Nodes[0].ID, Destination: n.Nodes[2].ID, HopLimit: 9}, Payload: ip}).MarshalBinary()
 	f.Add(frame)
 	f.Fuzz(func(t *testing.T, raw []byte) {
-		r.FromPeer(context.Background(), n.Nodes[0].ID, raw)
+		fromPeer(r, context.Background(), n.Nodes[0].ID, raw)
 		if len(raw) > packet.HeaderSize {
 			var header [packet.HeaderSize]byte
-			r.CompactHeader(header[:], [16]byte(raw[8:24]), raw[3], raw[packet.HeaderSize:])
+			r.RebuildHeader(header[:], [16]byte(raw[8:24]), raw[3], raw[packet.HeaderSize:])
 		}
 	})
 }

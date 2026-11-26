@@ -62,6 +62,40 @@ func (c *memChannel) Send(ctx context.Context, raw []byte) error {
 		return ctx.Err()
 	}
 }
+
+// testHeaders rebuilds no packet header: these tests carry no IP messages.
+type testHeaders struct{}
+
+func (testHeaders) Rebuild([]byte, [16]byte, uint8, []byte) bool { return false }
+
+// zeroHeaders rebuilds an all-zero packet header, as the punch tests send.
+type zeroHeaders struct{}
+
+func (zeroHeaders) Rebuild(header []byte, _ [16]byte, _ uint8, _ []byte) bool {
+	clear(header)
+	return true
+}
+
+// receiveEach adapts a per-frame receiver to Receive; frames are copies.
+func receiveEach(receive func(context.Context, model.ID, []byte) error) Receive {
+	return func(ctx context.Context, peer model.ID, owners []*packetbuf.Buffer) error {
+		defer packetbuf.ReleaseAll(owners)
+		for _, b := range owners {
+			receive(ctx, peer, bytes.Clone(b.Data))
+		}
+		return nil
+	}
+}
+
+func ownedBatch(raw []byte, err error) ([]*packetbuf.Buffer, error) {
+	if err != nil {
+		return nil, err
+	}
+	return []*packetbuf.Buffer{packetbuf.Wrap(raw)}, nil
+}
+func (c *memChannel) ReceiveOwnedBatch(ctx context.Context) ([]*packetbuf.Buffer, error) {
+	return ownedBatch(c.Receive(ctx))
+}
 func (c *memChannel) Receive(ctx context.Context) ([]byte, error) {
 	select {
 	case raw := <-c.in:
@@ -110,11 +144,11 @@ func (p *muxPair) connect(t testing.TB, acceptorStreams bool) (*link.Link, *link
 	if acceptorStreams {
 		ob.Streams, ob.StreamHello = p.b, true
 	}
-	la, err := link.New(p.ctx, ca, info(3), oa)
+	la, err := link.New(p.ctx, ca, info(3), testHeaders{}, oa)
 	if err != nil {
 		t.Fatal(err)
 	}
-	lb, err := link.New(p.ctx, cb, info(4), ob)
+	lb, err := link.New(p.ctx, cb, info(4), testHeaders{}, ob)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -935,11 +969,11 @@ func TestMuxRejectsLinkWithFailingSizeProbe(t *testing.T) {
 	oa.Streams, oa.SizeProbe, oa.Resume = p.a, true, true
 	ob.Accepted, ob.Streams, ob.StreamHello, ob.SizeProbe, ob.SizeProbeHello, ob.Resume = true, p.b, true, true, true, true
 
-	la, err := link.New(p.ctx, &mtuDropChannel{memChannel: ca, maxSize: 1500}, info(3), oa)
+	la, err := link.New(p.ctx, &mtuDropChannel{memChannel: ca, maxSize: 1500}, info(3), testHeaders{}, oa)
 	if err != nil {
 		t.Fatal(err)
 	}
-	lb, err := link.New(p.ctx, &mtuDropChannel{memChannel: cb, maxSize: 1500}, info(4), ob)
+	lb, err := link.New(p.ctx, &mtuDropChannel{memChannel: cb, maxSize: 1500}, info(4), testHeaders{}, ob)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -975,11 +1009,11 @@ func TestMuxResumableImmediatelyOnStreamsAvailable(t *testing.T) {
 	oa.Streams, oa.SizeProbe, oa.Resume = p.a, true, true
 	ob.Accepted, ob.Streams, ob.StreamHello, ob.SizeProbe, ob.SizeProbeHello, ob.Resume = true, p.b, true, true, true, true
 
-	la, err := link.New(p.ctx, ca, info(3), oa)
+	la, err := link.New(p.ctx, ca, info(3), testHeaders{}, oa)
 	if err != nil {
 		t.Fatal(err)
 	}
-	lb, err := link.New(p.ctx, cb, info(4), ob)
+	lb, err := link.New(p.ctx, cb, info(4), testHeaders{}, ob)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1004,11 +1038,11 @@ func TestTCPBackedIgnoresUnhealthyBackupWhenUDPActive(t *testing.T) {
 	// Bring up a healthy UDP link as active on the Edge.
 	udpA, udpB := memChannelPair()
 	uOpts := linkOptions
-	luA, err := link.New(ctx, udpA, link.Info{NetworkID: testutil.ID(1), EdgeID: testutil.ID(2), PeerID: testutil.ID(4), CandidateID: "udp", Transport: model.UDP}, uOpts)
+	luA, err := link.New(ctx, udpA, link.Info{NetworkID: testutil.ID(1), EdgeID: testutil.ID(2), PeerID: testutil.ID(4), CandidateID: "udp", Transport: model.UDP}, testHeaders{}, uOpts)
 	if err != nil {
 		t.Fatal(err)
 	}
-	luB, err := link.New(ctx, udpB, link.Info{NetworkID: testutil.ID(1), EdgeID: testutil.ID(2), PeerID: testutil.ID(3), CandidateID: "udp", Transport: model.UDP}, uOpts)
+	luB, err := link.New(ctx, udpB, link.Info{NetworkID: testutil.ID(1), EdgeID: testutil.ID(2), PeerID: testutil.ID(3), CandidateID: "udp", Transport: model.UDP}, testHeaders{}, uOpts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1038,11 +1072,11 @@ func TestTCPBackedIgnoresUnhealthyBackupWhenUDPActive(t *testing.T) {
 	tOptsA, tOptsB := linkOptions, linkOptions
 	tOptsA.Streams, tOptsA.SizeProbe = g.mux, true
 	tOptsB.Accepted, tOptsB.Streams, tOptsB.StreamHello, tOptsB.SizeProbe, tOptsB.SizeProbeHello = true, newMux(&group{ctx: ctx}, false, func(s *muxStream) { s.Abort() }), true, true, true
-	ltA, err := link.New(ctx, &mtuDropChannel{memChannel: tcpA, maxSize: 1500}, link.Info{NetworkID: testutil.ID(1), EdgeID: testutil.ID(2), PeerID: testutil.ID(4), CandidateID: "tcp", Transport: model.TCP}, tOptsA)
+	ltA, err := link.New(ctx, &mtuDropChannel{memChannel: tcpA, maxSize: 1500}, link.Info{NetworkID: testutil.ID(1), EdgeID: testutil.ID(2), PeerID: testutil.ID(4), CandidateID: "tcp", Transport: model.TCP}, testHeaders{}, tOptsA)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ltB, err := link.New(ctx, &mtuDropChannel{memChannel: tcpB, maxSize: 1500}, link.Info{NetworkID: testutil.ID(1), EdgeID: testutil.ID(2), PeerID: testutil.ID(3), CandidateID: "tcp", Transport: model.TCP}, tOptsB)
+	ltB, err := link.New(ctx, &mtuDropChannel{memChannel: tcpB, maxSize: 1500}, link.Info{NetworkID: testutil.ID(1), EdgeID: testutil.ID(2), PeerID: testutil.ID(3), CandidateID: "tcp", Transport: model.TCP}, testHeaders{}, tOptsB)
 	if err != nil {
 		t.Fatal(err)
 	}

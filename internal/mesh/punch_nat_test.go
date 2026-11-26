@@ -27,25 +27,25 @@ func TestUDPPunchAcrossPortRestrictedConeAndBlockAllFirewall(t *testing.T) {
 
 	gotA := make(chan []byte, 4)
 	gotB := make(chan []byte, 4)
-	mA, err := New(ctx, keyA, "127.0.0.1", 0, func(_ context.Context, _ model.ID, data []byte) error {
+	mA, err := New(ctx, keyA, "127.0.0.1", 0, receiveEach(func(_ context.Context, _ model.ID, data []byte) error {
 		select {
 		case gotA <- bytes.Clone(data):
 		default:
 		}
 		return nil
-	})
+	}), zeroHeaders{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer mA.Close()
 
-	mB, err := New(ctx, keyB, "127.0.0.1", 0, func(_ context.Context, _ model.ID, data []byte) error {
+	mB, err := New(ctx, keyB, "127.0.0.1", 0, receiveEach(func(_ context.Context, _ model.ID, data []byte) error {
 		select {
 		case gotB <- bytes.Clone(data):
 		default:
 		}
 		return nil
-	})
+	}), zeroHeaders{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -291,18 +291,18 @@ func TestTCPPunchIgnoresDirectDialStarvation(t *testing.T) {
 	_, keyA, _ := ed25519.GenerateKey(rand.Reader)
 	_, keyB, _ := ed25519.GenerateKey(rand.Reader)
 	gotB := make(chan []byte, 4)
-	mA, err := New(ctx, keyA, "127.0.0.1", 0, func(context.Context, model.ID, []byte) error { return nil })
+	mA, err := New(ctx, keyA, "127.0.0.1", 0, receiveEach(func(context.Context, model.ID, []byte) error { return nil }), zeroHeaders{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer mA.Close()
-	mB, err := New(ctx, keyB, "127.0.0.1", 0, func(_ context.Context, _ model.ID, data []byte) error {
+	mB, err := New(ctx, keyB, "127.0.0.1", 0, receiveEach(func(_ context.Context, _ model.ID, data []byte) error {
 		select {
 		case gotB <- bytes.Clone(data):
 		default:
 		}
 		return nil
-	})
+	}), zeroHeaders{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -385,12 +385,12 @@ func TestWaitForInstalledPunchWakesImmediately(t *testing.T) {
 	defer cancel()
 	_, keyA, _ := ed25519.GenerateKey(rand.Reader)
 	_, keyB, _ := ed25519.GenerateKey(rand.Reader)
-	mA, err := New(ctx, keyA, "127.0.0.1", 0, func(context.Context, model.ID, []byte) error { return nil })
+	mA, err := New(ctx, keyA, "127.0.0.1", 0, receiveEach(func(context.Context, model.ID, []byte) error { return nil }), zeroHeaders{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer mA.Close()
-	mB, err := New(ctx, keyB, "127.0.0.1", 0, func(context.Context, model.ID, []byte) error { return nil })
+	mB, err := New(ctx, keyB, "127.0.0.1", 0, receiveEach(func(context.Context, model.ID, []byte) error { return nil }), zeroHeaders{})
 	if err != nil {
 		t.Fatal(err)
 	}

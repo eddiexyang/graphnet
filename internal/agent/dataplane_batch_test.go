@@ -72,9 +72,10 @@ func runSaturatedTunnelBatch(t *testing.T, count int) {
 			return nil
 		},
 		func(context.Context, model.ID, []byte) error { t.Fatal("packet delivered locally"); return nil },
-		forwarding.BatchOptions{Send: func(_ context.Context, _, _ model.ID, frames [][]byte) error {
-			if len(frames) != count {
-				t.Fatal("full input batch was split", len(frames))
+		forwarding.BatchOptions{SendOwned: func(_ context.Context, _, _ model.ID, owners []*packetbuf.Buffer) error {
+			defer packetbuf.ReleaseAll(owners)
+			if len(owners) != count {
+				t.Fatal("full input batch was split", len(owners))
 			}
 			queued <- struct{}{}
 			return nil

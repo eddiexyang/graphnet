@@ -37,12 +37,7 @@ func TestTraceroute(t *testing.T) {
 					}
 					r, err := forwarding.New(snap, func(ctx context.Context, network, next model.ID, frame []byte) error {
 						before := bytes.Clone(frame)
-						var err error
-						if batch {
-							err = routers[next].FromPeerBatch(ctx, node.ID, [][]byte{frame})
-						} else {
-							err = routers[next].FromPeer(ctx, node.ID, frame)
-						}
+						err := fromPeer(routers[next], ctx, node.ID, frame)
 						if !bytes.Equal(before, frame) {
 							t.Error("mutated caller frame")
 						}

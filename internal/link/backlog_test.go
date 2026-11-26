@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"github.com/eddiexyang/graphnet/internal/model"
+	"github.com/eddiexyang/graphnet/internal/packet"
 	"github.com/eddiexyang/graphnet/internal/packetbuf"
 	"testing"
 )
@@ -19,21 +20,24 @@ func TestTCPBacklogOwnershipAndDrain(t *testing.T) {
 				owners[i] = packetbuf.Wrap(make([]byte, 4096))
 			}
 			err := l.SendOwnedBatch(context.Background(), owners)
+			// Each zero frame is an IP packet, queued as an IP message.
+			size := 4096 - packet.HeaderSize + 2
 			want := 128
 			if l.tcpBacked() {
-				want = tcpQueueBytes / 4097
+				want = tcpQueueBytes / size
 				if !errors.Is(err, ErrQueueFull) {
 					t.Fatal(err)
 				}
 			} else if err != nil {
 				t.Fatal(err)
 			}
-			if l.dataCount != want || l.dataBytes != want*4097 {
+			if l.dataCount != want || l.dataBytes != want*size {
 				t.Fatalf("count=%d bytes=%d", l.dataCount, l.dataBytes)
 			}
-			for _, b := range owners {
-				if b.Data != nil {
-					t.Fatal("input owner not released after copy/drop")
+			// Queued IP messages keep their owners' storage; the rest are released.
+			for i, b := range owners {
+				if i < want && l.data[i].buffer != b || i >= want && b.Data != nil {
+					t.Fatalf("owner %d neither queued in place nor released", i)
 				}
 			}
 			for l.dataCount > 0 {

@@ -41,10 +41,9 @@ type Send func(context.Context, model.ID, model.ID, []byte) error
 type Deliver func(context.Context, model.ID, []byte) error
 
 type BatchOptions struct {
-	Send    func(context.Context, model.ID, model.ID, [][]byte) error
 	Deliver func(context.Context, model.ID, [][]byte) error
 	// SendOwned takes ownership of every buffer even on error; it must not
-	// retain the caller's slice. It takes precedence over Send.
+	// retain the caller's slice.
 	SendOwned func(context.Context, model.ID, model.ID, []*packetbuf.Buffer) error
 }
 
@@ -98,7 +97,6 @@ type Router struct {
 	send           Send
 	deliver        Deliver
 	deliverBatch   func(context.Context, model.ID, [][]byte) error
-	sendBatch      func(context.Context, model.ID, model.ID, [][]byte) error
 	sendOwnedBatch func(context.Context, model.ID, model.ID, []*packetbuf.Buffer) error
 	tcpIntercept   atomic.Pointer[TCPIntercept]
 	tcpCarrier     atomic.Pointer[TCPCarrier]
@@ -205,7 +203,6 @@ func New(snapshot model.Snapshot, send Send, deliver Deliver, batches ...BatchOp
 	router := &Router{send: send, deliver: deliver}
 	if len(batches) > 0 {
 		router.deliverBatch = batches[0].Deliver
-		router.sendBatch = batches[0].Send
 		router.sendOwnedBatch = batches[0].SendOwned
 	}
 	if err := router.Configure(snapshot); err != nil {
@@ -304,8 +301,6 @@ func (r *Router) FromTunnelBatch(ctx context.Context, networkID model.ID, packet
 		}
 		if r.sendOwnedBatch != nil {
 			result = errors.Join(result, r.sendOwnedBatch(ctx, networkID, nextHop, owners[:count]))
-		} else if r.sendBatch != nil {
-			result = errors.Join(result, r.sendBatch(ctx, networkID, nextHop, frames[:count]))
 		} else {
 			for _, frame := range frames[:count] {
 				result = errors.Join(result, r.send(ctx, networkID, nextHop, frame))
@@ -339,9 +334,6 @@ func (r *Router) FromTunnelBatch(ctx context.Context, networkID model.ID, packet
 }
 
 func (r *Router) encapsulate(ctx context.Context, n *network, raw []byte) (*packetbuf.Buffer, model.ID, error) {
-	return r.encapsulateSource(ctx, n, raw, nil)
-}
-func (r *Router) encapsulateSource(ctx context.Context, n *network, raw []byte, client *node) (*packetbuf.Buffer, model.ID, error) {
 	if len(raw) > n.mtu {
 		return nil, "", ErrMTU
 	}
@@ -349,11 +341,7 @@ func (r *Router) encapsulateSource(ctx context.Context, n *network, raw []byte, 
 	if err != nil {
 		return nil, "", err
 	}
-	if client != nil {
-		if info.Source != client.address {
-			return nil, "", ErrSource
-		}
-	} else if info.Source != n.self.Address && !n.admits(n.byAddress[n.self.Address], info.Source) {
+	if info.Source != n.self.Address && !n.admits(n.byAddress[n.self.Address], info.Source) {
 		return nil, "", ErrSource
 	}
 	flow := func() uint64 { return info.Flow }
@@ -369,42 +357,28 @@ func (r *Router) encapsulateSource(ctx context.Context, n *network, raw []byte, 
 		return nil, "", ErrUnreachable
 	}
 	if packet.IsTCP(raw) && r.carriesTCP(n.id, nextHop) {
-		if client != nil {
-			return nil, "", ErrTCPOverTCP
-		}
 		return nil, "", r.refuseTCP(ctx, n, raw, nil, nil)
 	}
-	if client != nil && packet.IPHopLimit(raw) <= 1 {
-		return nil, "", r.timeExceeded(ctx, n, raw)
-	}
-	// Room for a Link's two-byte prefix of a compact frame.
+	// Room for the two-byte prefix of a Link's IP message.
 	buffer := packetbuf.GetHeadroom(packet.HeaderSize+len(raw), 2)
 	frame := buffer.Data[:packet.HeaderSize+len(raw)]
 	copy(frame, n.header[:])
-	if client != nil {
-		copy(frame[24:40], client.wire[:])
-	}
 	copy(frame[40:56], destination.wire[:])
 	binary.BigEndian.PutUint64(frame[64:72], info.Flow)
 	copy(frame[packet.HeaderSize:], raw)
-	if client != nil {
-		packet.DecrementIPHopLimit(frame[packet.HeaderSize:])
-	}
 	binary.BigEndian.PutUint16(frame[4:6], uint16(len(frame)-packet.HeaderSize))
 	buffer.Data = frame
 	return buffer, nextHop, nil
 }
 
-// FromPeer must receive the Node ID authenticated by the peer Channel, never an
-// unauthenticated ID read from the packet itself. Transit Nodes are trusted hop
-// forwarders; the IP/Node directory check is admission, not end-to-end signing.
-func (r *Router) FromPeer(ctx context.Context, peerID model.ID, frame []byte) error {
-	return r.fromPeer(ctx, peerID, frame, r.deliver, nil)
-}
-
+// FromPeerOwnedBatch must receive the Node ID authenticated by the peer
+// Channel, never an unauthenticated ID read from the packet itself. Transit
+// Nodes are trusted hop forwarders; the IP/Node directory check is admission,
+// not end-to-end signing.
+//
 // FromPeerOwnedBatch takes ownership of every buffer. A transit frame is
 // forwarded in its own buffer, its hop limits decremented in place; local
-// packets are delivered in batches as FromPeerBatch does.
+// packets are delivered in batches.
 func (r *Router) FromPeerOwnedBatch(ctx context.Context, peerID model.ID, owners []*packetbuf.Buffer) error {
 	var result error
 	var deliverNetwork model.ID
@@ -473,45 +447,8 @@ func (r *Router) FromPeerOwnedBatch(ctx context.Context, peerID model.ID, owners
 	return result
 }
 
-// FromPeerBatch validates every frame independently. Only admitted local
-// packets are batched; transit retains the normal hop-limit and routing checks.
-func (r *Router) FromPeerBatch(ctx context.Context, peerID model.ID, frames [][]byte) error {
-	var networkID model.ID
-	var packets [packetbuf.BatchSize][]byte
-	count := 0
-	var result error
-	flush := func() {
-		if count == 0 {
-			return
-		}
-		if r.deliverBatch != nil {
-			result = errors.Join(result, r.deliverBatch(ctx, networkID, packets[:count]))
-		} else {
-			for _, raw := range packets[:count] {
-				result = errors.Join(result, r.deliver(ctx, networkID, raw))
-			}
-		}
-		clear(packets[:count])
-		count = 0
-	}
-	deliver := func(_ context.Context, id model.ID, raw []byte) error {
-		if id != networkID || count == len(packets) {
-			flush()
-		}
-		networkID = id
-		packets[count] = raw
-		count++
-		return nil
-	}
-	for _, frame := range frames {
-		result = errors.Join(result, r.fromPeer(ctx, peerID, frame, deliver, nil))
-	}
-	flush()
-	return result
-}
-
-// fromPeer forwards a transit frame with forward when the caller owns frame:
-// its hop limits are then decremented in place. Otherwise it sends a copy.
+// fromPeer forwards a transit frame with forward, which takes the caller's
+// buffer; its hop limits are decremented in place.
 func (r *Router) fromPeer(ctx context.Context, peerID model.ID, frame []byte, deliver Deliver, forward func(network, next model.ID)) error {
 	p, err := packet.ParseView(frame)
 	if err != nil {
@@ -557,16 +494,9 @@ func (r *Router) fromPeer(ctx context.Context, peerID model.ID, frame []byte, de
 		if nextHop == peerID {
 			return fmt.Errorf("route would return packet to ingress neighbor")
 		}
-		if forward != nil {
-			frame[3]--
-			forward(n.id, nextHop)
-			return nil
-		}
-		buffer := packetbuf.Get(len(frame))
-		defer buffer.Release()
-		copy(buffer.Data, frame)
-		buffer.Data[3]--
-		return r.send(ctx, n.id, nextHop, buffer.Data)
+		frame[3]--
+		forward(n.id, nextHop)
+		return nil
 	}
 	info, err := packet.InspectAddresses(raw)
 	if err != nil {
@@ -601,19 +531,10 @@ func (r *Router) fromPeer(ctx context.Context, peerID model.ID, frame []byte, de
 	if packet.IsTCP(raw) && r.carriesTCP(n.id, nextHop) {
 		return r.refuseTCP(ctx, n, raw, source, destination)
 	}
-	if forward != nil {
-		frame[3]--
-		packet.DecrementIPHopLimit(frame[packet.HeaderSize:])
-		forward(n.id, nextHop)
-		return nil
-	}
-	// Keep the caller's authenticated frame immutable, including its IP header.
-	buffer := packetbuf.Get(len(frame))
-	defer buffer.Release()
-	copy(buffer.Data, frame)
-	buffer.Data[3]--
-	packet.DecrementIPHopLimit(buffer.Data[packet.HeaderSize:])
-	return r.send(ctx, n.id, nextHop, buffer.Data)
+	frame[3]--
+	packet.DecrementIPHopLimit(frame[packet.HeaderSize:])
+	forward(n.id, nextHop)
+	return nil
 }
 
 func (r *Router) timeExceeded(ctx context.Context, n *network, raw []byte) error {
@@ -629,36 +550,10 @@ func (r *Router) timeExceeded(ctx context.Context, n *network, raw []byte) error
 	return r.send(ctx, n.id, hop, buffer.Data)
 }
 
-// CompactHeader rebuilds the header a compact Link omitted. Source and
+// RebuildHeader rebuilds the header an IP message does not carry. Source and
 // destination are the owners of the inner addresses: the only Nodes fromPeer
-// admits for them, so the expanded frame still passes every FromPeer check.
-// CompactIndex returns the wire index of a network's Node.
-func (r *Router) CompactIndex(networkWire, nodeWire [16]byte) (uint16, bool) {
-	n := r.state.Load().byWire[networkWire]
-	if n == nil {
-		return 0, false
-	}
-	entry := n.byNode[nodeWire]
-	if entry == nil {
-		return 0, false
-	}
-	return entry.index, true
-}
-
-// CompactNode returns the Node of a network's wire index.
-func (r *Router) CompactNode(networkWire [16]byte, index uint16) ([16]byte, bool) {
-	n := r.state.Load().byWire[networkWire]
-	if n == nil {
-		return [16]byte{}, false
-	}
-	entry := n.byIndex[index]
-	if entry == nil {
-		return [16]byte{}, false
-	}
-	return entry.wire, true
-}
-
-func (r *Router) CompactHeader(header []byte, networkWire [16]byte, hopLimit uint8, payload []byte) bool {
+// admits for them, so the rebuilt frame passes every fromPeer check.
+func (r *Router) RebuildHeader(header []byte, networkWire [16]byte, hopLimit uint8, payload []byte) bool {
 	n := r.state.Load().byWire[networkWire]
 	if n == nil {
 		return false
@@ -778,7 +673,7 @@ func (n *network) admits(candidate *node, ip netip.Addr) bool {
 	return false
 }
 
-// sourceOwner names a source Node for a header a compact Link omitted: the
+// sourceOwner names a source Node for a header an IP message omits: the
 // overlay host, or an advertiser of the longest matching prefix other than
 // this Node, which never receives its own traffic from a peer.
 // mayRelay reports whether a frame from source may arrive from neighbor peerID.

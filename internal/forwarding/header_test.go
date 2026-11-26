@@ -13,10 +13,10 @@ import (
 	"github.com/eddiexyang/graphnet/internal/testutil"
 )
 
-// Every hop carries only the hop limit and IP packet, as a compact Link does.
+// Every hop carries only the hop limit and IP packet, as a Link does.
 // The receiver's rebuilt header must equal the sender's routing fields, so
 // forwarding, transit and admission behave exactly as with full frames.
-func TestCompactHeaderRebuildsRoutedFrames(t *testing.T) {
+func TestRebuildHeaderRoutesFrames(t *testing.T) {
 	state := testutil.Topology()
 	n := &state.Networks[0]
 	n.Nodes[2].AdvertisedSubnets = []model.AdvertisedSubnet{{Prefix: netip.MustParsePrefix("192.168.10.0/24"), GatewayMode: model.GatewayOff}}
@@ -33,14 +33,14 @@ func TestCompactHeaderRebuildsRoutedFrames(t *testing.T) {
 		r, err := forwarding.New(snapshot, func(ctx context.Context, network, next model.ID, frame []byte) error {
 			hops++
 			rebuilt := make([]byte, len(frame))
-			if !routers[next].CompactHeader(rebuilt, [16]byte(frame[8:24]), frame[3], frame[packet.HeaderSize:]) {
-				t.Fatalf("hop %d: compact header not rebuilt", hops)
+			if !routers[next].RebuildHeader(rebuilt, [16]byte(frame[8:24]), frame[3], frame[packet.HeaderSize:]) {
+				t.Fatalf("hop %d: header not rebuilt", hops)
 			}
 			copy(rebuilt[packet.HeaderSize:], frame[packet.HeaderSize:])
 			if !bytes.Equal(rebuilt[:56], frame[:56]) {
 				t.Fatalf("hop %d: rebuilt header %x, sent %x", hops, rebuilt[:56], frame[:56])
 			}
-			return routers[next].FromPeer(ctx, node.ID, rebuilt)
+			return fromPeer(routers[next], ctx, node.ID, rebuilt)
 		}, func(_ context.Context, _ model.ID, raw []byte) error {
 			delivered, payload = node.ID, append([]byte(nil), raw...)
 			return nil
@@ -79,11 +79,11 @@ func TestCompactHeaderRebuildsRoutedFrames(t *testing.T) {
 	}
 	wire := [16]byte(full[8:24])
 	for _, raw := range [][]byte{ipv4("10.42.0.1", "203.0.113.9"), ipv4("10.99.0.1", "10.42.0.1"), {0x45}} {
-		if routers[a].CompactHeader(header, wire, 8, raw) {
+		if routers[a].RebuildHeader(header, wire, 8, raw) {
 			t.Fatalf("rebuilt a header for unadmitted packet %x", raw)
 		}
 	}
-	if routers[a].CompactHeader(header, [16]byte{1}, 8, ipv4("10.42.0.1", "10.42.0.2")) {
+	if routers[a].RebuildHeader(header, [16]byte{1}, 8, ipv4("10.42.0.1", "10.42.0.2")) {
 		t.Fatal("rebuilt a header for an unknown network")
 	}
 }

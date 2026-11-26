@@ -208,8 +208,8 @@ func TestSizeProbeEndToEnd(t *testing.T) {
 
 	t.Run("both support probes", func(t *testing.T) {
 		a, b := pipePair()
-		dialer := newCompactTestLink(t, a, dialerOptions)
-		acceptor := newCompactTestLink(t, b, acceptorOptions)
+		dialer := newTestLink(t, a, dialerOptions)
+		acceptor := newTestLink(t, b, acceptorOptions)
 		if !healthy(dialer, acceptor) {
 			t.Fatal("verified links did not become healthy")
 		}
@@ -225,8 +225,8 @@ func TestSizeProbeEndToEnd(t *testing.T) {
 		a, b := pipePair()
 		older := fast
 		older.Accepted = true
-		dialer := newCompactTestLink(t, a, dialerOptions)
-		acceptor := newCompactTestLink(t, b, older)
+		dialer := newTestLink(t, a, dialerOptions)
+		acceptor := newTestLink(t, b, older)
 		if !healthy(dialer, acceptor) {
 			t.Fatal("link to an older acceptor did not become healthy")
 		}
@@ -240,8 +240,8 @@ func TestSizeProbeEndToEnd(t *testing.T) {
 
 	t.Run("full-size segments lost", func(t *testing.T) {
 		a, b := pipePair()
-		dialer := newCompactTestLink(t, dropLarge{a, 1000}, dialerOptions)
-		acceptor := newCompactTestLink(t, b, acceptorOptions)
+		dialer := newTestLink(t, dropLarge{a, 1000}, dialerOptions)
+		acceptor := newTestLink(t, b, acceptorOptions)
 		for _, l := range []*Link{dialer, acceptor} {
 			select {
 			case <-l.Done():
@@ -264,8 +264,8 @@ func TestDialerProbesWhenHelloArrives(t *testing.T) {
 	dialerOptions, acceptorOptions := Options{SizeProbe: true}, Options{Accepted: true, SizeProbe: true, SizeProbeHello: true}
 	a, b := pipePair()
 	start := time.Now()
-	dialer := newCompactTestLink(t, a, dialerOptions)
-	acceptor := newCompactTestLink(t, b, acceptorOptions)
+	dialer := newTestLink(t, a, dialerOptions)
+	acceptor := newTestLink(t, b, acceptorOptions)
 	for !(dialer.Healthy() && acceptor.Healthy()) {
 		if time.Since(start) > defaults.Heartbeat {
 			t.Fatalf("dialer healthy=%v acceptor healthy=%v after a heartbeat", dialer.Healthy(), acceptor.Healthy())

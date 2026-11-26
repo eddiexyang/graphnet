@@ -18,8 +18,8 @@ const (
 	MaxMessages   = uint64(1) << 32
 	RenewMessages = 3 * (uint64(1) << 30)
 	MaxSessionAge = time.Hour
-	// Plaintext includes a message type and, for data, a complete overlay
-	// frame, which a compact frame's prefix precedes with two more bytes.
+	// Plaintext is a Link message: its type and, for data, at most a
+	// complete overlay frame. Peers enforce the same bound, so it stays.
 	MaxPlaintext = packet.MaxFrame + 3
 	// Overhead is a message's nonce, its sequence in 4 bytes, and its tag.
 	Overhead = NonceSize + 16
