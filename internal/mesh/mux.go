@@ -115,6 +115,7 @@ type mux struct {
 	queuedStreams map[*muxStream]bool
 	resets        []muxResetEntry
 	lostSince     time.Time
+	lastAck       time.Time
 	closed        bool
 	// queued is the bytes of frames waiting for the Link writer. Once it
 	// reaches muxQueue a stream waits while it holds its share of that, so a
@@ -322,6 +323,7 @@ func (m *mux) linkDone(l *link.Link) {
 	var next *link.Link
 	if m.current == l {
 		m.current = nil
+		m.lastAck = time.Time{}
 		if pref := m.preferredActiveLocked(active); pref != nil {
 			m.switchLocked(pref)
 			next = pref
@@ -360,6 +362,7 @@ func (m *mux) bestLocked() *link.Link {
 func (m *mux) switchLocked(l *link.Link) {
 	m.current = l
 	m.lostSince = time.Time{}
+	m.lastAck = time.Time{}
 	resent := 0
 	for _, s := range m.streams {
 		resent += s.unsent
@@ -406,7 +409,13 @@ func (m *mux) maintain() {
 		switch {
 		case s.session:
 			// A session rebuilds what a stalled hop holds instead of waiting.
-			if len(s.frames) > 0 && now.Sub(s.progress) >= muxStall {
+			// While the current Link is actively acknowledging other streams in
+			// order, queued frames on this stream are backpressured, not stalled.
+			progress := s.progress
+			if m.current != nil && m.lastAck.After(progress) {
+				progress = m.lastAck
+			}
+			if len(s.frames) > 0 && now.Sub(progress) >= muxStall {
 				failed = append(failed, s)
 			}
 		case m.current == nil && !m.lostSince.IsZero() && now.Sub(m.lostSince) >= muxLinkLoss:
@@ -807,7 +816,11 @@ func (m *mux) receiveAckConsumed(id, received, limit, consumed uint64, stated bo
 		s.peerDelivered = max(s.peerDelivered, delivered)
 	}
 	if received > s.acked {
-		s.progress = time.Now()
+		now := time.Now()
+		s.progress = now
+		if m.current != nil {
+			m.lastAck = now
+		}
 		s.acked = received
 		drop := 0
 		for drop < len(s.frames) && s.frames[drop].end <= received {

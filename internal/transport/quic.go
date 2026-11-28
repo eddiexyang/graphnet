@@ -25,6 +25,7 @@ import (
 	quic "github.com/eddiexyang/quic-go"
 	"github.com/eddiexyang/quic-go/bbr"
 	"github.com/eddiexyang/quic-go/congestion"
+	"github.com/eddiexyang/quic-go/monotime"
 	"golang.org/x/crypto/chacha20"
 	"golang.org/x/net/ipv4"
 )
@@ -187,7 +188,6 @@ func (h *UDP) EnableQUIC(identity ed25519.PrivateKey, options ...QUICOptions) (*
 	q.ids = quicIDs{key: quicKey(identity.Seed(), "GraphNet QUIC connection ID v1")}
 	q.knockKey = quicKey(identity.Public().(ed25519.PublicKey), quicKnockLabel)
 	for _, socket := range h.sockets {
-		_ = socket.SetWriteBuffer(4 << 20)
 		conn := &quicSocket{socket: socket, hub: h, incoming: make(chan udpPacketCopy, quicQueue), done: make(chan struct{})}
 		engine := &quic.Transport{
 			Conn:                             conn,
@@ -210,6 +210,9 @@ func (h *UDP) EnableQUIC(identity ed25519.PrivateKey, options ...QUICOptions) (*
 			q.close()
 			return nil, err
 		}
+		// quic-go's wrapConn raises SO_SNDBUF via SO_SNDBUFFORCE during Listen;
+		// re-apply the bounded write buffer afterwards so Linux keeps send queueing tight.
+		_ = socket.SetWriteBuffer(1 << 20)
 		q.engines[socket], q.sockets[socket] = engine, conn
 		q.listeners = append(q.listeners, listener)
 	}
@@ -248,7 +251,7 @@ func (q *QUICHub) acceptStream(ctx context.Context, conn *quic.Conn) {
 		return
 	}
 	release, _ := conn.Context().Value(quicAdmissionKey{}).(func())
-	link := &QUIC{Stream: NewStream(&quicConn{Stream: stream, conn: conn}), conn: conn, releaseAdmission: release}
+	link := &QUIC{Stream: NewStream(&quicConn{Stream: stream, conn: conn, receiveWindow: int(q.opts.MaxStreamReceiveWindow)}), conn: conn, releaseAdmission: release}
 	select {
 	case q.accepted <- link:
 	case <-ctx.Done():
@@ -256,8 +259,31 @@ func (q *QUICHub) acceptStream(ctx context.Context, conn *quic.Conn) {
 	}
 }
 
+// bbrPriorInFlight adapts quic-go's sentPacketHandler (which increments
+// bytesInFlight before calling OnPacketSent) to BBR's expectation of
+// priorInFlight (0 on quiescence exit).
+type bbrPriorInFlight struct {
+	congestion.CongestionControlEx
+}
+
+func (w bbrPriorInFlight) OnPacketSent(
+	sentTime monotime.Time,
+	bytesInFlight congestion.ByteCount,
+	packetNumber congestion.PacketNumber,
+	bytes congestion.ByteCount,
+	isRetransmittable bool,
+) {
+	priorInFlight := bytesInFlight
+	if isRetransmittable && priorInFlight >= bytes {
+		priorInFlight -= bytes
+	}
+	w.CongestionControlEx.OnPacketSent(sentTime, priorInFlight, packetNumber, bytes, isRetransmittable)
+}
+
 func installBBRv1(conn *quic.Conn) {
-	conn.SetCongestionControl(bbr.NewBbrSender(bbr.DefaultClock{}, congestion.InitialPacketSize, bbr.ProfileStandard))
+	conn.SetCongestionControl(bbrPriorInFlight{
+		CongestionControlEx: bbr.NewBbrSender(bbr.DefaultClock{}, congestion.InitialPacketSize, bbr.ProfileStandard),
+	})
 }
 
 func quicConfig(opts QUICOptions) *quic.Config {
@@ -371,7 +397,7 @@ func (q *QUICHub) DialAt(ctx context.Context, endpoint model.Endpoint, family in
 				cancel()
 				retained = true
 				context.AfterFunc(conn.Context(), release)
-				return &QUIC{Stream: NewStream(&quicConn{Stream: stream, conn: conn}), conn: conn, releaseAdmission: release}, nil
+				return &QUIC{Stream: NewStream(&quicConn{Stream: stream, conn: conn, receiveWindow: int(q.opts.MaxStreamReceiveWindow)}), conn: conn, releaseAdmission: release}, nil
 			}
 		}
 		cancel()
@@ -407,7 +433,15 @@ func (q *QUICHub) knockUntil(ctx context.Context, socket *net.UDPConn, remote ne
 // quicConn is a QUIC stream as a net.Conn; closing it closes the connection.
 type quicConn struct {
 	*quic.Stream
-	conn *quic.Conn
+	conn          *quic.Conn
+	receiveWindow int
+}
+
+func (c *quicConn) ReceiveWindow() (int, bool) {
+	if c.receiveWindow <= 0 {
+		return 0, false
+	}
+	return c.receiveWindow, true
 }
 
 func (c *quicConn) LocalAddr() net.Addr  { return c.conn.LocalAddr() }

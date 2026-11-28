@@ -42,7 +42,7 @@ const (
 )
 
 // An end without a working chain this long resets the connection.
-var orphanLifetime = 2 * time.Minute
+var orphanLifetime = 30 * time.Second
 
 // Response statuses for a chain's request.
 const (
@@ -1261,6 +1261,18 @@ func (e *End) Close() error {
 	}
 	e.mu.Unlock()
 	go func() {
+		// Bound tail-delivery wait so a wedged or half-closed peer can never
+		// pin retained buffers or session ends indefinitely.
+		drainTimer := time.AfterFunc(orphanLifetime, func() {
+			e.mu.Lock()
+			if !e.done {
+				e.finishLocked(errNoPath)
+			}
+			e.mu.Unlock()
+		})
+		defer drainTimer.Stop()
+
+		var watched Hop
 		e.mu.Lock()
 		defer e.mu.Unlock()
 		for !e.done {
@@ -1268,12 +1280,28 @@ func (e *End) Close() error {
 			if e.eof && e.ended && e.hop != nil && e.hop.PeerDelivered() > end {
 				break
 			}
+			if hop := e.hop; hop != nil && hop != watched {
+				watched = hop
+				go func(h Hop) {
+					select {
+					case <-h.Done():
+						e.mu.Lock()
+						if !e.done && e.hop == h {
+							e.failLocked(h)
+						}
+						e.mu.Unlock()
+					case <-e.ctx.Done():
+					}
+				}(hop)
+			}
 			e.cond.Wait()
 		}
-		if e.hop != nil {
-			e.hop.Close()
+		if !e.done {
+			if e.hop != nil {
+				e.hop.Close()
+			}
+			e.finishLocked(nil)
 		}
-		e.finishLocked(nil)
 	}()
 	return nil
 }

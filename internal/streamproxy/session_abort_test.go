@@ -131,3 +131,67 @@ func TestEgressOrphanExpiresAfterFailLocked(t *testing.T) {
 		t.Fatalf("retained ends = %d, want 0", ends)
 	}
 }
+
+func TestCloseAfterBothDirectionsEndedReleasesOnHopAbort(t *testing.T) {
+	counters := &Counters{}
+	hop := newAbortTestHop(true)
+	e := NewEgress(t.Context(), hop, func(uint32) {}, counters)
+	e.keep.Add([]byte("tail-bytes"), nil, 0)
+	e.mu.Lock()
+	e.eof, e.ended = true, true
+	e.mu.Unlock()
+
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Peer resets the hop while End.Close is waiting for PeerDelivered > end.
+	hop.AbortSession()
+
+	select {
+	case <-e.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("End.Close leaked after both directions ended and hop aborted")
+	}
+	if got := counters.Retained(); got != 0 {
+		t.Fatalf("retained bytes = %d, want 0", got)
+	}
+	counters.retained.mu.Lock()
+	ends := counters.retained.ends
+	counters.retained.mu.Unlock()
+	if ends != 0 {
+		t.Fatalf("retained ends = %d, want 0", ends)
+	}
+}
+
+func TestCloseAfterBothDirectionsEndedExpiresOnSilentHop(t *testing.T) {
+	prev := orphanLifetime
+	orphanLifetime = 50 * time.Millisecond
+	t.Cleanup(func() { orphanLifetime = prev })
+
+	counters := &Counters{}
+	hop := newAbortTestHop(false)
+	e := NewEgress(t.Context(), hop, func(uint32) {}, counters)
+	e.keep.Add([]byte("tail-bytes"), nil, 0)
+	e.mu.Lock()
+	e.eof, e.ended = true, true
+	e.mu.Unlock()
+
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-e.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("End.Close leaked past orphanLifetime on silent hop")
+	}
+	if got := counters.Retained(); got != 0 {
+		t.Fatalf("retained bytes = %d, want 0", got)
+	}
+	counters.retained.mu.Lock()
+	ends := counters.retained.ends
+	counters.retained.mu.Unlock()
+	if ends != 0 {
+		t.Fatalf("retained ends = %d, want 0", ends)
+	}
+}

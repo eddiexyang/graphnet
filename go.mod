@@ -9,7 +9,7 @@ replace github.com/boltdb/bolt => ./internal/boltcompat
 require (
 	filippo.io/edwards25519 v1.2.0
 	github.com/coder/websocket v1.8.15
-	github.com/eddiexyang/quic-go v0.63.0-bbr.1
+	github.com/eddiexyang/quic-go v0.63.0-bbr.2
 	github.com/flynn/noise v1.1.0
 	github.com/hashicorp/raft v1.8.0
 	github.com/hashicorp/raft-boltdb/v2 v2.4.2

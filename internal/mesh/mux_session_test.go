@@ -97,6 +97,31 @@ func TestMuxSessionStallResets(t *testing.T) {
 	}
 }
 
+// While the current Link is actively acknowledging frames on another stream,
+// queued session frames do not trigger a false stall reset.
+func TestMuxSessionStallSkippedWhileLinkProgresses(t *testing.T) {
+	p := newMuxPair(t)
+	p.a.g.mesh = &Mesh{}
+	s, _ := sessionPair(t, p)
+	p.a.mu.Lock()
+	s.frames = append(s.frames, muxFrame{end: 10, raw: []byte("queued")})
+	s.progress = time.Now().Add(-muxStall - 50*time.Millisecond)
+	p.a.lastAck = time.Now()
+	p.a.mu.Unlock()
+
+	p.a.maintain()
+
+	p.a.mu.Lock()
+	err := s.err
+	p.a.mu.Unlock()
+	if err != nil {
+		t.Fatalf("session hop spuriously reset while Link was progressing: %v", err)
+	}
+	if got := p.a.g.mesh.Counters()["session_stall_resets"]; got != 0 {
+		t.Fatalf("session_stall_resets = %d, want 0", got)
+	}
+}
+
 // A reset of the connection is told apart from a failed hop.
 func TestMuxSessionAbortReachesPeer(t *testing.T) {
 	p := newMuxPair(t)
