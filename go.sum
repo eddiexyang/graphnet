@@ -6,8 +6,8 @@ github.com/coder/websocket v1.8.15 h1:6B2JPeOGlpff2Uz6vOEH1Vzpi0iUz20A+lPVhPHtNU
 github.com/coder/websocket v1.8.15/go.mod h1:NX3SzP+inril6yawo5CQXx8+fk145lPDC6pumgx0mVg=
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
-github.com/eddiexyang/quic-go v0.63.0-bbr.2 h1:FdFvEefAt+XeRV7DuYpymGaKbE+HmfeSikRo2GjYdoc=
-github.com/eddiexyang/quic-go v0.63.0-bbr.2/go.mod h1:uXnH9k+pngR24kAEjJUZFXQOKyG/Y3jBWdFFEzmw/8Q=
+github.com/eddiexyang/quic-go v0.63.0-bbr.3 h1:GHGC38ty+fKtjfAbz2rH36WO2LKXxt54O9bR6Jjg2EA=
+github.com/eddiexyang/quic-go v0.63.0-bbr.3/go.mod h1:uXnH9k+pngR24kAEjJUZFXQOKyG/Y3jBWdFFEzmw/8Q=
 github.com/fatih/color v1.13.0/go.mod h1:kLAiJbzzSOZDVNGyDpeOxJ47H46qBXwg5ILebYFFOfk=
 github.com/fatih/color v1.19.0 h1:Zp3PiM21/9Ld6FzSKyL5c/BULoe/ONr9KlbYVOfG8+w=
 github.com/fatih/color v1.19.0/go.mod h1:zNk67I0ZUT1bEGsSGyCZYZNrHuTkJJB+r6Q9VuMi0LE=
