@@ -26,6 +26,8 @@ type introduction struct {
 	PathExchange bool   `json:"path_exchange,omitempty"`
 	// TCPStreams offers byte streams on this Link. The acceptor confirms in band.
 	TCPStreams bool `json:"tcp_streams,omitempty"`
+	// QUICStreams offers native per-hop QUIC substreams on a QUIC Link.
+	QUICStreams bool `json:"qs,omitempty"`
 	// LinkState offers link-state advertisements on this Link.
 	LinkState bool `json:"link_state,omitempty"`
 	// SizeProbe offers full-size probes before the Link carries traffic.
@@ -69,6 +71,7 @@ func (g *group) schedule() {
 		g.retireSessions()
 		g.drain()
 		g.mux.maintain()
+		g.maintainQUICStreams()
 		cfg := g.policy.Load()
 		candidates := g.candidates(cfg, true)
 		if pref := g.mesh.preferredTransport; pref != "" && slices.Contains(cfg.peer.Edge.Transports, pref) {
@@ -332,9 +335,10 @@ func (g *group) connect(ctx context.Context, candidate link.Candidate) (*peer.Ch
 		return nil, linkCaps{}, err
 	}
 	streams := g.mesh.streamsEnabled() && streamTransport(candidate.Endpoint.Transport)
-	offered := linkCaps{streams: streams, resume: g.mesh.resumeEnabled(), windows: streams && g.mesh.resumeEnabled(), linkState: g.mesh.linkStateEnabled(), sizeProbe: streamTransport(candidate.Endpoint.Transport)}
+	quicStreams := streams && candidate.Endpoint.Transport == model.QUIC
+	offered := linkCaps{streams: streams, quicStreams: quicStreams, resume: g.mesh.resumeEnabled(), windows: streams && g.mesh.resumeEnabled(), linkState: g.mesh.linkStateEnabled(), sizeProbe: streamTransport(candidate.Endpoint.Transport)}
 	heartbeat, _ := linkTiming(g.policy.Load().detection, offered)
-	intro := introduction{Candidate: candidate.ID, Endpoint: endpointFingerprint(candidate.Endpoint), Scope: link.ScopeIdentity(candidate.Scope), PathExchange: true, TCPStreams: offered.streams, LinkState: offered.linkState, SizeProbe: offered.sizeProbe, TCPResume: offered.resume, Windows: offered.windows, Heartbeat: uint32(heartbeat.Milliseconds())}
+	intro := introduction{Candidate: candidate.ID, Endpoint: endpointFingerprint(candidate.Endpoint), Scope: link.ScopeIdentity(candidate.Scope), PathExchange: true, TCPStreams: offered.streams, QUICStreams: offered.quicStreams, LinkState: offered.linkState, SizeProbe: offered.sizeProbe, TCPResume: offered.resume, Windows: offered.windows, Heartbeat: uint32(heartbeat.Milliseconds())}
 	if candidate.Target.IsValid() {
 		intro.Target = candidate.Target.String()
 	}
@@ -358,6 +362,10 @@ func (g *group) connect(ctx context.Context, candidate link.Candidate) (*peer.Ch
 	if offered.resume && len(encoded)+1 > maxIntroduction {
 		// Its streams then carry only connections without sessions.
 		offered.resume, intro.TCPResume = false, false
+		encoded, _ = json.Marshal(intro)
+	}
+	if offered.quicStreams && len(encoded)+1 > maxIntroduction {
+		offered.quicStreams, intro.QUICStreams = false, false
 		encoded, _ = json.Marshal(intro)
 	}
 	if err := channel.Send(ctx, append([]byte{0}, encoded...)); err != nil {

@@ -51,21 +51,99 @@ const (
 	quicKnockLabel = "GraphNet QUIC knock v2"
 )
 
-// QUIC carries a Link as one bidirectional stream of length-framed messages,
-// as TCP does, over the UDP hub's sockets. Like a TCP Link it carries
-// streams; unlike one it shares the port with native UDP and STUN.
+// QUIC carries a Link's control channel on Stream 0 at highest scheduling
+// priority and multiplexes packet and per-hop byte streams onto dedicated
+// QUIC streams once authenticated.
 type QUIC struct {
 	*Stream
 	conn             *quic.Conn
 	releaseAdmission func()
+	authed           chan struct{}
+	authOnce         sync.Once
+}
+
+func newQUIC(stream *quic.Stream, conn *quic.Conn, receiveWindow int, release func()) *QUIC {
+	stream.SetPriority(0, false)
+	return &QUIC{
+		Stream:           NewStream(&quicConn{Stream: stream, conn: conn, receiveWindow: receiveWindow}),
+		conn:             conn,
+		releaseAdmission: release,
+		authed:           make(chan struct{}),
+	}
 }
 
 // Authenticated is invoked by the configured Noise handshake, never by QUIC's
 // TLS, which only pins the server.
 func (q *QUIC) Authenticated() {
-	if q.releaseAdmission != nil {
-		q.releaseAdmission()
+	q.authOnce.Do(func() {
+		close(q.authed)
+		if q.releaseAdmission != nil {
+			q.releaseAdmission()
+		}
+	})
+}
+
+// QUICSubstream is a bidirectional QUIC stream opened on an authenticated QUIC
+// connection. Closing or cancelling it affects only this stream, never the
+// underlying QUIC connection.
+type QUICSubstream struct {
+	*quic.Stream
+}
+
+func (s *QUICSubstream) StreamID() uint64 { return uint64(s.Stream.StreamID()) }
+
+func (s *QUICSubstream) CloseWrite() error { return s.Stream.Close() }
+
+func (s *QUICSubstream) Cancel(code uint64) {
+	s.Stream.CancelRead(quic.StreamErrorCode(code))
+	s.Stream.CancelWrite(quic.StreamErrorCode(code))
+}
+
+func (s *QUICSubstream) Close() error {
+	s.Stream.CancelRead(0)
+	return s.Stream.Close()
+}
+
+// OpenSubstream opens a bidirectional QUIC stream with the given RFC 9218
+// urgency and incremental scheduling flag once Noise authentication succeeded.
+func (q *QUIC) OpenSubstream(ctx context.Context, urgency int8, incremental bool) (*QUICSubstream, error) {
+	select {
+	case <-q.authed:
+	default:
+		return nil, errors.New("QUIC connection is not authenticated")
 	}
+	st, err := q.conn.OpenStreamSync(ctx)
+	if err != nil {
+		return nil, err
+	}
+	st.SetPriority(urgency, incremental)
+	return &QUICSubstream{Stream: st}, nil
+}
+
+// AcceptSubstream accepts the next peer-initiated bidirectional QUIC stream
+// after Noise authentication succeeded.
+func (q *QUIC) AcceptSubstream(ctx context.Context) (*QUICSubstream, error) {
+	select {
+	case <-q.authed:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-q.conn.Context().Done():
+		return nil, context.Cause(q.conn.Context())
+	}
+	st, err := q.conn.AcceptStream(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &QUICSubstream{Stream: st}, nil
+}
+
+// StreamErrorCode extracts the peer's QUIC application stream reset/stop code.
+func StreamErrorCode(err error) (uint64, bool) {
+	var se *quic.StreamError
+	if errors.As(err, &se) {
+		return uint64(se.ErrorCode), true
+	}
+	return 0, false
 }
 
 // QUICHub dials and accepts QUIC Links on a UDP hub's sockets.
@@ -188,6 +266,7 @@ func (h *UDP) EnableQUIC(identity ed25519.PrivateKey, options ...QUICOptions) (*
 	q.ids = quicIDs{key: quicKey(identity.Seed(), "GraphNet QUIC connection ID v1")}
 	q.knockKey = quicKey(identity.Public().(ed25519.PublicKey), quicKnockLabel)
 	for _, socket := range h.sockets {
+		setUDPSocketBuffers(socket)
 		conn := &quicSocket{socket: socket, hub: h, incoming: make(chan udpPacketCopy, quicQueue), done: make(chan struct{})}
 		engine := &quic.Transport{
 			Conn:                             conn,
@@ -212,7 +291,7 @@ func (h *UDP) EnableQUIC(identity ed25519.PrivateKey, options ...QUICOptions) (*
 		}
 		// quic-go's wrapConn raises SO_SNDBUF via SO_SNDBUFFORCE during Listen;
 		// re-apply the bounded write buffer afterwards so Linux keeps send queueing tight.
-		_ = socket.SetWriteBuffer(1 << 20)
+		setUDPSocketBuffers(socket)
 		q.engines[socket], q.sockets[socket] = engine, conn
 		q.listeners = append(q.listeners, listener)
 	}
@@ -250,8 +329,12 @@ func (q *QUICHub) acceptStream(ctx context.Context, conn *quic.Conn) {
 		conn.CloseWithError(1, "no stream")
 		return
 	}
+	if stream.StreamID() != 0 {
+		conn.CloseWithError(1, "unexpected initial stream")
+		return
+	}
 	release, _ := conn.Context().Value(quicAdmissionKey{}).(func())
-	link := &QUIC{Stream: NewStream(&quicConn{Stream: stream, conn: conn, receiveWindow: int(q.opts.MaxStreamReceiveWindow)}), conn: conn, releaseAdmission: release}
+	link := newQUIC(stream, conn, int(q.opts.MaxStreamReceiveWindow), release)
 	select {
 	case q.accepted <- link:
 	case <-ctx.Done():
@@ -290,7 +373,7 @@ func quicConfig(opts QUICOptions) *quic.Config {
 	opts = opts.normalize()
 	return &quic.Config{Versions: []quic.Version{quic.Version1},
 		HandshakeIdleTimeout: 5 * time.Second, MaxIdleTimeout: 15 * time.Second, KeepAlivePeriod: 5 * time.Second,
-		MaxIncomingStreams: 1, MaxIncomingUniStreams: -1,
+		MaxIncomingStreams: 4096, MaxIncomingUniStreams: -1,
 		InitialStreamReceiveWindow:     opts.InitialStreamReceiveWindow,
 		MaxStreamReceiveWindow:         opts.MaxStreamReceiveWindow,
 		InitialConnectionReceiveWindow: opts.InitialConnectionReceiveWindow,
@@ -397,7 +480,7 @@ func (q *QUICHub) DialAt(ctx context.Context, endpoint model.Endpoint, family in
 				cancel()
 				retained = true
 				context.AfterFunc(conn.Context(), release)
-				return &QUIC{Stream: NewStream(&quicConn{Stream: stream, conn: conn, receiveWindow: int(q.opts.MaxStreamReceiveWindow)}), conn: conn, releaseAdmission: release}, nil
+				return newQUIC(stream, conn, int(q.opts.MaxStreamReceiveWindow), release), nil
 			}
 		}
 		cancel()

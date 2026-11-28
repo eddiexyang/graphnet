@@ -95,6 +95,12 @@ type Options struct {
 	// side enables streams when that announcement arrives.
 	Streams     StreamHandler
 	StreamHello bool
+	// QUICStreams carries per-hop byte streams and packets on native QUIC
+	// substreams instead of Stream 0 multiplexing when both sides support it.
+	QUICStreams       bool
+	QUICStreamHello   bool
+	QUICStreamHandler QUICStreamHandler
+	Substreams        *SubstreamProvider
 	// Resume offers (dialer) or confirms (acceptor) resumable TCP sessions on
 	// the streams. The acceptor confirms with a hello message.
 	Resume bool
@@ -217,6 +223,14 @@ type Link struct {
 	sent, lost      uint64
 	rx, tx, dropped atomic.Uint64
 	streamsReady    atomic.Bool
+	quicStreams     atomic.Bool
+	packetSubSet    atomic.Bool
+	packetSubReady  atomic.Bool
+	packetSubWake   chan struct{}
+	hopAckMu        sync.Mutex
+	hopAcks         map[uint64]hopAckEntry
+	hopAckOrder     []uint64
+	hopAckWake      chan struct{}
 	resume          atomic.Bool
 	windows         atomic.Bool
 	streamWake      chan struct{}
@@ -257,10 +271,12 @@ func New(parent context.Context, channel Channel, info Info, headers Headers, op
 		}
 	}
 	ctx, cancel := context.WithCancel(parent)
-	l := &Link{channel: channel, info: info, options: options, headers: headers, ctx: ctx, cancel: cancel, done: make(chan struct{}), dataReady: make(chan struct{}, 1), retime: make(chan struct{}, 1), selection: make(chan Selection, 8), control: make(chan []byte, 8), ownedPackets: packetbuf.NewQueue(queueSize), pending: map[uint64]time.Time{}, started: time.Now()}
+	l := &Link{channel: channel, info: info, options: options, headers: headers, ctx: ctx, cancel: cancel, done: make(chan struct{}), dataReady: make(chan struct{}, 1), retime: make(chan struct{}, 1), selection: make(chan Selection, 8), control: make(chan []byte, 16), ownedPackets: packetbuf.NewQueue(queueSize), pending: map[uint64]time.Time{}, started: time.Now()}
 	l.pathEnabled = options.PathExchange
 	l.retirements = make(chan Retirement, 8)
 	l.streamWake = make(chan struct{}, 1)
+	l.packetSubWake = make(chan struct{}, 1)
+	l.hopAckWake = make(chan struct{}, 1)
 	l.linkStateOut = make(chan []byte, linkStateQueue)
 	l.dataGeneration.Store(1)
 	// The size-probe hello must precede every other message; see sizeprobe.go.
@@ -277,7 +293,11 @@ func New(parent context.Context, channel Channel, info Info, headers Headers, op
 		l.control <- []byte{resumeHelloMessage, 1}
 		l.resume.Store(true)
 	}
-	if options.Streams != nil && options.StreamHello && l.tcpBacked() {
+	if options.QUICStreams && options.QUICStreamHello && l.info.Transport == model.QUIC && options.Substreams != nil && options.QUICStreamHandler != nil {
+		l.control <- []byte{quicStreamHelloMessage, 1}
+		l.quicStreams.Store(true)
+		l.streamsReady.Store(true)
+	} else if options.Streams != nil && options.StreamHello && l.tcpBacked() {
 		// Prior capability hellos precede streamHello, which precedes every stream frame.
 		l.control <- []byte{streamHelloMessage, 1}
 		l.streamsReady.Store(true)
@@ -294,7 +314,10 @@ func New(parent context.Context, channel Channel, info Info, headers Headers, op
 	go l.readLoop()
 	go l.writeLoop()
 	go l.healthLoop()
-	if l.streamsReady.Load() {
+	if l.quicStreams.Load() {
+		l.startQUICSubstreams(false)
+		options.QUICStreamHandler.QUICStreamsReady(l)
+	} else if l.streamsReady.Load() {
 		options.Streams.StreamsReady(l)
 	}
 	if l.linkStateReady.Load() {
@@ -533,6 +556,10 @@ func (l *Link) tcpBacked() bool {
 }
 
 func (l *Link) notifyData() {
+	if l.packetSubReady.Load() {
+		l.notifyPacketSub()
+		return
+	}
 	select {
 	case l.dataReady <- struct{}{}:
 	default:
@@ -736,12 +763,32 @@ func (l *Link) readLoop() {
 			if count == len(ready) {
 				flush()
 			}
+		case quicStreamHelloMessage:
+			if len(raw) != 2 || l.streamsReady.Load() || !l.options.QUICStreams || l.options.QUICStreamHello || l.info.Transport != model.QUIC || l.options.Substreams == nil || l.options.QUICStreamHandler == nil {
+				return
+			}
+			l.sizeProbeUnsupported()
+			if !l.quicStreams.Swap(true) {
+				l.streamsReady.Store(true)
+				l.startQUICSubstreams(true)
+				l.options.QUICStreamHandler.QUICStreamsReady(l)
+			}
+		case hopDeliveredMessage:
+			if !l.quicStreams.Load() || len(raw) != hopDeliveredSize {
+				return
+			}
+			flags := raw[1]
+			streamID := binary.BigEndian.Uint64(raw[2:10])
+			consumed := binary.BigEndian.Uint64(raw[10:18])
+			delivered := binary.BigEndian.Uint64(raw[18:26])
+			l.options.QUICStreamHandler.ReceiveHopDelivered(l, streamID, consumed, delivered, flags&hopFlagFin != 0, flags&hopFlagExplicit != 0)
+			l.sawStream(time.Now())
 		case streamHelloMessage:
 			if len(raw) != 2 || l.options.Streams == nil || l.options.StreamHello || !l.tcpBacked() {
 				return
 			}
 			l.sizeProbeUnsupported()
-			if !l.streamsReady.Swap(true) {
+			if !l.quicStreams.Load() && !l.streamsReady.Swap(true) {
 				l.options.Streams.StreamsReady(l)
 			}
 		case resumeHelloMessage:
@@ -862,6 +909,13 @@ func (l *Link) writeLoop() {
 		}
 		if count == 0 {
 			select {
+			case <-l.hopAckWake:
+				count = l.pullHopAcks(messages[:limit])
+			default:
+			}
+		}
+		if count == 0 {
+			select {
 			case messages[0] = <-l.linkStateOut:
 				count = 1
 			default:
@@ -880,11 +934,17 @@ func (l *Link) writeLoop() {
 				return
 			case messages[0] = <-l.control:
 				count = 1
+			case <-l.hopAckWake:
+				count = l.pullHopAcks(messages[:limit])
 			case messages[0] = <-l.linkStateOut:
 				count = 1
 			case <-l.streamWake:
 				count = l.pullStreams(messages[:limit], owners[:limit])
 			case <-l.dataReady:
+				if l.packetSubReady.Load() {
+					l.notifyPacketSub()
+					continue
+				}
 				l.queueMu.Lock()
 				for l.dataCount > 0 && count < limit {
 					data := l.takeData()
@@ -1118,6 +1178,12 @@ func (l *Link) logUp(attrs ...any) {
 }
 
 func (l *Link) notifyStreamsHealthy() {
+	if l.quicStreams.Load() {
+		if sh, ok := l.options.QUICStreamHandler.(interface{ LinkHealthy(*Link) }); ok {
+			sh.LinkHealthy(l)
+		}
+		return
+	}
 	if l.streamsReady.Load() {
 		if sh, ok := l.options.Streams.(interface{ LinkHealthy(*Link) }); ok {
 			sh.LinkHealthy(l)

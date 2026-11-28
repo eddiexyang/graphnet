@@ -1,6 +1,8 @@
 package secure
 
 import (
+	"crypto/hkdf"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"runtime"
@@ -8,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/eddiexyang/graphnet/internal/model"
 	"github.com/eddiexyang/graphnet/internal/packet"
 	"github.com/flynn/noise"
 )
@@ -32,21 +35,25 @@ var ErrReplay = errors.New("replayed or stale encrypted packet")
 var ErrRekey = errors.New("session requires a fresh handshake")
 
 type Session struct {
-	id          string
-	binding     []byte
-	sendAD      []byte
-	receiveAD   []byte
-	created     time.Time
-	sendMu      sync.Mutex
-	receiveMu   sync.Mutex
-	send        noise.Cipher
-	receive     noise.Cipher
-	sequence    uint64
-	highest     uint64
-	seen        [ReplayWindow]uint64
-	batchAD     [4][]byte
-	sealAD      [2][]byte
-	batchNonces [128]uint64
+	id             string
+	binding        []byte
+	sendAD         []byte
+	receiveAD      []byte
+	created        time.Time
+	sendMu         sync.Mutex
+	receiveMu      sync.Mutex
+	send           noise.Cipher
+	receive        noise.Cipher
+	sequence       uint64
+	highest        uint64
+	seen           [ReplayWindow]uint64
+	batchAD        [4][]byte
+	sealAD         [2][]byte
+	batchNonces    [128]uint64
+	suite          model.CipherSuite
+	sendStreamRoot [32]byte
+	recvStreamRoot [32]byte
+	hasStreamRoots bool
 }
 
 func newSession(id string, binding []byte, send, receive noise.Cipher) *Session {
@@ -274,4 +281,111 @@ func (s *Session) OpenBatchInPlace(frames [][]byte) []error {
 		}
 	}
 	return errs
+}
+
+const (
+	// SubstreamTagSize is the AEAD tag overhead on an ordered substream record.
+	SubstreamTagSize = 16
+)
+
+// SubstreamCipher encrypts and decrypts in-order records on one transport
+// substream derived from a Session. One writer and one reader may operate
+// concurrently without contending on the control Session's locks or replay window.
+type SubstreamCipher struct {
+	session *Session
+	send    noise.Cipher
+	recv    noise.Cipher
+	sendAD  []byte
+	recvAD  []byte
+	sendSeq uint64
+	recvSeq uint64
+}
+
+// NewSubstreamCipher derives independent directional AEAD keys for streamID.
+func (s *Session) NewSubstreamCipher(streamID uint64) (*SubstreamCipher, error) {
+	if !s.hasStreamRoots {
+		return nil, errors.New("session does not support substream ciphers")
+	}
+	if time.Since(s.created) >= MaxSessionAge {
+		return nil, ErrRekey
+	}
+	var idRaw [8]byte
+	binary.BigEndian.PutUint64(idRaw[:], streamID)
+	sk, err := hkdf.Key(sha256.New, s.sendStreamRoot[:], idRaw[:], "GraphNet/qstream/v1", 32)
+	if err != nil {
+		return nil, err
+	}
+	rk, err := hkdf.Key(sha256.New, s.recvStreamRoot[:], idRaw[:], "GraphNet/qstream/v1", 32)
+	if err != nil {
+		return nil, err
+	}
+	var sdk, rdk [32]byte
+	copy(sdk[:], sk)
+	copy(rdk[:], rk)
+	fn := cipherFunction(s.suite)
+	adLen := len(s.binding) + 16
+	sendAD := make([]byte, adLen)
+	recvAD := make([]byte, adLen)
+	copy(sendAD, s.binding)
+	copy(recvAD, s.binding)
+	binary.BigEndian.PutUint64(sendAD[len(s.binding):], streamID)
+	binary.BigEndian.PutUint64(recvAD[len(s.binding):], streamID)
+	return &SubstreamCipher{
+		session: s,
+		send:    fn.Cipher(sdk),
+		recv:    fn.Cipher(rdk),
+		sendAD:  sendAD,
+		recvAD:  recvAD,
+	}, nil
+}
+
+// SealRecord appends [4-byte ciphertext length][AEAD(kind || body)] to dst.
+// Callers serialize writes on one SubstreamCipher.
+func (c *SubstreamCipher) SealRecord(dst []byte, kind byte, body []byte, plainScratch *[]byte) ([]byte, error) {
+	plainLen := 1 + len(body)
+	if plainLen > MaxPlaintext {
+		return nil, errors.New("invalid substream record size")
+	}
+	if c.sendSeq >= MaxMessages-1 || time.Since(c.session.created) >= MaxSessionAge {
+		return nil, ErrRekey
+	}
+	c.sendSeq++
+	seq := c.sendSeq
+	binary.BigEndian.PutUint64(c.sendAD[len(c.sendAD)-8:], seq)
+	if cap(*plainScratch) < plainLen {
+		*plainScratch = make([]byte, plainLen)
+	}
+	plain := (*plainScratch)[:plainLen]
+	plain[0] = kind
+	copy(plain[1:], body)
+	cipherLen := plainLen + SubstreamTagSize
+	dst = binary.BigEndian.AppendUint32(dst, uint32(cipherLen))
+	return c.send.Encrypt(dst, seq, c.sendAD, plain), nil
+}
+
+// UndoSeal rolls back the last SealRecord sequence number when zero bytes of
+// that record were written to the underlying stream before a deadline expired.
+func (c *SubstreamCipher) UndoSeal() {
+	if c.sendSeq > 0 {
+		c.sendSeq--
+	}
+}
+
+// OpenInPlace authenticates and decrypts frame in place, returning the record
+// kind and body slice aliasing frame. Callers serialize reads on one SubstreamCipher.
+func (c *SubstreamCipher) OpenInPlace(frame []byte) (byte, []byte, error) {
+	if len(frame) < 1+SubstreamTagSize || len(frame) > MaxPlaintext+SubstreamTagSize {
+		return 0, nil, errors.New("invalid substream ciphertext size")
+	}
+	if time.Since(c.session.created) >= MaxSessionAge {
+		return 0, nil, ErrRekey
+	}
+	c.recvSeq++
+	seq := c.recvSeq
+	binary.BigEndian.PutUint64(c.recvAD[len(c.recvAD)-8:], seq)
+	plain, err := c.recv.Decrypt(frame[:0], seq, c.recvAD, frame)
+	if err != nil {
+		return 0, nil, err
+	}
+	return plain[0], plain[1:], nil
 }

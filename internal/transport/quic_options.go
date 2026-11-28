@@ -2,13 +2,13 @@ package transport
 
 const (
 	DefaultQUICInitialStreamWindow     uint64 = 512 << 10
-	DefaultQUICInitialConnectionWindow uint64 = 512 << 10
-	DefaultQUICMaxStreamWindow         uint64 = 8 << 20
-	DefaultQUICMaxConnectionWindow     uint64 = 12 << 20
+	DefaultQUICInitialConnectionWindow uint64 = 1 << 20
+	DefaultQUICMaxStreamWindow         uint64 = 6 << 20
+	DefaultQUICMaxConnectionWindow     uint64 = 16 << 20
 )
 
 // QUICOptions configures flow-control windows for a QUICHub.
-// Zero fields use the defaults (8 MiB stream / 12 MiB connection max, 512 KiB initial).
+// Zero fields use the defaults (6 MiB stream / 16 MiB connection max, 512 KiB / 1 MiB initial).
 type QUICOptions struct {
 	InitialStreamReceiveWindow     uint64
 	MaxStreamReceiveWindow         uint64

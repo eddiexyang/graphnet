@@ -47,7 +47,7 @@ func (m *Mesh) StreamsAvailable(network, remote model.ID) bool {
 	m.mu.Lock()
 	g := m.groups[key{network, remote}]
 	m.mu.Unlock()
-	return g != nil && g.mux.Available()
+	return g != nil && (g.quicStreamLink() != nil || g.mux.Available())
 }
 
 // StreamCarrier reports whether the Edge to remote carries TCP as streams:
@@ -57,7 +57,7 @@ func (m *Mesh) StreamCarrier(network, remote model.ID) bool {
 	m.mu.Lock()
 	g := m.groups[key{network, remote}]
 	m.mu.Unlock()
-	return g != nil && (g.mux.Available() || g.tcpBacked())
+	return g != nil && (g.quicStreamLink() != nil || g.mux.Available() || g.tcpBacked())
 }
 
 // tcpBacked reports whether the Edge carries TCP as streams rather than packets.
@@ -135,7 +135,13 @@ func (m *Mesh) ResumeAvailable(network, remote model.ID) bool {
 	m.mu.Lock()
 	g := m.groups[key{network, remote}]
 	m.mu.Unlock()
-	return g != nil && g.mux.Resumable()
+	if g == nil {
+		return false
+	}
+	if l := g.quicStreamLink(); l != nil {
+		return l.Resume()
+	}
+	return g.mux.Resumable()
 }
 
 // OpenStream starts a stream on the Edge's current Link. It sends nothing until
@@ -147,15 +153,26 @@ func (m *Mesh) OpenStream(ctx context.Context, network, remote model.ID) (stream
 	if g == nil {
 		return nil, link.ErrUnavailable
 	}
+	if l := g.quicStreamLink(); l != nil {
+		return g.openQUICStream(ctx, l)
+	}
 	return g.mux.Open(ctx)
 }
 
 func (m *Mesh) acceptMuxStream(g *group, s *muxStream) {
+	m.acceptConnStream(g, s)
+}
+
+func (m *Mesh) acceptConnStream(g *group, s streamproxy.Conn) {
 	m.mu.Lock()
 	handler := m.streamHandler
 	if handler == nil || m.closed {
 		m.mu.Unlock()
-		s.Abort()
+		if aborter, ok := s.(interface{ Abort() }); ok {
+			aborter.Abort()
+		} else {
+			_ = s.Close()
+		}
 		return
 	}
 	m.wg.Add(1)

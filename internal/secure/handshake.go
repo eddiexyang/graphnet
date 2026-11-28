@@ -255,17 +255,34 @@ func deriveSession(suite model.CipherSuite, initiator bool, first, second *noise
 	if err != nil {
 		return nil, err
 	}
-	var dk1, dk2 [32]byte
+	sub1, err := hkdf.Key(sha256.New, k1[:], binding, "GraphNet/peer/v2/qstream-i2r/"+string(suite), 32)
+	if err != nil {
+		return nil, err
+	}
+	sub2, err := hkdf.Key(sha256.New, k2[:], binding, "GraphNet/peer/v2/qstream-r2i/"+string(suite), 32)
+	if err != nil {
+		return nil, err
+	}
+	var dk1, dk2, sr1, sr2 [32]byte
 	copy(dk1[:], raw1)
 	copy(dk2[:], raw2)
+	copy(sr1[:], sub1)
+	copy(sr2[:], sub2)
 	fn := cipherFunction(suite)
 	c1, c2 := fn.Cipher(dk1), fn.Cipher(dk2)
 	send, recv := c1, c2
+	sendSub, recvSub := sr1, sr2
 	if !initiator {
 		send, recv = c2, c1
+		sendSub, recvSub = sr2, sr1
 	}
 	ownedBinding := bytes.Clone(binding)
-	return newSession(hex.EncodeToString(ownedBinding), ownedBinding, send, recv), nil
+	s := newSession(hex.EncodeToString(ownedBinding), ownedBinding, send, recv)
+	s.suite = suite
+	s.sendStreamRoot = sendSub
+	s.recvStreamRoot = recvSub
+	s.hasStreamRoots = true
+	return s, nil
 }
 
 type Handshake struct {

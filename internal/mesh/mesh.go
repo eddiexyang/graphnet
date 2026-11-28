@@ -318,7 +318,7 @@ func (m *Mesh) Report() []model.LinkStatus {
 	result := []model.LinkStatus{}
 	for _, g := range groups {
 		links := g.edge.Report()
-		streams := uint32(g.mux.streamCount())
+		streams := uint32(g.mux.streamCount() + g.quicStreamCount())
 		for i := range links {
 			if links[i].Active {
 				links[i].StreamSessions = streams
@@ -472,11 +472,12 @@ func (m *Mesh) accept(conn transport.Conn, kind model.Transport) {
 		}
 		// The acceptor confirms each offered capability in band.
 		streams := introduction.TCPStreams && m.streamsEnabled() && streamTransport(actualKind)
+		quicStreams := introduction.QUICStreams && streams && actualKind == model.QUIC
 		resume := introduction.TCPResume && m.resumeEnabled()
 		windows := introduction.Windows && streams && m.resumeEnabled()
 		linkState := introduction.LinkState && m.linkStateEnabled()
 		sizeProbe := introduction.SizeProbe && streamTransport(actualKind)
-		selected.register(channel, *candidate, introduction.PathExchange, linkCaps{streams: streams, resume: resume, windows: windows, streamHello: true, linkState: linkState, linkStateHello: true, sizeProbe: sizeProbe, sizeProbeHello: true, accepted: true, peerHeartbeat: time.Duration(introduction.Heartbeat) * time.Millisecond})
+		selected.register(channel, *candidate, introduction.PathExchange, linkCaps{streams: streams, quicStreams: quicStreams, quicStreamHello: true, resume: resume, windows: windows, streamHello: true, linkState: linkState, linkStateHello: true, sizeProbe: sizeProbe, sizeProbeHello: true, accepted: true, peerHeartbeat: time.Duration(introduction.Heartbeat) * time.Millisecond})
 	}()
 }
 func addressFamily(address net.Addr) int {
@@ -496,6 +497,9 @@ func addressFamily(address net.Addr) int {
 
 type group struct {
 	mux               *mux
+	qmu               sync.Mutex
+	qlinks            map[*link.Link]map[uint64]*qhopStream
+	qclosed           bool
 	extensionInflight int
 	extensionStart    time.Time
 	mesh              *Mesh
@@ -540,6 +544,7 @@ func (m *Mesh) newGroup(cfg *policy) *group {
 	return g
 }
 func (g *group) close() {
+	g.closeQUICStreams()
 	g.mux.close()
 	g.cancel()
 	g.mu.Lock()
@@ -558,6 +563,7 @@ func (g *group) close() {
 // offer (acceptor, which announces each with a hello message).
 type linkCaps struct {
 	streams, streamHello, linkState, linkStateHello bool
+	quicStreams, quicStreamHello                    bool
 	resume, windows                                 bool
 	sizeProbe, sizeProbeHello                       bool
 	accepted                                        bool
@@ -619,6 +625,20 @@ func (g *group) register(channel *peer.Channel, candidate link.Candidate, pathEx
 	options.Accepted = caps.accepted
 	if caps.streams {
 		options.Streams, options.StreamHello = g.mux, caps.streamHello
+	}
+	if caps.quicStreams && channel.SupportsSubstreams() {
+		options.QUICStreams = true
+		options.QUICStreamHello = caps.quicStreamHello
+		options.QUICStreamHandler = g
+		options.Substreams = &link.SubstreamProvider{
+			Open: func(ctx context.Context, urgency int8, incremental bool) (link.Substream, error) {
+				return channel.OpenSubstream(ctx, urgency, incremental)
+			},
+			Accept: func(ctx context.Context) (link.Substream, error) {
+				return channel.AcceptSubstream(ctx)
+			},
+			ErrorCode: peer.SubstreamErrorCode,
+		}
 	}
 	if caps.linkState {
 		options.LinkState, options.LinkStateHello = g, caps.linkStateHello

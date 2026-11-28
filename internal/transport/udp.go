@@ -116,12 +116,9 @@ func newUDP(sockets []*net.UDPConn) (*UDP, error) {
 		var err error
 		switch runtime.GOOS {
 		case "darwin", "dragonfly", "freebsd", "netbsd", "openbsd":
-			err = socket.SetWriteBuffer(64 << 10)
+			setUDPSocketBuffers(socket)
 		}
-		if err == nil {
-			err = enableUDPPacketInfo(socket)
-		}
-		if err != nil {
+		if err = enableUDPPacketInfo(socket); err != nil {
 			for _, owned := range sockets {
 				owned.Close()
 			}
@@ -140,6 +137,20 @@ func newUDP(sockets []*net.UDPConn) (*UDP, error) {
 	go hub.expireLoop()
 	return hub, nil
 }
+
+func setUDPSocketBuffers(socket *net.UDPConn) {
+	for _, size := range []int{1 << 20, 512 << 10, 256 << 10, 64 << 10} {
+		if socket.SetWriteBuffer(size) == nil {
+			break
+		}
+	}
+	for _, size := range []int{2 << 20, 1 << 20, 512 << 10, 256 << 10} {
+		if socket.SetReadBuffer(size) == nil {
+			break
+		}
+	}
+}
+
 func (h *UDP) LocalAddr() net.Addr { return h.sockets[0].LocalAddr() }
 func (h *UDP) Close() error {
 	h.stop()
